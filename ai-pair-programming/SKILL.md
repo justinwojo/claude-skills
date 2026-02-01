@@ -20,9 +20,9 @@ Query external LLMs with rich context for code review, improvement suggestions, 
 Override default model selection per provider:
 | Provider | Environment Variable | Default |
 |----------|---------------------|---------|
-| OpenAI | `OPENAI_MODEL` | gpt-4o |
-| Gemini | `GEMINI_MODEL` | gemini-2.0-flash |
-| Grok | `GROK_MODEL` | grok-2 |
+| OpenAI | `OPENAI_MODEL` | gpt-5.2 |
+| Gemini | `GEMINI_MODEL` | gemini-3-flash-preview |
+| Grok | `GROK_MODEL` | grok-4-1-fast-reasoning |
 
 Models can also be specified per-query via `--models openai:gpt-4-turbo`.
 
@@ -59,9 +59,9 @@ Include relevant background:
 
 ### 5. Target Models
 Query one or more:
-- `openai` (gpt-4o, gpt-4-turbo, gpt-3.5-turbo)
-- `gemini` (gemini-2.0-flash, gemini-1.5-pro)
-- `grok` (grok-2, grok-2-mini, grok-4-1-fast-reasoning)
+- `openai` (gpt-5.2, gpt-5, gpt-4o, o3-mini)
+- `gemini` (gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-flash)
+- `grok` (grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning)
 
 ### 6. Temperature Selection
 Use `--temperature` (or `-t`) to control response creativity. Choose based on the task:

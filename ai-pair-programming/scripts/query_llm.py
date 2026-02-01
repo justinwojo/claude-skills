@@ -23,22 +23,22 @@ API_CONFIG = {
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "OPENAI_MODEL",
         "base_url": "https://api.openai.com/v1/chat/completions",
-        "default_model": "gpt-4o",
-        "models": ["gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "default_model": "gpt-5.2",
+        "models": ["gpt-5.2", "gpt-5", "gpt-4o", "o3-mini"],
     },
     "gemini": {
         "env_key": "GOOGLE_AI_API_KEY",
         "model_env_key": "GEMINI_MODEL",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
-        "default_model": "gemini-2.0-flash",
-        "models": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+        "default_model": "gemini-3-flash-preview",
+        "models": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
     },
     "grok": {
         "env_key": "XAI_API_KEY",
         "model_env_key": "GROK_MODEL",
         "base_url": "https://api.x.ai/v1/chat/completions",
-        "default_model": "grok-2",
-        "models": ["grok-2", "grok-2-mini", "grok-4-1-fast-reasoning"],
+        "default_model": "grok-4-1-fast-reasoning",
+        "models": ["grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning"],
     },
 }
 
