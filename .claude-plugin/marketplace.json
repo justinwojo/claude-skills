@@ -1,0 +1,22 @@
+{
+  "name": "justin-claude-skills",
+  "owner": {
+    "name": "Justin Wojciechowski",
+    "email": "justinwojo1@gmail.com"
+  },
+  "metadata": {
+    "description": "Personal collection of Claude skills",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "ai-pair-programming",
+      "description": "Query external LLMs (OpenAI/ChatGPT, Google Gemini, xAI Grok) for code review, improvement suggestions, and collaborative problem-solving",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./ai-pair-programming"
+      ]
+    }
+  ]
+}
