@@ -15,7 +15,8 @@ Usage:
 
 import argparse
 import json
-from dataclasses import dataclass, asdict
+import subprocess
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -26,7 +27,8 @@ class ContextPackage:
     files: dict[str, str]
     project_context: Optional[str]
     additional_context: Optional[str]
-    file_summary: dict[str, dict]  # filename -> {lines, size, language}
+    file_summary: dict[str, dict]  # filepath -> {lines, size, language}
+    diff: Optional[str] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), indent=2)
@@ -54,7 +56,7 @@ def detect_language(filename: str) -> str:
 
 
 def read_files(file_paths: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
-    """Read files and generate summaries."""
+    """Read files and generate summaries. Preserves full paths as keys."""
     files = {}
     summaries = {}
 
@@ -65,8 +67,9 @@ def read_files(file_paths: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
             continue
         try:
             content = p.read_text(encoding="utf-8")
-            files[p.name] = content
-            summaries[p.name] = {
+            key = str(path)
+            files[key] = content
+            summaries[key] = {
                 "path": str(p.absolute()),
                 "lines": len(content.splitlines()),
                 "size": len(content),
@@ -78,10 +81,30 @@ def read_files(file_paths: list[str]) -> tuple[dict[str, str], dict[str, dict]]:
     return files, summaries
 
 
+def get_git_diff(diff_target: str) -> Optional[str]:
+    """Get git diff output."""
+    try:
+        if diff_target == "staged":
+            cmd = ["git", "diff", "--cached"]
+        elif diff_target == "unstaged":
+            cmd = ["git", "diff"]
+        else:
+            cmd = ["git", "diff", diff_target]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(f"Warning: git diff failed: {result.stderr.strip()}")
+            return None
+        return result.stdout if result.stdout.strip() else None
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build context package for LLM queries")
     parser.add_argument("--files", "-f", nargs="+", required=True,
                         help="Files to include")
+    parser.add_argument("--diff", "-d", nargs="?", const="unstaged", default=None,
+                        help="Include git diff (unstaged, staged, or branch/commit)")
     parser.add_argument("--project", "-p", default=None,
                         help="Project context description")
     parser.add_argument("--context", "-c", default=None,
@@ -92,12 +115,14 @@ def main():
     args = parser.parse_args()
 
     files, summaries = read_files(args.files)
+    diff = get_git_diff(args.diff) if args.diff else None
 
     package = ContextPackage(
         files=files,
         project_context=args.project,
         additional_context=args.context,
         file_summary=summaries,
+        diff=diff,
     )
 
     Path(args.output).write_text(package.to_json(), encoding="utf-8")

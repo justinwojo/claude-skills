@@ -11,6 +11,7 @@ Usage:
 import argparse
 import json
 import os
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,8 +31,8 @@ API_CONFIG = {
         "env_key": "GOOGLE_AI_API_KEY",
         "model_env_key": "GEMINI_MODEL",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/models",
-        "default_model": "gemini-3-flash-preview",
-        "models": ["gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
+        "default_model": "gemini-3.1-pro-preview",
+        "models": ["gemini-3.1-pro-preview", "gemini-3-pro-preview", "gemini-3-flash-preview", "gemini-2.5-flash"],
     },
     "grok": {
         "env_key": "XAI_API_KEY",
@@ -56,19 +57,69 @@ REQUEST_PROMPTS = {
     "guidance": "Please provide guidance on the following question or problem. Be specific and practical.",
 }
 
+ANTI_HALLUCINATION_RULES = """
+## Anti-Hallucination Rules
+- ONLY comment on code you can see in the provided files. Never assume or guess about code not shown.
+- If you cannot determine something from the provided code, say "I can't determine this from the provided files" rather than speculating.
+- If a section has no findings, omit it entirely. Do not pad your response with filler.
+- A short, accurate review is better than a long one that guesses. If the code is straightforward and correct, say so briefly.
+- Never invent file paths, function names, or line numbers. Only reference what is present in the provided code."""
+
+SYSTEM_PROMPTS = {
+    "review": f"""You are an expert code reviewer. Follow these rules strictly:
+
+## Response Format
+Structure your review with these sections (omit any section with no findings):
+- **Critical Issues**: Bugs, security vulnerabilities, data loss risks. Include file path and line number.
+- **Improvements**: Code quality, performance, maintainability suggestions. Include file path and line number.
+- **Positive**: What's done well (brief).
+
+## Rules
+- When a git diff is provided, focus your review on the CHANGED lines. The diff shows what's new — that's what needs review.
+- Always reference specific file paths and line numbers (e.g., `src/server/handlers.ts:42`).
+- Distinguish between issues in NEW code (from the diff) vs PRE-EXISTING issues in the surrounding context.
+- Be specific and actionable. "Consider improving error handling" is useless. "Add null check for `user` at line 42 — `getProfile()` can return null when session expires" is useful.
+{ANTI_HALLUCINATION_RULES}""",
+
+    "improve": f"""You are an expert software engineer focused on code improvement. Follow these rules:
+
+## Response Format (omit any section with no findings)
+- **High Impact**: Changes that significantly improve performance, reliability, or maintainability. Include file:line.
+- **Medium Impact**: Code quality and best practice improvements. Include file:line.
+- **Low Impact / Style**: Minor cleanups (brief, don't over-index on these).
+
+## Rules
+- When a git diff is provided, focus improvements on the changed code.
+- Always include the specific file path and line number for each suggestion.
+- Provide concrete code examples for non-trivial suggestions.
+- If you cannot determine the full impact of a change, say what you'd need to see to be sure.
+{ANTI_HALLUCINATION_RULES}""",
+
+    "feedback": f"""You are a senior technical advisor providing feedback on a plan or approach. Be specific about:
+- Feasibility concerns with concrete reasoning
+- Potential issues you foresee and why
+- Alternative approaches worth considering
+- What information would be needed to make a more confident assessment
+{ANTI_HALLUCINATION_RULES}""",
+
+    "guidance": None,  # No system prompt for general guidance
+}
+
 
 @dataclass
 class QueryContext:
     """Container for all context passed to LLMs."""
-    files: dict[str, str]  # filename -> content
+    files: dict[str, str]  # filepath -> content
     project_context: Optional[str]
     request_type: str
     additional_context: Optional[str]
     custom_prompt: Optional[str]
+    diff: Optional[str] = None
 
 
 def read_files(file_paths: list[str]) -> dict[str, str]:
-    """Read multiple files and return as dict of filename -> content."""
+    """Read multiple files and return as dict of filepath -> content.
+    Preserves relative or absolute path as the key for architectural context."""
     files = {}
     for path in file_paths:
         p = Path(path)
@@ -76,10 +127,43 @@ def read_files(file_paths: list[str]) -> dict[str, str]:
             print(f"Warning: File not found: {path}", file=sys.stderr)
             continue
         try:
-            files[p.name] = p.read_text(encoding="utf-8")
+            files[str(path)] = p.read_text(encoding="utf-8")
         except Exception as e:
             print(f"Warning: Could not read {path}: {e}", file=sys.stderr)
     return files
+
+
+def get_git_diff(diff_target: str) -> Optional[str]:
+    """Get git diff output. diff_target can be a branch, commit, or 'staged'/'unstaged'."""
+    try:
+        if diff_target == "staged":
+            cmd = ["git", "diff", "--cached"]
+        elif diff_target == "unstaged":
+            cmd = ["git", "diff"]
+        else:
+            # Branch name or commit hash
+            cmd = ["git", "diff", diff_target]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(f"Warning: git diff failed: {result.stderr.strip()}", file=sys.stderr)
+            return None
+        return result.stdout if result.stdout.strip() else None
+    except FileNotFoundError:
+        print("Warning: git not found", file=sys.stderr)
+        return None
+    except subprocess.TimeoutExpired:
+        print("Warning: git diff timed out", file=sys.stderr)
+        return None
+
+
+LANG_MAP = {
+    ".cs": "csharp", ".py": "python", ".js": "javascript",
+    ".ts": "typescript", ".jsx": "jsx", ".tsx": "tsx",
+    ".java": "java", ".kt": "kotlin", ".swift": "swift",
+    ".go": "go", ".rs": "rust", ".rb": "ruby",
+    ".md": "markdown", ".json": "json", ".xml": "xml",
+    ".yaml": "yaml", ".yml": "yaml", ".sql": "sql",
+}
 
 
 def build_prompt(ctx: QueryContext) -> str:
@@ -96,22 +180,17 @@ def build_prompt(ctx: QueryContext) -> str:
     else:
         parts.append(f"## Request\n{REQUEST_PROMPTS.get(ctx.request_type, REQUEST_PROMPTS['guidance'])}")
 
+    # Git diff (before files — shows what changed, files show full context)
+    if ctx.diff:
+        parts.append(f"## Git Diff (Changed Code)\nThe following diff shows what was changed. Focus your review on these changes.\n```diff\n{ctx.diff}\n```")
+
     # Files
     if ctx.files:
-        parts.append("## Files")
-        for filename, content in ctx.files.items():
-            # Detect language from extension for code fence
-            ext = Path(filename).suffix.lower()
-            lang_map = {
-                ".cs": "csharp", ".py": "python", ".js": "javascript",
-                ".ts": "typescript", ".jsx": "jsx", ".tsx": "tsx",
-                ".java": "java", ".kt": "kotlin", ".swift": "swift",
-                ".go": "go", ".rs": "rust", ".rb": "ruby",
-                ".md": "markdown", ".json": "json", ".xml": "xml",
-                ".yaml": "yaml", ".yml": "yaml", ".sql": "sql",
-            }
-            lang = lang_map.get(ext, "")
-            parts.append(f"### {filename}\n```{lang}\n{content}\n```")
+        parts.append("## Files" + (" (Full Context)" if ctx.diff else ""))
+        for filepath, content in ctx.files.items():
+            ext = Path(filepath).suffix.lower()
+            lang = LANG_MAP.get(ext, "")
+            parts.append(f"### {filepath}\n```{lang}\n{content}\n```")
 
     # Additional context
     if ctx.additional_context:
@@ -120,7 +199,46 @@ def build_prompt(ctx: QueryContext) -> str:
     return "\n\n".join(parts)
 
 
-def query_openai(prompt: str, model: str, api_key: str, temperature: float = 0.7) -> str:
+def _build_openai_messages(prompt: str, system_prompt: Optional[str]) -> list[dict]:
+    """Build messages array for OpenAI-compatible APIs."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+@dataclass
+class LLMResponse:
+    """Response from an LLM including content and token usage."""
+    content: str
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+
+
+def _extract_openai_usage(result: dict) -> dict:
+    """Extract token usage from OpenAI-compatible response."""
+    usage = result.get("usage", {})
+    return {
+        "input_tokens": usage.get("prompt_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+
+
+def _extract_gemini_usage(result: dict) -> dict:
+    """Extract token usage from Gemini response."""
+    usage = result.get("usageMetadata", {})
+    return {
+        "input_tokens": usage.get("promptTokenCount"),
+        "output_tokens": usage.get("candidatesTokenCount"),
+        "total_tokens": usage.get("totalTokenCount"),
+    }
+
+
+def query_openai(prompt: str, model: str, api_key: str, temperature: float = 0.7,
+                 system_prompt: Optional[str] = None) -> LLMResponse:
     """Query OpenAI API."""
     import urllib.request
 
@@ -131,7 +249,7 @@ def query_openai(prompt: str, model: str, api_key: str, temperature: float = 0.7
     }
     data = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": _build_openai_messages(prompt, system_prompt),
         "temperature": temperature,
     }).encode()
 
@@ -144,10 +262,14 @@ def query_openai(prompt: str, model: str, api_key: str, temperature: float = 0.7
 
     with urllib.request.urlopen(req, timeout=120) as resp:
         result = json.loads(resp.read().decode())
-        return result["choices"][0]["message"]["content"]
+        return LLMResponse(
+            content=result["choices"][0]["message"]["content"],
+            **_extract_openai_usage(result),
+        )
 
 
-def query_gemini(prompt: str, model: str, api_key: str, temperature: float = 0.7) -> str:
+def query_gemini(prompt: str, model: str, api_key: str, temperature: float = 0.7,
+                 system_prompt: Optional[str] = None) -> LLMResponse:
     """Query Google Gemini API."""
     import urllib.request
 
@@ -156,19 +278,26 @@ def query_gemini(prompt: str, model: str, api_key: str, temperature: float = 0.7
         "Content-Type": "application/json",
         "User-Agent": "AI-Pair-Programming/1.0",
     }
-    data = json.dumps({
+    body: dict = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": temperature},
-    }).encode()
+    }
+    if system_prompt:
+        body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+    data = json.dumps(body).encode()
 
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
     with urllib.request.urlopen(req, timeout=120) as resp:
         result = json.loads(resp.read().decode())
-        return result["candidates"][0]["content"]["parts"][0]["text"]
+        return LLMResponse(
+            content=result["candidates"][0]["content"]["parts"][0]["text"],
+            **_extract_gemini_usage(result),
+        )
 
 
-def query_grok(prompt: str, model: str, api_key: str, temperature: float = 0.7) -> str:
+def query_grok(prompt: str, model: str, api_key: str, temperature: float = 0.7,
+               system_prompt: Optional[str] = None) -> LLMResponse:
     """Query xAI Grok API."""
     import urllib.request
     import urllib.error
@@ -180,7 +309,7 @@ def query_grok(prompt: str, model: str, api_key: str, temperature: float = 0.7) 
     }
     data = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": _build_openai_messages(prompt, system_prompt),
         "temperature": temperature,
     }).encode()
 
@@ -194,21 +323,25 @@ def query_grok(prompt: str, model: str, api_key: str, temperature: float = 0.7) 
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode())
-            return result["choices"][0]["message"]["content"]
+            return LLMResponse(
+                content=result["choices"][0]["message"]["content"],
+                **_extract_openai_usage(result),
+            )
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else ""
         raise Exception(f"HTTP {e.code}: {error_body}")
 
 
-def query_provider(provider: str, model: Optional[str], prompt: str, temperature: float = 0.7) -> tuple[str, str, str]:
-    """Query a single provider and return (provider, model, response)."""
+def query_provider(provider: str, model: Optional[str], prompt: str, temperature: float = 0.7,
+                   system_prompt: Optional[str] = None) -> tuple[str, str, LLMResponse]:
+    """Query a single provider and return (provider, model, LLMResponse)."""
     config = API_CONFIG.get(provider)
     if not config:
-        return provider, "", f"Error: Unknown provider '{provider}'"
+        return provider, "", LLMResponse(content=f"Error: Unknown provider '{provider}'")
 
     api_key = os.environ.get(config["env_key"])
     if not api_key:
-        return provider, "", f"Error: {config['env_key']} not set"
+        return provider, "", LLMResponse(content=f"Error: {config['env_key']} not set")
 
     model = model or get_default_model(provider)
 
@@ -219,10 +352,10 @@ def query_provider(provider: str, model: Optional[str], prompt: str, temperature
     }
 
     try:
-        response = query_funcs[provider](prompt, model, api_key, temperature)
+        response = query_funcs[provider](prompt, model, api_key, temperature, system_prompt)
         return provider, model, response
     except Exception as e:
-        return provider, model, f"Error: {str(e)}"
+        return provider, model, LLMResponse(content=f"Error: {str(e)}")
 
 
 def parse_model_spec(spec: str) -> tuple[str, Optional[str]]:
@@ -239,6 +372,8 @@ def main():
                         help="Comma-separated list of models (e.g., grok,gemini,openai:gpt-4-turbo)")
     parser.add_argument("--files", "-f", nargs="+", default=[],
                         help="Files to include in the query")
+    parser.add_argument("--diff", "-d", nargs="?", const="unstaged", default=None,
+                        help="Include git diff. Use: --diff (unstaged), --diff staged, --diff main, --diff <commit>")
     parser.add_argument("--project", "-p", default=None,
                         help="Project context (tech stack, framework, etc.)")
     parser.add_argument("--request", "-r", default="guidance",
@@ -260,6 +395,11 @@ def main():
     # Parse model specifications
     model_specs = [parse_model_spec(m.strip()) for m in args.models.split(",")]
 
+    # Get git diff if requested
+    diff = get_git_diff(args.diff) if args.diff else None
+    if args.diff and not diff:
+        print("Note: --diff requested but no diff output (clean working tree?)", file=sys.stderr)
+
     # Build context
     ctx = QueryContext(
         files=read_files(args.files),
@@ -267,29 +407,70 @@ def main():
         request_type=args.request,
         additional_context=args.context,
         custom_prompt=args.prompt,
+        diff=diff,
     )
 
     prompt = build_prompt(ctx)
+
+    # Estimate token count and warn if large (~4 chars per token)
+    estimated_tokens = len(prompt) // 4
+    if estimated_tokens > 100_000:
+        print(f"Warning: Estimated prompt size is ~{estimated_tokens:,} tokens. "
+              f"Some models may truncate or reject this. Consider sending fewer/smaller files.",
+              file=sys.stderr)
+    elif estimated_tokens > 50_000:
+        print(f"Note: Estimated prompt size is ~{estimated_tokens:,} tokens.", file=sys.stderr)
+
+    # Get system prompt for this request type
+    system_prompt = SYSTEM_PROMPTS.get(args.request) if not args.prompt else None
 
     # Query all models in parallel
     results = {}
     with ThreadPoolExecutor(max_workers=len(model_specs)) as executor:
         futures = {
-            executor.submit(query_provider, provider, model, prompt, args.temperature): (provider, model)
+            executor.submit(query_provider, provider, model, prompt, args.temperature, system_prompt): (provider, model)
             for provider, model in model_specs
         }
         for future in as_completed(futures):
             provider, model, response = future.result()
             results[provider] = {"model": model, "response": response}
 
+    # Format token usage line
+    def format_usage(resp: LLMResponse) -> str:
+        parts = []
+        if resp.input_tokens is not None:
+            parts.append(f"input: {resp.input_tokens:,}")
+        if resp.output_tokens is not None:
+            parts.append(f"output: {resp.output_tokens:,}")
+        if resp.total_tokens is not None:
+            parts.append(f"total: {resp.total_tokens:,}")
+        return f"Tokens: {' | '.join(parts)}" if parts else ""
+
     # Output
     if args.json:
-        output = json.dumps(results, indent=2)
+        json_results = {}
+        for provider, data in results.items():
+            resp = data["response"]
+            json_results[provider] = {
+                "model": data["model"],
+                "response": resp.content,
+                "usage": {
+                    "input_tokens": resp.input_tokens,
+                    "output_tokens": resp.output_tokens,
+                    "total_tokens": resp.total_tokens,
+                },
+            }
+        output = json.dumps(json_results, indent=2)
     else:
         output_parts = []
         for provider, data in results.items():
+            resp = data["response"]
             header = f"=== {provider.upper()} ({data['model']}) ==="
-            output_parts.append(f"{header}\n{data['response']}")
+            usage = format_usage(resp)
+            section = f"{header}\n{resp.content}"
+            if usage:
+                section += f"\n\n_{usage}_"
+            output_parts.append(section)
         output = "\n\n".join(output_parts)
 
     if args.output:
