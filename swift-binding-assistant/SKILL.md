@@ -1,11 +1,11 @@
 ---
 name: swift-binding-assistant
-description: Guide users through creating .NET C# bindings for Swift or Objective-C Apple platform libraries (iOS, macOS, Mac Catalyst, tvOS). Takes a user from an SPM package URL or xcframework to a validated NuGet package using the Swift.Bindings.Sdk. Handles prerequisites, xcframework building, binding generation, error diagnosis, and optional binding review. Auto-detects whether the framework is Swift, ObjC, or mixed, and runs the correct pipeline. Triggers on "bind Swift library", "Swift to C#", "create Swift binding", "Swift NuGet package", "use Swift from .NET", "Swift interop", "Swift .NET MAUI", "bind ObjC library", "Objective-C binding", "ObjC to C#", "bind Objective-C", "ObjC NuGet", "bind iOS framework", "bind macOS framework", "bind tvOS framework", "bind Mac Catalyst framework".
+description: Guide users through creating .NET C# bindings for Swift or Objective-C Apple platform libraries (iOS, macOS, Mac Catalyst, tvOS). Takes a user from an SPM package URL or xcframework to a validated NuGet package using the SwiftBindings.Sdk. Handles prerequisites, xcframework building, binding generation, error diagnosis, and optional binding review. Auto-detects whether the framework is Swift, ObjC, or mixed, and runs the correct pipeline. Triggers on "bind Swift library", "Swift to C#", "create Swift binding", "Swift NuGet package", "use Swift from .NET", "Swift interop", "Swift .NET MAUI", "bind ObjC library", "Objective-C binding", "ObjC to C#", "bind Objective-C", "ObjC NuGet", "bind iOS framework", "bind macOS framework", "bind tvOS framework", "bind Mac Catalyst framework".
 ---
 
 # Swift & ObjC Binding Assistant
 
-Guide users through creating .NET C# bindings for Swift or Objective-C Apple platform libraries using the Swift.Bindings.Sdk. Supports iOS, macOS, Mac Catalyst, and tvOS. The generator auto-detects framework type (Swift, ObjC, or mixed) and runs the correct pipeline — no flags needed.
+Guide users through creating .NET C# bindings for Swift or Objective-C Apple platform libraries using the SwiftBindings.Sdk. Supports iOS, macOS, Mac Catalyst, and tvOS. The generator auto-detects framework type (Swift, ObjC, or mixed) and runs the correct pipeline — no flags needed.
 
 ## Documentation
 
@@ -110,7 +110,7 @@ dotnet workload list
 
 # Template check
 dotnet new list swift-binding
-# If not found: dotnet new install Swift.Bindings.Templates
+# If not found: dotnet new install SwiftBindings.Templates
 ```
 
 If any prerequisite is missing, guide the user through installing it before proceeding. Do not continue until all prerequisites pass.
@@ -213,7 +213,7 @@ cp -r <PATH_TO_XCFRAMEWORK> <LibraryName>.Swift.<Platform>/
 
 The generated `.csproj` will look like:
 ```xml
-<Project Sdk="Swift.Bindings.Sdk">
+<Project Sdk="SwiftBindings.Sdk">
   <PropertyGroup>
     <TargetFramework>net10.0-ios</TargetFramework>  <!-- or net10.0-macos, net10.0-maccatalyst, net10.0-tvos -->
   </PropertyGroup>
