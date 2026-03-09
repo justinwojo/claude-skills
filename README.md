@@ -20,6 +20,22 @@ Query external LLMs (OpenAI/ChatGPT, Google Gemini, xAI Grok) for code review, i
 
 See [ai-pair-programming/SKILL.md](ai-pair-programming/SKILL.md) for full documentation.
 
+### swift-binding-assistant
+
+Guide users through creating .NET C# bindings for Swift iOS libraries. Takes a user from an SPM package URL or xcframework to a validated NuGet package using the [Swift.Bindings.Sdk](https://github.com/justinwojo/swift-dotnet-bindings).
+
+**What it does:**
+- Checks prerequisites (macOS, Xcode, .NET 10, iOS workload)
+- Builds xcframeworks from SPM packages via [spm-to-xcframework](https://github.com/justinwojo/spm-to-xcframework)
+- Creates and configures the binding project
+- Diagnoses build errors using the latest project docs
+- Packages the binding as a NuGet package
+- Optionally reviews the generated binding for completeness
+
+**Setup:** No configuration needed. Requires macOS with Xcode and .NET 10 SDK.
+
+See [swift-binding-assistant/SKILL.md](swift-binding-assistant/SKILL.md) for full documentation.
+
 ## License
 
 MIT

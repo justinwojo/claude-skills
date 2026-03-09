@@ -1,5 +1,5 @@
 {
-  "name": "justin-claude-skills",
+  "name": "justinwojo-claude-skills",
   "owner": {
     "name": "Justin Wojciechowski",
     "email": "justinwojo1@gmail.com"
@@ -16,6 +16,15 @@
       "strict": false,
       "skills": [
         "./ai-pair-programming"
+      ]
+    },
+    {
+      "name": "swift-binding-assistant",
+      "description": "Guide users through creating .NET C# bindings for Swift iOS libraries, from SPM package or xcframework to validated NuGet package",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./swift-binding-assistant"
       ]
     }
   ]
