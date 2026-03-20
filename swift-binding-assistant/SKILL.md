@@ -9,19 +9,19 @@ Guide users through creating .NET C# bindings for Swift or Objective-C Apple pla
 
 ## Documentation
 
-The authoritative docs live in the project repository. **Always fetch the latest version** using WebFetch when you need to reference them — do NOT rely on memorized content, as it may be outdated.
+The authoritative docs live in the [project wiki](https://github.com/justinwojo/swift-dotnet-bindings/wiki). **Always fetch the latest version** using WebFetch when you need to reference them — do NOT rely on memorized content, as it may be outdated.
 
 | Doc | URL |
 |-----|-----|
-| Getting Started | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Getting-Started.md` |
-| Troubleshooting | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Troubleshooting.md` |
-| Known Limitations | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Known-Limitations.md` |
-| Supported Features | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Supported-Features.md` |
-| How Bindings Map | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/How-Bindings-Map.md` |
-| Customization | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Customization.md` |
-| SwiftUI Interop | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/SwiftUI-Interop.md` |
-| NativeAOT Deployment | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/NativeAOT-Deployment.md` |
-| Architecture | `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Architecture.md` |
+| Getting Started | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Getting-Started.md` |
+| Troubleshooting | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Troubleshooting.md` |
+| Known Limitations | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Known-Limitations.md` |
+| Supported Features | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Supported-Features.md` |
+| How Bindings Map | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/How-Bindings-Map.md` |
+| Customization | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Customization.md` |
+| SwiftUI Interop | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/SwiftUI-Interop.md` |
+| NativeAOT Deployment | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/NativeAOT-Deployment.md` |
+| Architecture | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Architecture.md` |
 
 Fetch docs proactively when:
 - The user hits a build error (fetch Troubleshooting)
@@ -274,7 +274,7 @@ Tell the user the build succeeded and move to Step 5.
 
 **Immediately fetch the troubleshooting guide:**
 ```
-WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Troubleshooting.md
+WebFetch: https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Troubleshooting.md
 ```
 
 Then diagnose the error. Here's a quick-reference for the most common errors:
@@ -398,8 +398,8 @@ ObjC bindings emit diagnostic information about skipped symbols. Look for:
 
 Fetch Known Limitations and Supported Features to explain any gaps:
 ```
-WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Known-Limitations.md
-WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Supported-Features.md
+WebFetch: https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Known-Limitations.md
+WebFetch: https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Supported-Features.md
 ```
 
 ##### 4. Present findings
@@ -437,7 +437,7 @@ var result = SomeClass.DoSomething();
   <PublishAot>true</PublishAot>
   <PublishAotUsingRuntimePack>true</PublishAotUsingRuntimePack>
   ```
-  Fetch the NativeAOT guide if the user asks: `https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/NativeAOT-Deployment.md`
+  Fetch the NativeAOT guide if the user asks: `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/NativeAOT-Deployment.md`
 
 ## Error Recovery Patterns
 
@@ -460,7 +460,7 @@ If the user comes in with an existing project that has errors:
 
 Fetch the Customization guide:
 ```
-WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/Customization.md
+WebFetch: https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Customization.md
 ```
 
 ### "My ObjC binding has bgen errors"
@@ -484,7 +484,7 @@ WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/mai
 
 Fetch the SwiftUI Interop guide:
 ```
-WebFetch: https://raw.githubusercontent.com/justinwojo/swift-dotnet-bindings/main/docs/SwiftUI-Interop.md
+WebFetch: https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/SwiftUI-Interop.md
 ```
 
 SwiftUI views are automatically detected and bridged — the user doesn't need to do anything extra. The bridge generates `{View}Session` classes that wrap the SwiftUI view in a `UIHostingController`.
@@ -492,6 +492,6 @@ SwiftUI views are automatically detected and bridged — the user doesn't need t
 ## Project Links
 
 - **Repository**: https://github.com/justinwojo/swift-dotnet-bindings
-- **Documentation**: https://github.com/justinwojo/swift-dotnet-bindings/tree/main/docs
+- **Documentation**: https://github.com/justinwojo/swift-dotnet-bindings/wiki
 - **spm-to-xcframework**: https://github.com/justinwojo/spm-to-xcframework
 - **File issues**: https://github.com/justinwojo/swift-dotnet-bindings/issues
