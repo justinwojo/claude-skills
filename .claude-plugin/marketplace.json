@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Personal collection of Claude skills",
-    "version": "1.0.0"
+    "version": "1.2.0"
   },
   "plugins": [
     {
@@ -25,6 +25,22 @@
       "strict": false,
       "skills": [
         "./swift-binding-assistant"
+      ]
+    },
+    {
+      "name": "smart-permissions",
+      "description": "Smart autonomous permission management for Claude Code with configurable safe commands, path-based security, dangerous command blocking, and optional LLM safety evaluation fallback",
+      "source": "./",
+      "strict": false,
+      "skills": []
+    },
+    {
+      "name": "session-orchestrator",
+      "description": "Orchestrate multi-session design doc execution using agent teams, spawning one worker per session sequentially with fresh context and optional AI pair review",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./session-orchestrator"
       ]
     }
   ]

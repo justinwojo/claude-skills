@@ -66,6 +66,51 @@ Optionally override default models: `OPENAI_MODEL`, `GEMINI_MODEL`, `GROK_MODEL`
 
 See [ai-pair-programming/SKILL.md](ai-pair-programming/SKILL.md) for full documentation.
 
+---
+
+### session-orchestrator
+
+Autonomously execute multi-session design docs using agent teams. A lead orchestrator reads your design doc, spawns one worker per session sequentially (each with fresh context), verifies deliverables, and reports results.
+
+**How it works:**
+
+```
+Lead (reads design doc, creates team, directs everything)
+ ├── session-1-worker → implements, validates, reviews, commits
+ ├── session-2-worker → picks up from session 1, same workflow
+ └── final validation, cleanup, summary to user
+```
+
+**Setup:** Requires the experimental agent teams feature. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
+```
+
+If the [ai-pair-programming](#ai-pair-programming) skill is installed and configured, workers automatically get external AI code review before committing. Without it, workers perform a self-review instead.
+
+**Example usage:**
+
+> "Orchestrate this design doc: docs/refactor-plan.md"
+>
+> "Run the sessions from my design doc"
+
+See [session-orchestrator/SKILL.md](session-orchestrator/SKILL.md) for the full skill specification.
+
+---
+
+### smart-permissions
+
+A PreToolUse hook that replaces the built-in permission prompts with configurable, rule-based auto-approval — safe commands execute immediately, dangerous patterns are blocked, and everything else falls through to an optional LLM safety evaluation or the standard permission prompt.
+
+**Setup:** Install the plugin — no API keys required. Optionally set `SAFETY_HOOK_API_KEY` (plus `SAFETY_HOOK_API_URL` and `SAFETY_HOOK_MODEL`) for LLM fallback evaluation. Customize allowed commands/paths via `~/.claude/smart-permissions-config.json`.
+
+See [smart-permissions/README.md](smart-permissions/README.md) for full documentation.
+
 ## License
 
 MIT

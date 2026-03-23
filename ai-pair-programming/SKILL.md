@@ -20,9 +20,9 @@ Query external LLMs with rich context for code review, improvement suggestions, 
 Override default model selection per provider:
 | Provider | Environment Variable | Default |
 |----------|---------------------|---------|
-| OpenAI | `OPENAI_MODEL` | gpt-5.2 |
+| OpenAI | `OPENAI_MODEL` | gpt-5.4 |
 | Gemini | `GEMINI_MODEL` | gemini-3.1-pro-preview |
-| Grok | `GROK_MODEL` | grok-4-1-fast-reasoning |
+| Grok | `GROK_MODEL` | grok-4.20-0309-reasoning |
 
 Models can also be specified per-query via `--models openai:gpt-4-turbo`.
 
@@ -60,9 +60,10 @@ Specify what you need:
 
 ### 5. Target Models
 Query one or more:
-- `openai` (gpt-5.2, gpt-5, gpt-4o, o3-mini)
+- `openai` (gpt-5.4, gpt-5.2, gpt-5, gpt-4o, o3-mini)
 - `gemini` (gemini-3.1-pro-preview, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-flash)
-- `grok` (grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning)
+- `grok` (grok-4.20-0309-reasoning, grok-4.20-0309-non-reasoning, grok-4-1-fast-reasoning, grok-4-1-fast-non-reasoning, grok-4.20-multi-agent-0309)
+  - **Note:** `grok-4.20-multi-agent-0309` has ~150K tokens of internal overhead per request — avoid for simple reviews.
 
 ### 6. Temperature Selection
 Use `--temperature` (or `-t`) to control response creativity. Choose based on the task:
@@ -72,7 +73,7 @@ Use `--temperature` (or `-t`) to control response creativity. Choose based on th
 | **0.2** | Bug hunting, security review, finding specific issues, factual questions |
 | **0.4** | Code review, explaining code, analyzing logic, technical Q&A |
 | **0.5** | Refactoring suggestions, code improvements, best practices |
-| **0.7** | General guidance, architectural feedback, plan review (default) |
+| **0.7** | General guidance, architectural feedback, plan review |
 | **0.8** | Brainstorming approaches, exploring alternatives, creative solutions |
 | **1.0** | Novel ideas, unconventional approaches, "what if" scenarios |
 
@@ -85,13 +86,12 @@ Use `--temperature` (or `-t`) to control response creativity. Choose based on th
 
 ### query_llm.py - Single or Multi-Model Query
 ```bash
+# Defaults to --request review --temperature 0.4
 python scripts/query_llm.py \
-  --models grok,gemini \
+  --models openai,grok \
   --files src/handlers.ts src/converters/request.ts \
   --diff main \
   --project "Node.js proxy server with Fastify" \
-  --request review \
-  --temperature 0.4 \
   --context "Recently added debug logging, want to verify no performance regressions"
 ```
 
@@ -127,7 +127,7 @@ If the user doesn't provide `--project`, infer it from the repo. Check for packa
 2. Include key source files the plan references so the model can assess feasibility.
 
 ### Token Budget
-The script warns when the prompt exceeds ~50K tokens. Most models have 128K context windows. To stay within limits:
+Keep reviews under ~200K input tokens. Most providers charge higher rates beyond that threshold. The script warns at 50K and 100K. To keep reviews sharp and cost-effective:
 - Send the most relevant files, not every file in the repo.
 - For large files (1000+ lines), consider sending only the changed sections or using Grep output instead.
 - The diff alone is often sufficient context — only include full files when the reviewer needs surrounding code to judge correctness.
@@ -161,14 +161,11 @@ Query all three AIs about the best approach for caching in this project.
 
 When querying multiple models, responses are returned with clear attribution:
 ```
-=== GROK (grok-4-1-fast-reasoning) ===
-[Grok's response]
-
-=== GEMINI (gemini-3-flash-preview) ===
-[Gemini's response]
-
-=== OPENAI (gpt-5.2) ===
+=== OPENAI (gpt-5.4) ===
 [OpenAI's response]
+
+=== GROK (grok-4.20-0309-reasoning) ===
+[Grok's response]
 ```
 
 ### Verifying and Presenting Results

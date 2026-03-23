@@ -69,33 +69,62 @@
 
 ## xAI Grok API
 
-**Endpoint:** `https://api.x.ai/v1/chat/completions`
 **Auth:** Bearer token via `Authorization` header
 **API Key:** `XAI_API_KEY`
-**Model Override:** `GROK_MODEL` (default: grok-2)
+**Model Override:** `GROK_MODEL` (default: grok-4-1-fast-reasoning)
+
+### Endpoints
+| Endpoint | Models | Notes |
+|----------|--------|-------|
+| `https://api.x.ai/v1/chat/completions` | grok-4-1-fast-* | OpenAI-compatible |
+| `https://api.x.ai/v1/responses` | grok-4.20-* | Responses API (required for 4.20 models) |
 
 ### Models
 | Model | Context | Best For |
 |-------|---------|----------|
-| grok-4-1-fast-reasoning | 128K | Latest, reasoning |
-| grok-2 | 128K | Capable |
-| grok-2-mini | 128K | Faster, lighter |
+| grok-4.20-multi-agent-0309 | 2M | Multi-agent, tool use |
+| grok-4.20-0309-reasoning | 2M | Reasoning |
+| grok-4.20-0309-non-reasoning | 2M | Fast, non-reasoning |
+| grok-4-1-fast-reasoning | 2M | Fast reasoning |
+| grok-4-1-fast-non-reasoning | 2M | Fast, non-reasoning |
 
-### Request Format
+### Chat Completions Request (grok-4-1-fast-*)
 ```json
 {
-  "model": "grok-2",
+  "model": "grok-4-1-fast-reasoning",
   "messages": [{"role": "user", "content": "..."}],
   "temperature": 0.7
 }
 ```
 
-### Response Format
+### Chat Completions Response
 ```json
 {
   "choices": [{
     "message": {"role": "assistant", "content": "..."}
   }]
+}
+```
+
+### Responses API Request (grok-4.20-*)
+```json
+{
+  "model": "grok-4.20-multi-agent-0309",
+  "input": [{"role": "user", "content": "..."}],
+  "temperature": 0.7,
+  "store": false
+}
+```
+
+### Responses API Response
+```json
+{
+  "output": [{
+    "content": [{"type": "output_text", "text": "..."}],
+    "role": "assistant",
+    "status": "completed"
+  }],
+  "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150}
 }
 ```
 

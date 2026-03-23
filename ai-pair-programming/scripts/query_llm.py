@@ -24,8 +24,8 @@ API_CONFIG = {
         "env_key": "OPENAI_API_KEY",
         "model_env_key": "OPENAI_MODEL",
         "base_url": "https://api.openai.com/v1/chat/completions",
-        "default_model": "gpt-5.2",
-        "models": ["gpt-5.2", "gpt-5", "gpt-4o", "o3-mini"],
+        "default_model": "gpt-5.4",
+        "models": ["gpt-5.4", "gpt-5.2", "gpt-5", "gpt-4o", "o3-mini"],
     },
     "gemini": {
         "env_key": "GOOGLE_AI_API_KEY",
@@ -38,10 +38,22 @@ API_CONFIG = {
         "env_key": "XAI_API_KEY",
         "model_env_key": "GROK_MODEL",
         "base_url": "https://api.x.ai/v1/chat/completions",
-        "default_model": "grok-4-1-fast-reasoning",
-        "models": ["grok-4-1-fast-reasoning", "grok-4-1-fast-non-reasoning"],
+        "responses_url": "https://api.x.ai/v1/responses",
+        "default_model": "grok-4.20-0309-reasoning",
+        "models": [
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-multi-agent-0309",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4-1-fast-reasoning",
+            "grok-4-1-fast-non-reasoning",
+        ],
     },
 }
+
+
+def _is_grok_responses_model(model: str) -> bool:
+    """Check if a Grok model requires the /v1/responses endpoint."""
+    return model.startswith("grok-4.20")
 
 
 def get_default_model(provider: str) -> str:
@@ -332,6 +344,57 @@ def query_grok(prompt: str, model: str, api_key: str, temperature: float = 0.7,
         raise Exception(f"HTTP {e.code}: {error_body}")
 
 
+def query_grok_responses(prompt: str, model: str, api_key: str, temperature: float = 0.7,
+                         system_prompt: Optional[str] = None) -> LLMResponse:
+    """Query xAI Grok via the /v1/responses endpoint (required for grok-4.20 models)."""
+    import urllib.request
+    import urllib.error
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "AI-Pair-Programming/1.0",
+    }
+    input_messages = []
+    if system_prompt:
+        input_messages.append({"role": "system", "content": system_prompt})
+    input_messages.append({"role": "user", "content": prompt})
+
+    data = json.dumps({
+        "model": model,
+        "input": input_messages,
+        "temperature": temperature,
+        "store": False,
+    }).encode()
+
+    req = urllib.request.Request(
+        API_CONFIG["grok"]["responses_url"],
+        data=data,
+        headers=headers,
+        method="POST"
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            result = json.loads(resp.read().decode())
+            # Extract text from responses API format
+            text = ""
+            for output_item in result.get("output", []):
+                for content_item in output_item.get("content", []):
+                    if content_item.get("type") == "output_text":
+                        text += content_item.get("text", "")
+            usage = result.get("usage", {})
+            return LLMResponse(
+                content=text,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                total_tokens=usage.get("total_tokens"),
+            )
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode() if e.fp else ""
+        raise Exception(f"HTTP {e.code}: {error_body}")
+
+
 def query_provider(provider: str, model: Optional[str], prompt: str, temperature: float = 0.7,
                    system_prompt: Optional[str] = None) -> tuple[str, str, LLMResponse]:
     """Query a single provider and return (provider, model, LLMResponse)."""
@@ -352,7 +415,11 @@ def query_provider(provider: str, model: Optional[str], prompt: str, temperature
     }
 
     try:
-        response = query_funcs[provider](prompt, model, api_key, temperature, system_prompt)
+        # Route grok-4.20 models to the /v1/responses endpoint
+        if provider == "grok" and _is_grok_responses_model(model):
+            response = query_grok_responses(prompt, model, api_key, temperature, system_prompt)
+        else:
+            response = query_funcs[provider](prompt, model, api_key, temperature, system_prompt)
         return provider, model, response
     except Exception as e:
         return provider, model, LLMResponse(content=f"Error: {str(e)}")
@@ -376,7 +443,7 @@ def main():
                         help="Include git diff. Use: --diff (unstaged), --diff staged, --diff main, --diff <commit>")
     parser.add_argument("--project", "-p", default=None,
                         help="Project context (tech stack, framework, etc.)")
-    parser.add_argument("--request", "-r", default="guidance",
+    parser.add_argument("--request", "-r", default="review",
                         choices=["review", "improve", "feedback", "guidance"],
                         help="Type of request")
     parser.add_argument("--context", "-c", default=None,
@@ -387,8 +454,8 @@ def main():
                         help="Output file (default: stdout)")
     parser.add_argument("--json", action="store_true",
                         help="Output as JSON")
-    parser.add_argument("--temperature", "-t", type=float, default=0.7,
-                        help="Temperature (0.0=deterministic, 1.0=creative). Default: 0.7")
+    parser.add_argument("--temperature", "-t", type=float, default=0.4,
+                        help="Temperature (0.0=deterministic, 1.0=creative). Default: 0.4")
 
     args = parser.parse_args()
 
@@ -414,9 +481,14 @@ def main():
 
     # Estimate token count and warn if large (~4 chars per token)
     estimated_tokens = len(prompt) // 4
-    if estimated_tokens > 100_000:
+    if estimated_tokens > 200_000:
         print(f"Warning: Estimated prompt size is ~{estimated_tokens:,} tokens. "
-              f"Some models may truncate or reject this. Consider sending fewer/smaller files.",
+              f"Exceeds 200K — most providers charge higher rates beyond this. "
+              f"Consider sending fewer/smaller files.",
+              file=sys.stderr)
+    elif estimated_tokens > 100_000:
+        print(f"Warning: Estimated prompt size is ~{estimated_tokens:,} tokens. "
+              f"Approaching 200K limit. Consider sending fewer/smaller files.",
               file=sys.stderr)
     elif estimated_tokens > 50_000:
         print(f"Note: Estimated prompt size is ~{estimated_tokens:,} tokens.", file=sys.stderr)

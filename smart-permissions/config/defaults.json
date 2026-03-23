@@ -1,0 +1,128 @@
+{
+  "_comment": "Default configuration for smart-permissions hook. Override any section by creating ~/.claude/smart-permissions-config.json with the keys you want to change. Arrays are merged (union), not replaced.",
+
+  "safe_commands": [
+    "__ Dev tools __",
+    "dotnet", "git", "npm", "pnpm", "yarn", "pip", "poetry",
+    "make", "cmake", "cargo", "rustc", "go", "node",
+    "python", "python3", "ruby", "perl", "swift", "swiftc",
+    "docker", "docker-compose", "gh", "just", "npx", "claude",
+    "xcodebuild", "xcrun", "xcode-select", "brew", "nuget",
+
+    "__ System utilities __",
+    "tree", "ls", "pwd", "which", "env", "export", "source",
+    "cd", "echo", "cat", "head", "tail", "wc", "tee", "file",
+    "du", "df", "test", "sleep", "printf", "date", "uname",
+    "open", "pbcopy", "pbpaste", "paste", "xattr", "exit",
+    "xmllint", "sips",
+
+    "__ File operations __",
+    "mkdir", "touch", "cp", "mv", "rm", "rmdir", "ln",
+    "chmod", "chown", "tar", "zip", "unzip",
+
+    "__ Search and text tools __",
+    "grep", "rg", "find", "fd", "jq", "yq",
+    "sed", "awk", "sort", "uniq", "diff", "patch", "xargs",
+    "cut", "tr", "column", "comm",
+
+    "__ Binary inspection and hash utilities __",
+    "nm", "otool", "lipo", "codesign", "plutil", "vtool", "defaults", "strings",
+    "md5", "stat", "xxd", "shasum", "sha256sum",
+
+    "__ Compilers __",
+    "clang", "clang++", "gcc", "g++", "cc", "c++",
+
+    "__ Process management __",
+    "ps", "pkill", "killall", "kill", "lsof", "timeout", "gtimeout", "time",
+
+    "__ Network __",
+    "curl", "wget",
+
+    "__ Modern CLI tools __",
+    "eza", "bat", "repomix",
+
+    "__ Shell builtins and meta __",
+    "!", "bash", "sh", "zsh", "true", "false", "command", "type",
+    "set", "[", "[[",
+    "local", "return", "declare", "typeset", "readonly", "unset",
+    "eval", "exec", "read", "trap", "wait", "shift",
+    "function", "{", "}",
+
+    "__ Shell flow-control keywords __",
+    "for", "do", "done", "while", "until",
+    "if", "then", "else", "elif", "fi",
+    "case", "esac", "in", "select",
+    "break", "continue",
+
+    "__ Path utilities __",
+    "basename", "dirname", "realpath", "readlink"
+  ],
+
+  "safe_write_paths": [
+    "~/Dev/",
+    "/tmp/",
+    "/private/tmp/",
+    "/var/folders/",
+    "/private/var/folders/",
+    "~/.claude/"
+  ],
+
+  "safe_script_paths": [
+    "~/Dev/",
+    "/tmp/",
+    "/private/tmp/",
+    "/usr/local/bin/",
+    "/usr/local/share/",
+    "/opt/homebrew/bin/"
+  ],
+
+  "allowed_web_domains": [
+    "github.com",
+    "raw.githubusercontent.com",
+    "stackoverflow.com",
+    "developer.apple.com",
+    "learn.microsoft.com",
+    "docs.python.org",
+    "docs.rs",
+    "pkg.go.dev",
+    "npmjs.com",
+    "pypi.org",
+    "crates.io"
+  ],
+
+  "sensitive_paths": [
+    "/.ssh/",
+    "/.aws/",
+    "/.config/gh/",
+    "/.env"
+  ],
+
+  "dangerous_patterns": [
+    "\\bsudo\\b",
+    "\\brm\\s+(-[a-zA-Z]*)?r[a-zA-Z]*f[a-zA-Z]*\\s+/(\\s|$)",
+    "\\brm\\s+(-[a-zA-Z]*)?f[a-zA-Z]*r[a-zA-Z]*\\s+/(\\s|$)",
+    "\\brm\\s+(-\\S+\\s+)*['\"]\\/(\\s|$|['\"])",
+    ">\\s*/dev/(?!null)",
+    "\\bmkfs\\b",
+    "\\bdd\\b.*\\bof=/dev/",
+    ":\\s*\\(\\)\\s*\\{.*\\|.*&",
+    "\\bcurl\\b.*\\|\\s*(ba)?sh\\b",
+    "\\bwget\\b.*\\|\\s*(ba)?sh\\b",
+    "\\b(ba)?sh\\s+<\\s*\\(\\s*(curl|wget)\\b",
+    "\\bsource\\s+<\\s*\\(\\s*(curl|wget)\\b"
+  ],
+
+  "risky_patterns": [
+    "\\brm\\s+(-\\S+\\s+)*(\\.\\*|\\*)(\\s|$)",
+    "\\bfind\\s+/\\s.*-delete\\b",
+    "\\bfind\\s+/\\s.*-exec\\s+rm\\b",
+    "\\b(tar|unzip|cpio)\\b.*(-C|--directory|-d)\\s+['\"]?/(?:usr|etc|bin|sbin|System|Library)?/?['\"]?(\\s|$)"
+  ],
+
+  "interpreter_exec_flags": {
+    "bash": ["-c"],
+    "sh": ["-c"],
+    "zsh": ["-c"],
+    "osascript": ["-e"]
+  }
+}

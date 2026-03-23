@@ -1,0 +1,42 @@
+{
+  "_comment": "Windows-specific defaults. Merged on top of defaults.json when running on Windows.",
+
+  "safe_commands": [
+    "__ Windows-specific tools __",
+    "powershell", "pwsh", "cmd",
+    "choco", "scoop", "winget",
+    "msbuild", "devenv",
+    "where", "type", "dir", "copy", "move", "del", "ren",
+    "mkdir", "rmdir", "cls", "more", "findstr", "attrib",
+    "icacls", "certutil", "tasklist", "taskkill",
+    "wsl", "wt"
+  ],
+
+  "safe_write_paths": [
+    "~/Dev/",
+    "~/Documents/",
+    "~/source/",
+    "~/.claude/"
+  ],
+
+  "safe_script_paths": [
+    "~/Dev/",
+    "~/source/"
+  ],
+
+  "dangerous_patterns": [
+    "\\bFormat-Volume\\b",
+    "\\bRemove-Item\\s+.*-Recurse.*-Force.*['\"]?[A-Z]:\\\\['\"]?(\\s|$)",
+    "\\bRemove-Item\\s+.*-Force.*-Recurse.*['\"]?[A-Z]:\\\\['\"]?(\\s|$)",
+    "\\bdel\\s+/s\\s+/q\\s+[A-Z]:\\\\",
+    "\\bformat\\s+[A-Z]:",
+    "\\bInvoke-WebRequest\\b.*\\|\\s*Invoke-Expression\\b",
+    "\\biwr\\b.*\\|\\s*iex\\b",
+    "\\bIEX\\s*\\(.*\\bNew-Object\\b.*\\bNet\\.WebClient\\b"
+  ],
+
+  "risky_patterns": [
+    "\\bRemove-Item\\s+.*\\*",
+    "\\bdel\\s+.*\\*"
+  ]
+}
