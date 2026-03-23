@@ -65,8 +65,8 @@ def run_hook(script, payload, env_overrides=None):
         decision = hook.get('decision', {})
         if 'behavior' in decision:
             return decision['behavior']
-    # No output = fall through to prompt
-    return 'prompt'
+    # No output = fall through to built-in prompt (silent exit)
+    return 'ask'
 
 
 def check(name, actual, expected):
@@ -219,6 +219,22 @@ def test_pretool_unknown_tools():
     check('SomeNewTool → ask', result, 'ask')
 
 
+def test_pretool_mcp_tools():
+    """MCP tools matched by safe_mcp_tools patterns should be allowed."""
+    print('\n--- PreToolUse: MCP tools ---')
+    # These should match patterns in safe_mcp_tools (if configured)
+    # Without config, all MCP tools should ask
+    result = run_hook(PRETOOL, {'tool_name': 'mcp__sentry__get_issue', 'tool_input': {}})
+    check('mcp__sentry__get_issue (no config) → ask', result, 'ask')
+
+    result = run_hook(PRETOOL, {'tool_name': 'mcp__sentry__resolve_issue', 'tool_input': {}})
+    check('mcp__sentry__resolve_issue (no config) → ask', result, 'ask')
+
+    # Non-MCP unknown tool should also ask
+    result = run_hook(PRETOOL, {'tool_name': 'SomeRandomTool', 'tool_input': {}})
+    check('non-MCP unknown → ask', result, 'ask')
+
+
 # =====================================================================
 #  PermissionRequest Learner Tests
 # =====================================================================
@@ -260,14 +276,14 @@ def test_learner_risky_prompts():
     for name, cmd_b64 in cases:
         cmd = base64.b64decode(cmd_b64).decode()
         result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}})
-        check(f'{name} → prompt', result, 'prompt')
+        check(f'{name} → ask', result, 'ask')
 
 
 def test_learner_interpreter_prompts():
     """Interpreter exec flags should fall through to user prompt."""
     print('\n--- PermissionRequest: Interpreter exec (fall through) ---')
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'bash -c "whoami"'}})
-    check('bash -c → prompt', result, 'prompt')
+    check('bash -c → ask', result, 'ask')
 
 
 def test_learner_other_tools():
@@ -279,13 +295,13 @@ def test_learner_other_tools():
     check('WebFetch unknown domain → allow', result, 'allow')
 
     result = run_hook(LEARNER, {'tool_name': 'Write', 'tool_input': {'file_path': '/opt/app/config.yml'}})
-    check('Write outside safe path (system) → prompt', result, 'prompt')
+    check('Write outside safe path (system) → ask', result, 'ask')
 
     result = run_hook(LEARNER, {'tool_name': 'Edit', 'tool_input': {'file_path': f'{home}/.ssh/config'}})
     check('Edit sensitive path → deny', result, 'deny')
 
     result = run_hook(LEARNER, {'tool_name': 'LSP', 'tool_input': {}})
-    check('Unknown tool → prompt', result, 'prompt')
+    check('Unknown tool → ask', result, 'ask')
 
 
 # =====================================================================
@@ -381,7 +397,7 @@ def test_quoted_interpreter_flag_bypass():
     # Also check learner
     print('\n--- Security: Quoted interpreter in learner ---')
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'bash "-c" "evil"'}})
-    check('bash "-c" in learner → prompt', result, 'prompt')
+    check('bash "-c" in learner → ask', result, 'ask')
 
 
 def test_relative_path_traversal():
@@ -452,22 +468,22 @@ def test_learner_compound_body_bypass():
     # bash -c in case arm — learner must not auto-approve
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {
         'command': 'case x in a) bash "-c" "evil";; esac'}})
-    check('bash "-c" in case arm (learner) → prompt', result, 'prompt')
+    check('bash "-c" in case arm (learner) → ask', result, 'ask')
 
     # bash -c in function body — learner must not auto-approve
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {
         'command': 'f() { bash -c "evil"; }\nf'}})
-    check('bash -c in func body (learner) → prompt', result, 'prompt')
+    check('bash -c in func body (learner) → ask', result, 'ask')
 
     # $CMD in function body — learner must not auto-approve
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {
         'command': 'f() { $CMD whoami; }\nf'}})
-    check('$CMD in func body (learner) → prompt', result, 'prompt')
+    check('$CMD in func body (learner) → ask', result, 'ask')
 
     # Unknown command in case arm — learner must not auto-approve
     result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {
         'command': 'case x in a) unknowncmd foo;; esac'}})
-    check('unknowncmd in case arm (learner) → prompt', result, 'prompt')
+    check('unknowncmd in case arm (learner) → ask', result, 'ask')
 
 
 def test_write_learning_system_paths():
@@ -477,11 +493,11 @@ def test_write_learning_system_paths():
     # System path should fall through to prompt
     result = run_hook(LEARNER, {'tool_name': 'Write', 'tool_input': {
         'file_path': '/etc/cron.d/malicious'}})
-    check('Write /etc/cron.d/ → prompt', result, 'prompt')
+    check('Write /etc/cron.d/ → ask', result, 'ask')
 
     result = run_hook(LEARNER, {'tool_name': 'Write', 'tool_input': {
         'file_path': '/usr/local/bin/evil'}})
-    check('Write /usr/local/bin/ → prompt', result, 'prompt')
+    check('Write /usr/local/bin/ → ask', result, 'ask')
 
     # Home dir should still auto-approve
     home = os.path.expanduser('~')
@@ -609,6 +625,7 @@ if __name__ == '__main__':
     test_pretool_file_paths()
     test_pretool_webfetch()
     test_pretool_unknown_tools()
+    test_pretool_mcp_tools()
     test_pretool_edge_cases()
     test_dollar_prefixed_bypass()
     test_quoted_interpreter_flag_bypass()

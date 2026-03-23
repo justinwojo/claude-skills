@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Personal collection of Claude skills",
-    "version": "1.2.0"
+    "version": "1.2.1"
   },
   "plugins": [
     {
@@ -32,6 +32,9 @@
       "description": "Smart autonomous permission management for Claude Code with configurable safe commands, path-based security, dangerous command blocking, and optional LLM safety evaluation fallback",
       "source": "./smart-permissions",
       "strict": false,
+      "commands": [
+        "./commands/"
+      ],
       "hooks": {
         "PreToolUse": [
           {
@@ -40,18 +43,6 @@
               {
                 "type": "command",
                 "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pretool_safety.py",
-                "timeout": 30
-              }
-            ]
-          }
-        ],
-        "PermissionRequest": [
-          {
-            "matcher": "",
-            "hooks": [
-              {
-                "type": "command",
-                "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/permission_learner.py",
                 "timeout": 30
               }
             ]

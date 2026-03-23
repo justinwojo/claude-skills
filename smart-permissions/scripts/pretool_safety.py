@@ -23,6 +23,7 @@ import sys
 import json
 import os
 import re
+from fnmatch import fnmatch
 from datetime import datetime
 import urllib.request
 import urllib.error
@@ -86,10 +87,15 @@ def load_config():
             os.makedirs(os.path.dirname(USER_CONFIG_PATH), exist_ok=True)
             with open(USER_CONFIG_PATH, "w") as f:
                 json.dump({
-                    "_comment": "Smart Permissions user config. Add your own commands, paths, and domains here. Arrays are merged with defaults — only add what's unique to your workflow.",
+                    "_comment": "Smart Permissions user config. Arrays are merged with defaults, so only add what's unique to your workflow.",
                     "safe_commands": [],
+                    "_safe_commands_examples": ["flutter", "dart", "gradle", "kubectl", "terraform", "ansible", "helm"],
                     "safe_write_paths": [],
+                    "_safe_write_paths_examples": ["~/Projects/", "~/workspace/"],
                     "allowed_web_domains": [],
+                    "_allowed_web_domains_examples": ["docs.flutter.dev", "pub.dev", "registry.terraform.io"],
+                    "safe_mcp_tools": [],
+                    "_safe_mcp_tools_examples": ["mcp__sentry__get_*", "mcp__sentry__list_*", "mcp__github__get_*", "mcp__github__list_*", "mcp__github__search_*"],
                 }, f, indent=2)
                 f.write("\n")
         except OSError:
@@ -137,6 +143,7 @@ SAFE_COMMANDS = set(_strip_comments(_CONFIG.get("safe_commands", [])))
 SAFE_WRITE_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_write_paths", [])]
 SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_script_paths", [])]
 ALLOWED_WEB_DOMAINS = _CONFIG.get("allowed_web_domains", [])
+SAFE_MCP_TOOLS = _CONFIG.get("safe_mcp_tools", [])
 SENSITIVE_PATHS = _CONFIG.get("sensitive_paths", [])
 DANGEROUS_PATTERNS = _CONFIG.get("dangerous_patterns", [])
 RISKY_PATTERNS = _CONFIG.get("risky_patterns", [])
@@ -150,22 +157,16 @@ INTERPRETER_EXEC_FLAGS = {k: set(v) for k, v in _raw_interp.items()}
 # LLM SAFETY EVALUATION (optional fallback)
 # ============================================================
 
-# Supports any OpenAI-compatible API (xAI Grok, OpenAI, Ollama, etc.)
+# Supports any OpenAI-compatible chat completions API.
 # Set env vars to enable:
-#   SAFETY_HOOK_API_URL  - API endpoint (default: xAI Grok)
-#   SAFETY_HOOK_API_KEY  - API key (falls back to XAI_API_KEY for compat)
-#   SAFETY_HOOK_MODEL    - Model name (default: grok-4-1-fast-reasoning)
-LLM_API_URL = os.environ.get(
-    "SAFETY_HOOK_API_URL",
-    "https://api.x.ai/v1/chat/completions"
-)
-LLM_API_KEY = os.environ.get(
-    "SAFETY_HOOK_API_KEY",
-    os.environ.get("XAI_API_KEY", "")
-)
+#   SAFETY_HOOK_API_URL  - Chat completions endpoint (required)
+#   SAFETY_HOOK_API_KEY  - API key (required — LLM disabled if empty)
+#   SAFETY_HOOK_MODEL    - Model name (required)
+LLM_API_URL = os.environ.get("SAFETY_HOOK_API_URL", "")
+LLM_API_KEY = os.environ.get("SAFETY_HOOK_API_KEY", "")
 LLM_MODEL = os.environ.get(
     "SAFETY_HOOK_MODEL",
-    "grok-4-1-fast-reasoning"
+    ""
 )
 
 # When true, commands/paths/domains approved by the LLM are automatically
@@ -279,8 +280,8 @@ def _auto_learn(tool, tool_input):
 
 def llm_evaluate(tool, tool_input):
     """Call an LLM to evaluate a tool call that local rules couldn't decide."""
-    if not LLM_API_KEY:
-        return ("ask", "No LLM API key set — manual approval required")
+    if not LLM_API_KEY or not LLM_API_URL or not LLM_MODEL:
+        return ("ask", "LLM not configured — set SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY, and SAFETY_HOOK_MODEL")
 
     prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
 
@@ -346,6 +347,13 @@ def main():
     if decision == "ask":
         decision, reason = llm_evaluate(tool, tool_input)
 
+    # If still "ask" after both local rules and LLM, exit silently
+    # so the built-in permission system takes over (which includes
+    # the "Always allow" option). Outputting "ask" would show a
+    # hook-specific Yes/No dialog instead.
+    if decision == "ask":
+        sys.exit(0)
+
     output_decision(decision, reason)
 
 
@@ -397,6 +405,10 @@ def evaluate(tool, tool_input):
     if tool in ("TeamCreate", "TeamDelete", "SendMessage"):
         return ("allow", "Team management tool")
 
+    # MCP tools — match against safe_mcp_tools patterns
+    if tool.startswith("mcp__"):
+        return evaluate_mcp_tool(tool)
+
     # Unknown tool — log and let normal permissions handle it
     log_unknown("tool", tool)
     return ("ask", f"Unknown tool: {tool} (logged)")
@@ -442,6 +454,22 @@ def evaluate_web_fetch(tool_input):
         if hostname == domain or hostname.endswith("." + domain):
             return ("allow", f"Allowed domain: {domain}")
     return ("ask", f"Domain not in allow list: {hostname}")
+
+
+def evaluate_mcp_tool(tool):
+    """Evaluate MCP tool calls against safe_mcp_tools patterns.
+
+    Patterns support fnmatch-style globs:
+      "mcp__sentry__get_*"     — all get operations from sentry
+      "mcp__sentry__list_*"    — all list operations from sentry
+      "mcp__github__*"         — everything from github (full trust)
+      "mcp__*__get_*"          — all get operations from any server
+    """
+    for pattern in SAFE_MCP_TOOLS:
+        if fnmatch(tool, pattern):
+            return ("allow", f"MCP tool matched: {pattern}")
+    log_unknown("mcp_tool", tool)
+    return ("ask", f"MCP tool not in safe list: {tool}")
 
 
 def _is_destructive_rm(command):

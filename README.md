@@ -105,9 +105,11 @@ See [session-orchestrator/SKILL.md](session-orchestrator/SKILL.md) for the full 
 
 ### smart-permissions
 
-A PreToolUse hook that replaces the built-in permission prompts with configurable, rule-based auto-approval — safe commands execute immediately, dangerous patterns are blocked, and everything else falls through to an optional LLM safety evaluation or the standard permission prompt.
+A PreToolUse hook that replaces the built-in permission prompts with configurable, rule-based auto-approval — safe commands execute immediately, dangerous patterns are blocked, and everything else falls through to an optional LLM safety evaluation or the standard permission prompt (with "Always allow" support).
 
-**Setup:** Install the plugin — no API keys required. Optionally set `SAFETY_HOOK_API_KEY` (plus `SAFETY_HOOK_API_URL` and `SAFETY_HOOK_MODEL`) for LLM fallback evaluation. Customize allowed commands/paths via `~/.claude/smart-permissions-config.json`.
+Includes MCP tool support with glob patterns for granular read-only vs write approval (e.g., `mcp__sentry__get_*`).
+
+**Setup:** Install the plugin — no API keys required. Optionally set `SAFETY_HOOK_API_KEY` (plus `SAFETY_HOOK_API_URL` and `SAFETY_HOOK_MODEL`) for LLM fallback evaluation. Customize allowed commands/paths/MCP tools via `~/.claude/smart-permissions-config.json`.
 
 See [smart-permissions/README.md](smart-permissions/README.md) for full documentation.
 
