@@ -30,7 +30,7 @@
     {
       "name": "smart-permissions",
       "description": "Smart autonomous permission management for Claude Code with configurable safe commands, path-based security, dangerous command blocking, and optional LLM safety evaluation fallback",
-      "source": "./",
+      "source": "./smart-permissions",
       "strict": false,
       "skills": []
     },
