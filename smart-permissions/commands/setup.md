@@ -51,12 +51,22 @@ Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
 
 Based on their choice:
 
-**OpenAI-compatible API:** Ask which provider they want to use (OpenAI, xAI Grok, Groq, Together, etc.) and show the appropriate export lines. All three variables are required:
+**OpenAI-compatible API:** Ask which provider they want to use and show the appropriate export lines. All three variables are required. Recommend these models by provider:
+
+- **xAI Grok:** `grok-4-1-fast-reasoning` — fast, cheap, and capable
+- **OpenAI:** `gpt-5.4-mini` (best balance) or `gpt-5.4-nano` (maximum cost efficiency)
+- **Groq, Together, etc.:** Whatever model they prefer
 
 ```bash
+# Example for xAI Grok:
+export SAFETY_HOOK_API_URL="https://api.x.ai/v1/chat/completions"
+export SAFETY_HOOK_API_KEY="your-api-key"
+export SAFETY_HOOK_MODEL="grok-4-1-fast-reasoning"
+
+# Example for OpenAI:
 export SAFETY_HOOK_API_URL="https://api.openai.com/v1/chat/completions"
 export SAFETY_HOOK_API_KEY="your-api-key"
-export SAFETY_HOOK_MODEL="gpt-4o-mini"
+export SAFETY_HOOK_MODEL="gpt-5.4-mini"
 ```
 
 **Ollama:** Show:
@@ -99,11 +109,16 @@ If they enable it, tell them to add `export SAFETY_HOOK_AUTO_LEARN=true` to thei
 
 Show them the current `safe_commands` list from their config (if any) and the defaults.
 
+Mention that commands support three formats:
+- **Single-word** (`flutter`) — allows all subcommands
+- **Multi-word** (`flutter doctor`, `docker compose up`) — allows only that specific subcommand
+- **Wildcards** (`kubectl get*`, `docker *`) — allows matching subcommands via glob patterns
+
 Use AskUserQuestion:
 
 ```json
 {
-  "question": "Do you want to add any commands to your safe list? These are auto-approved without prompting.",
+  "question": "Do you want to add any commands to your safe list? These are auto-approved without prompting. You can use multi-word entries (e.g. 'flutter doctor') or wildcards (e.g. 'kubectl get*').",
   "options": [
     {
       "label": "Yes, add commands",
@@ -194,6 +209,13 @@ Show a summary of everything configured:
 
 To make changes later, edit ~/.claude/smart-permissions-config.json directly
 or run /smart-permissions:setup again.
+```
+
+If LLM evaluation was configured in step 2, remind the user:
+
+```
+If you added environment variables to your shell config, either restart your
+terminal or run `source ~/.zshrc` (or `source ~/.bashrc`) to pick them up.
 ```
 
 ## Important Notes

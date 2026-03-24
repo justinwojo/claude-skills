@@ -40,7 +40,10 @@ PLUGIN_ROOT = os.path.dirname(SCRIPT_DIR)
 HOME_DIR = os.path.expanduser("~")
 
 DEFAULTS_PATH = os.path.join(PLUGIN_ROOT, "config", "defaults.json")
-USER_CONFIG_PATH = os.path.join(HOME_DIR, ".claude", "smart-permissions-config.json")
+USER_CONFIG_PATH = os.environ.get(
+    "SMART_PERMISSIONS_CONFIG",
+    os.path.join(HOME_DIR, ".claude", "smart-permissions-config.json"),
+)
 UNKNOWN_LOG = os.path.join(HOME_DIR, ".claude", "hooks", "unknown-permissions.log")
 
 
@@ -87,9 +90,9 @@ def load_config():
             os.makedirs(os.path.dirname(USER_CONFIG_PATH), exist_ok=True)
             with open(USER_CONFIG_PATH, "w") as f:
                 json.dump({
-                    "_comment": "Smart Permissions user config. Arrays are merged with defaults, so only add what's unique to your workflow.",
+                    "_comment": "Smart Permissions user config. Arrays are merged with defaults, so only add what's unique to your workflow. Commands support multi-word entries (e.g. 'flutter doctor') and wildcards (e.g. 'kubectl get*').",
                     "safe_commands": [],
-                    "_safe_commands_examples": ["flutter", "dart", "gradle", "kubectl", "terraform", "ansible", "helm"],
+                    "_safe_commands_examples": ["flutter doctor", "flutter build", "kubectl get *", "terraform plan", "docker compose *", "ansible", "helm"],
                     "safe_write_paths": [],
                     "_safe_write_paths_examples": ["~/Projects/", "~/workspace/"],
                     "allowed_web_domains": [],
@@ -139,7 +142,13 @@ def _strip_comments(items):
 # Load configuration once at module level
 _CONFIG = load_config()
 
-SAFE_COMMANDS = set(_strip_comments(_CONFIG.get("safe_commands", [])))
+_ALL_SAFE_COMMANDS = _strip_comments(_CONFIG.get("safe_commands", []))
+# Single-word commands: "git", "npm", etc. — O(1) set lookup
+SAFE_COMMANDS = set(c for c in _ALL_SAFE_COMMANDS if " " not in c and "*" not in c and "?" not in c)
+# Multi-word exact entries: "flutter doctor", "docker compose up" — O(1) set lookup
+SAFE_COMMANDS_MULTI = set(c for c in _ALL_SAFE_COMMANDS if " " in c and "*" not in c and "?" not in c)
+# Wildcard entries (single or multi-word): "kubectl get*", "docker *" — fnmatch
+SAFE_COMMANDS_WILD = [c for c in _ALL_SAFE_COMMANDS if "*" in c or "?" in c]
 SAFE_WRITE_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_write_paths", [])]
 SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_script_paths", [])]
 ALLOWED_WEB_DOMAINS = _CONFIG.get("allowed_web_domains", [])
@@ -254,9 +263,26 @@ def _auto_learn(tool, tool_input):
         command = tool_input.get("command", "")
         commands, _ = split_compound_command(command)
         for cmd in commands:
-            word = get_first_command_word(cmd)
-            if word and os.path.basename(word) not in SAFE_COMMANDS and word not in SAFE_COMMANDS:
-                learn_to_config("safe_commands", os.path.basename(word))
+            words = get_command_words(cmd, max_words=3, flag_handling="stop")
+            if not words:
+                continue
+            basename = os.path.basename(words[0])
+            # If the base command is already approved (single-word), skip
+            if basename in SAFE_COMMANDS or words[0] in SAFE_COMMANDS:
+                continue
+            # Already covered by a multi-word entry (exact or wildcard)?
+            if matches_safe_command(words[0], cmd):
+                continue
+            # Learn the most specific form we can: up to 2 subcommand words
+            # e.g. "flutter doctor", "kubectl get pods"
+            # Safety: never learn a single-word base command — if we only
+            # extracted 1 word it may be because flags obscured the real
+            # subcommand, and learning the base command would blanket-approve
+            # all subcommands including dangerous ones.
+            if len(words) < 2:
+                continue
+            to_learn = " ".join([basename] + words[1:])
+            learn_to_config("safe_commands", to_learn)
     elif tool in ("Write", "Edit", "NotebookEdit"):
         path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
         if path:
@@ -608,8 +634,8 @@ def evaluate_bash(command):
                 flag = next(iter(matched))
                 return ("ask", f"Inline interpreter execution: {basename} {flag}")
 
-        # Check known-safe commands
-        if basename in SAFE_COMMANDS or first_word in SAFE_COMMANDS:
+        # Check known-safe commands (supports multi-word like "flutter doctor")
+        if matches_safe_command(first_word, cmd):
             continue
 
         # Check user-defined shell functions
@@ -696,8 +722,8 @@ def _check_inner_commands(body_text, defined_functions):
                 flag = next(iter(exec_flags & stripped))
                 return ("ask", f"Interpreter execution in compound block: {basename} {flag}")
 
-        # Known-safe commands
-        if basename in SAFE_COMMANDS or first_word in SAFE_COMMANDS:
+        # Known-safe commands (supports multi-word like "flutter doctor")
+        if matches_safe_command(first_word, cmd):
             continue
         if first_word in defined_functions:
             continue
@@ -1011,6 +1037,227 @@ def _extract_case_arm_bodies(cmd):
             # No pattern prefix — could be continuation; check anyway
             bodies.append(arm)
     return bodies
+
+
+def get_command_words(cmd, max_words=2, flag_handling="stop"):
+    """Extract up to `max_words` command words from a single command.
+
+    Skips env variable assignments (VAR=value), leading pipes, and
+    redirections — same logic as get_first_command_word but returns a
+    list of up to `max_words` words.
+
+    flag_handling controls what happens when a flag token (starting with -)
+    is encountered while scanning for subcommand words:
+
+    - "stop" (default): Stop scanning at the first flag. Only immediately
+      adjacent subcommand words are returned.  Safe for auto-learning.
+    - "skip": Skip the flag but continue scanning. Handles boolean flags
+      before subcommands (e.g. "docker --verbose build" → ["docker", "build"]).
+    - "skip_with_value": Skip the flag AND the next token (presumed flag
+      value). Handles value flags before subcommands (e.g. "docker --context
+      prod build" → ["docker", "build"]).
+
+    matches_safe_command tries all three modes for matching; _auto_learn
+    uses only "stop" to avoid persisting ambiguous extractions.
+    """
+    if not cmd:
+        return []
+
+    cmd = cmd.strip()
+    if cmd.startswith("#"):
+        return []
+
+    tokens = cmd.split()
+    if not tokens:
+        return []
+
+    idx = 0
+
+    # Skip leading pipe tokens
+    while idx < len(tokens) and tokens[idx] == "|":
+        idx += 1
+
+    # Skip env var assignments
+    while idx < len(tokens):
+        token = tokens[idx]
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+            idx += 1
+            value_part = token.split("=", 1)[1]
+
+            if value_part and value_part[0] in ('"', "'"):
+                quote_char = value_part[0]
+                if not (len(value_part) >= 2 and value_part.endswith(quote_char)):
+                    while idx < len(tokens):
+                        if tokens[idx].endswith(quote_char):
+                            idx += 1
+                            break
+                        idx += 1
+                    continue
+
+            open_parens = value_part.count("$(")
+            close_parens = value_part.count(")")
+            while open_parens > close_parens and idx < len(tokens):
+                next_token = tokens[idx]
+                open_parens += next_token.count("$(")
+                close_parens += next_token.count(")")
+                idx += 1
+        else:
+            break
+
+    if idx >= len(tokens):
+        return []
+
+    word = tokens[idx]
+
+    if word.startswith("#"):
+        return []
+    if word.startswith(">") or word.startswith("<"):
+        return []
+    if word.startswith("$("):
+        inner = word[2:].rstrip(")")
+        return [inner] if inner else []
+    if word.startswith("$") and not word.startswith("$("):
+        return [word]
+    if word == "-":
+        return []
+
+    word = word.lstrip("(")
+    word = word.rstrip(";)")
+
+    if len(word) >= 2 and word[0] in ('"', "'") and word[-1] == word[0]:
+        word = word[1:-1]
+    elif word and word[0] in ('"', "'"):
+        return []
+
+    if not word:
+        return []
+
+    result = [word]
+
+    # Scan forward for subcommand words.
+    subcommands_needed = max_words - 1
+    scan_idx = idx
+    max_scan = min(len(tokens), idx + 12)  # Don't scan too far into args
+    while subcommands_needed > 0 and scan_idx + 1 < max_scan:
+        scan_idx += 1
+        w = tokens[scan_idx].rstrip(";)")
+
+        # Handle flags
+        if w.startswith("-"):
+            if flag_handling == "skip_with_value":
+                # Skip the flag, and if no inline value (no =), also
+                # skip the next token as a presumed flag value.
+                # Handles: docker --context prod build → ["docker", "build"]
+                if "=" not in w and scan_idx + 1 < max_scan:
+                    scan_idx += 1  # skip presumed value
+                continue
+            elif flag_handling == "skip":
+                # Skip the flag only, continue scanning.
+                # Handles: docker --verbose build → ["docker", "build"]
+                continue
+            else:
+                # "stop": conservative mode, stop at the first flag
+                break
+
+        # Only treat as a subcommand if it's a plain word —
+        # skip paths (/foo, ./bar), variables ($X),
+        # redirections (>, <), quotes, and empty results
+        if _is_subcommand_token(w):
+            result.append(w)
+            subcommands_needed -= 1
+        else:
+            break  # Stop at the first non-subcommand, non-flag token
+
+    return result
+
+
+def _is_subcommand_token(w):
+    """Check if a token looks like a CLI subcommand (plain alphanumeric word)."""
+    return (w
+            and not w.startswith("/")
+            and not w.startswith("./")
+            and not w.startswith("$")
+            and not w.startswith(">")
+            and not w.startswith("<")
+            and not w.startswith("#")
+            and "=" not in w
+            and w[0] not in ('"', "'")
+            and "/" not in w)
+
+
+def _build_candidates(words):
+    """Build candidate multi-word strings from extracted command words.
+
+    ["docker", "compose", "up"] → ["docker compose up", "docker compose"]
+    """
+    if len(words) < 2:
+        return []
+    candidates = []
+    for n in range(min(len(words), 3), 1, -1):
+        candidates.append(" ".join([os.path.basename(words[0])] + words[1:n]))
+    return candidates
+
+
+def _check_candidates(basename, candidates):
+    """Check if any candidate matches SAFE_COMMANDS_MULTI or SAFE_COMMANDS_WILD."""
+    # Check exact multi-word entries first, longest match wins
+    if SAFE_COMMANDS_MULTI:
+        for candidate in candidates:
+            if candidate in SAFE_COMMANDS_MULTI:
+                return True
+
+    # Check wildcard patterns (e.g. "kubectl get*", "docker *")
+    # A pattern like "cargo build *" also matches bare "cargo build"
+    # (trailing " *" means "with optional arguments").
+    if SAFE_COMMANDS_WILD:
+        for candidate in candidates:
+            for pattern in SAFE_COMMANDS_WILD:
+                if fnmatch(candidate, pattern):
+                    return True
+                if pattern.endswith(" *") and candidate == pattern[:-2]:
+                    return True
+        # Also test single-word against wildcards (e.g. "kube*")
+        for pattern in SAFE_COMMANDS_WILD:
+            if fnmatch(basename, pattern):
+                return True
+            if pattern.endswith(" *") and basename == pattern[:-2]:
+                return True
+
+    return False
+
+
+def matches_safe_command(first_word, cmd):
+    """Check if a command matches SAFE_COMMANDS, supporting multi-word entries.
+
+    Uses three extraction strategies and accepts if any matches:
+    1. "stop" (adjacent-only): handles "docker build -t myapp"
+    2. "skip" (skip flags only): handles "docker --verbose build"
+    3. "skip_with_value" (skip flag + value): handles "docker --context prod build"
+
+    This covers boolean flags, value flags, and no-flag cases without
+    any strategy producing false positives that could bypass restrictions.
+
+    Args:
+        first_word: The first command word (from get_first_command_word).
+        cmd: The full single-command string (for extracting subcommand words).
+
+    Returns:
+        True if the command is in SAFE_COMMANDS or SAFE_COMMANDS_MULTI.
+    """
+    if first_word is None:
+        return False
+
+    basename = os.path.basename(first_word)
+
+    # Try all three extraction strategies — accept if any matches
+    for mode in ("stop", "skip", "skip_with_value"):
+        words = get_command_words(cmd, max_words=3, flag_handling=mode)
+        candidates = _build_candidates(words)
+        if _check_candidates(basename, candidates):
+            return True
+
+    # Fall back to single-word exact match
+    return basename in SAFE_COMMANDS or first_word in SAFE_COMMANDS
 
 
 def get_first_command_word(cmd):

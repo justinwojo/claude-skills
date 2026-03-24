@@ -119,10 +119,69 @@ def test_pretool_safe_bash():
         ('heredoc', "cat <<'EOF'\nhello world\nEOF"),
         ('multiline compound', 'git add .\ngit commit -m "test"'),
         ('for loop', 'for f in *.txt; do echo "$f"; done'),
+        # Multi-word defaults: safe subcommands
+        ('npm install', 'npm install'),
+        ('npm run dev', 'npm run dev'),
+        ('npm test', 'npm test'),
+        ('cargo build', 'cargo build'),
+        ('cargo test', 'cargo test --release'),
+        ('pip install', 'pip install requests'),
+        ('docker build', 'docker build -t myapp .'),
+        ('docker ps', 'docker ps -a'),
+        ('docker compose up', 'docker compose up -d'),
+        ('docker-compose up', 'docker-compose up -d'),
+        ('docker-compose ps', 'docker-compose ps'),
+        ('gh pr list', 'gh pr list'),
+        ('gh pr view', 'gh pr view 123'),
+        ('gh issue list', 'gh issue list --state open'),
+        # Value flags before subcommand (--flag value)
+        ('npm --prefix run', 'npm --prefix /tmp/x run build'),
+        ('cargo --manifest build', 'cargo --manifest-path Cargo.toml build'),
+        ('gh --repo pr view', 'gh --repo owner/repo pr view 123'),
+        ('docker --context prod build', 'docker --context prod build .'),
+        ('npm --workspace app run', 'npm --workspace app run build'),
+        ('cargo --package mycrate build', 'cargo --package mycrate build'),
+        ('gh --hostname ghe pr view', 'gh --hostname ghe pr view 123'),
+        # Boolean flags before subcommand (--flag with no value)
+        ('docker --verbose build', 'docker --verbose build .'),
+        ('docker --debug build', 'docker --debug build -t myapp .'),
+        ('npm --verbose run', 'npm --verbose run build'),
+        ('cargo --verbose build', 'cargo --verbose build'),
+        ('gh --verbose pr view', 'gh --verbose pr view 123'),
     ]
     for name, cmd in cases:
         result = run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}})
         check(f'{name} → allow', result, 'allow')
+
+
+def test_pretool_restricted_subcommands():
+    """Restricted subcommands should prompt, not auto-allow."""
+    print('\n--- PreToolUse: Restricted subcommands (should prompt) ---')
+    cases = [
+        ('npm publish', 'npm publish'),
+        ('npm unpublish', 'npm unpublish my-pkg'),
+        ('pnpm publish', 'pnpm publish'),
+        ('yarn npm publish', 'yarn npm publish'),
+        ('cargo publish', 'cargo publish'),
+        ('pip uninstall', 'pip uninstall requests'),
+        ('docker run', 'docker run -it ubuntu'),
+        ('docker exec', 'docker exec -it container bash'),
+        ('docker push', 'docker push myimage:latest'),
+        ('gh pr create', 'gh pr create --title "my pr"'),
+        ('gh pr merge', 'gh pr merge 123'),
+        ('gh pr close', 'gh pr close 123'),
+        ('gh issue create', 'gh issue create --title "bug"'),
+        ('gh repo delete', 'gh repo delete my-repo'),
+        ('gh api (mutation)', 'gh api -X POST repos/o/r/issues'),
+        ('gh auth token', 'gh auth token'),
+        # Boolean flag before dangerous subcommand — must still prompt
+        ('docker --verbose run', 'docker --verbose run -it ubuntu'),
+        ('docker --tls exec', 'docker --tls exec -it container bash'),
+        ('docker --debug push', 'docker --debug push myimage:latest'),
+    ]
+    for name, cmd in cases:
+        result = run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}})
+        check(f'{name} → ask', result, 'ask')
 
 
 def test_pretool_dangerous_bash():
@@ -544,29 +603,23 @@ def test_config_learning():
         # We use importlib.reload to re-initialize the module with the
         # clean config path.
         wrapper = f'''
-import sys, os, json, importlib
+import sys, os, json
 sys.path.insert(0, {SCRIPT_DIR!r})
-
-# Patch environment to suppress LLM fallback
-os.environ.pop('SAFETY_HOOK_API_KEY', None)
-os.environ.pop('XAI_API_KEY', None)
 
 import pretool_safety
 pretool_safety.USER_CONFIG_PATH = {config_path!r}
-importlib.reload(pretool_safety)  # re-run load_config() with patched path
-pretool_safety.USER_CONFIG_PATH = {config_path!r}  # reload resets it
 
 import permission_learner
-importlib.reload(permission_learner)  # pick up reloaded pretool_safety
 permission_learner.main()
 '''
 
         env = os.environ.copy()
         env.pop('SAFETY_HOOK_API_KEY', None)
         env.pop('XAI_API_KEY', None)
+        env['SMART_PERMISSIONS_CONFIG'] = config_path
 
         # Use unique command names unlikely to be in any config
-        # Step 1: Learn a Bash command
+        # Step 1: Learn a Bash command (multi-word: "zzztesttool123 plan")
         r = subprocess.run(
             [sys.executable, '-c', wrapper],
             input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool123 plan'}}),
@@ -577,7 +630,7 @@ permission_learner.main()
             return
         with open(config_path) as f:
             config = json.load(f)
-        check('learns command', 'zzztesttool123' in config.get('safe_commands', []), True)
+        check('learns multi-word command', 'zzztesttool123 plan' in config.get('safe_commands', []), True)
 
         # Step 2: Learn a WebFetch domain
         r = subprocess.run(
@@ -589,7 +642,18 @@ permission_learner.main()
             config = json.load(f)
         check('learns domain', 'zzz-test-domain.example' in config.get('allowed_web_domains', []), True)
 
-        # Step 3: No duplicates on re-learn
+        # Step 3: No duplicates on re-learn (same command again)
+        r = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool123 plan'}}),
+            capture_output=True, text=True, env=env,
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        count = config.get('safe_commands', []).count('zzztesttool123 plan')
+        check('no duplicates', count, 1)
+
+        # Step 4: Different subcommand learns as separate entry
         r = subprocess.run(
             [sys.executable, '-c', wrapper],
             input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool123 apply'}}),
@@ -597,8 +661,60 @@ permission_learner.main()
         )
         with open(config_path) as f:
             config = json.load(f)
-        count = config.get('safe_commands', []).count('zzztesttool123')
-        check('no duplicates', count, 1)
+        check('learns different subcommand', 'zzztesttool123 apply' in config.get('safe_commands', []), True)
+
+        # Step 5: Flags before subcommand — conservative learning skips these entirely.
+        # The command is still auto-approved by the PermissionRequest hook, but nothing
+        # gets persisted because adjacent-only parsing stops at the flag. This prevents
+        # both blanket base-command learning AND bogus flag-value-as-subcommand learning.
+        r = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool123 --prefix /tmp/x deploy staging'}}),
+            capture_output=True, text=True, env=env,
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        learned = config.get('safe_commands', [])
+        # Must NOT have learned the blanket base command
+        check('flags: no blanket base learned', 'zzztesttool123' not in learned, True)
+        # Must NOT have learned a bogus entry with the flag value
+        check('flags: no bogus entry learned', all(
+            'zzztesttool123' not in e or e in ('zzztesttool123 plan', 'zzztesttool123 apply')
+            for e in learned), True)
+
+        # Step 6: Plain-word flag value — same conservative behavior, nothing learned
+        r = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool456 --context prod serve hot'}}),
+            capture_output=True, text=True, env=env,
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        learned = config.get('safe_commands', [])
+        check('plain-word flag: no bogus entry', all('zzztesttool456' not in e for e in learned), True)
+
+        # Step 7: Single-word command (no subcommand) — should NOT be learned
+        r = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzzsingleonly789'}}),
+            capture_output=True, text=True, env=env,
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        check('does not learn single-word command', 'zzzsingleonly789' not in config.get('safe_commands', []), True)
+
+        # Step 8: Boolean flag before subcommand — must NOT learn bogus entry
+        # "zzztesttool999 --verbose build ." should NOT learn "zzztesttool999 ."
+        # or "zzztesttool999 build" — it should learn nothing (flags block adjacent parsing)
+        r = subprocess.run(
+            [sys.executable, '-c', wrapper],
+            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'zzztesttool999 --verbose build .'}}),
+            capture_output=True, text=True, env=env,
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        learned = config.get('safe_commands', [])
+        check('boolean flag: no bogus learning', all('zzztesttool999' not in e for e in learned), True)
 
     finally:
         if os.path.exists(config_path):
@@ -606,6 +722,110 @@ permission_learner.main()
         tmp = config_path + '.tmp'
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+# =====================================================================
+#  Multi-word and Wildcard Command Tests
+# =====================================================================
+
+def test_multiword_command_matching():
+    """Multi-word safe_commands entries and wildcard patterns."""
+    print('\n--- Multi-word command matching ---')
+
+    # These tests use a custom config with multi-word and wildcard entries.
+    # We create a temp config, point pretool_safety at it, and test via
+    # a wrapper script that reloads with the custom config.
+    config_path = '/tmp/test-sp-multiword.json'
+
+    try:
+        # Write a config with multi-word and wildcard entries
+        config = {
+            "safe_commands": [
+                "zzzmulti doctor",
+                "zzzmulti build ios",
+                "zzzwild get*",
+                "zzzwild2 *",
+                "zzzexact"
+            ],
+            "safe_write_paths": [],
+            "allowed_web_domains": [],
+            "safe_mcp_tools": []
+        }
+        with open(config_path, 'w') as f:
+            json.dump(config, f)
+
+        wrapper = f'''
+import sys, os, json
+sys.path.insert(0, {SCRIPT_DIR!r})
+
+import pretool_safety
+
+# Run PreToolUse evaluation
+input_data = json.loads(sys.stdin.read())
+tool = input_data.get("tool_name", "")
+tool_input = input_data.get("tool_input", {{}})
+
+result = pretool_safety.evaluate(tool, tool_input)
+if result:
+    decision, reason = result
+    output = {{"hookSpecificOutput": {{"permissionDecision": decision}}}}
+    print(json.dumps(output))
+'''
+
+        env = os.environ.copy()
+        env.pop('SAFETY_HOOK_API_KEY', None)
+        env.pop('XAI_API_KEY', None)
+        env['SMART_PERMISSIONS_CONFIG'] = config_path
+
+        def run_multi(cmd):
+            r = subprocess.run(
+                [sys.executable, '-c', wrapper],
+                input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': cmd}}),
+                capture_output=True, text=True, env=env,
+            )
+            if r.stdout.strip():
+                out = json.loads(r.stdout)
+                hook = out.get('hookSpecificOutput', {})
+                return hook.get('permissionDecision', 'ask')
+            return 'ask'
+
+        # 2-part exact match: "zzzmulti doctor" should be allowed
+        check('zzzmulti doctor → allow', run_multi('zzzmulti doctor'), 'allow')
+
+        # 3-part exact match: "zzzmulti build ios" should be allowed
+        check('zzzmulti build ios → allow', run_multi('zzzmulti build ios'), 'allow')
+
+        # Different subcommand NOT in config: "zzzmulti run" should ask
+        check('zzzmulti run → ask', run_multi('zzzmulti run'), 'ask')
+
+        # Wildcard: "zzzwild get" should match "zzzwild get*"
+        check('zzzwild get → allow', run_multi('zzzwild get'), 'allow')
+
+        # Wildcard: "zzzwild get-contexts" should match "zzzwild get*"
+        check('zzzwild get-contexts → allow', run_multi('zzzwild get-contexts'), 'allow')
+
+        # Wildcard: "zzzwild get pods" should match "zzzwild get*"
+        check('zzzwild get pods → allow', run_multi('zzzwild get pods'), 'allow')
+
+        # Wildcard: "zzzwild delete" should NOT match "zzzwild get*"
+        check('zzzwild delete → ask', run_multi('zzzwild delete'), 'ask')
+
+        # Wildcard "zzzwild2 *": any subcommand should be allowed
+        check('zzzwild2 anything → allow', run_multi('zzzwild2 anything'), 'allow')
+        check('zzzwild2 other stuff → allow', run_multi('zzzwild2 other stuff'), 'allow')
+
+        # Single-word exact: "zzzexact" with no subcommand should be allowed
+        check('zzzexact → allow', run_multi('zzzexact'), 'allow')
+
+        # Single-word exact: "zzzexact foo" should also be allowed (base cmd match)
+        check('zzzexact foo → allow', run_multi('zzzexact foo'), 'allow')
+
+        # 2-part match with extra args: "zzzmulti doctor --verbose" should allow
+        check('zzzmulti doctor --verbose → allow', run_multi('zzzmulti doctor --verbose'), 'allow')
+
+    finally:
+        if os.path.exists(config_path):
+            os.unlink(config_path)
 
 
 # =====================================================================
@@ -619,6 +839,7 @@ if __name__ == '__main__':
     test_pretool_readonly_tools()
     test_pretool_internal_tools()
     test_pretool_safe_bash()
+    test_pretool_restricted_subcommands()
     test_pretool_dangerous_bash()
     test_pretool_risky_bash()
     test_pretool_interpreter_exec()
@@ -640,6 +861,7 @@ if __name__ == '__main__':
     test_learner_interpreter_prompts()
     test_learner_other_tools()
     test_config_learning()
+    test_multiword_command_matching()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

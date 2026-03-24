@@ -29,7 +29,7 @@ Tool call
   │                                                                   │
   │  Dangerous pattern? (sudo, rm -rf /, curl|sh)  ──→  DENY         │
   │  Risky pattern? (rm *, find / -delete)          ──→  DENY         │
-  │  Known-safe command? (git, npm, cargo, etc.)    ──→  ALLOW        │
+  │  Known-safe command/subcommand?                  ──→  ALLOW        │
   │  MCP tool in safe list? (glob patterns)         ──→  ALLOW        │
   │  Unknown command?                               ──→  LLM eval     │
   │                                                      (optional)   │
@@ -46,10 +46,12 @@ Tool call
 
 - **Read-only tools** — Read, Glob, Grep, WebSearch are always safe
 - **File writes** to safe directories — `~/Dev/`, `/tmp/`, `~/.claude/`
-- **Bash commands** using known tools — git, npm, cargo, docker, dotnet, compilers, file utilities, and 100+ more
+- **Bash commands** using known tools — git, dotnet, compilers, file utilities, and 100+ more
+- **Safe subcommands** of restricted tools — `npm install`, `docker build`, `gh pr view`, `cargo test`, etc.
 - **Relative scripts** — `./build.sh`, `scripts/test.sh` (project scripts are trusted)
 - **WebFetch** to allowed domains — GitHub, StackOverflow, language docs, etc.
 - **MCP tools** matching `safe_mcp_tools` patterns — configure per-server with globs
+- **Global flags** before subcommands — `docker --context prod build`, `npm --prefix /tmp run dev`, etc.
 
 ### What gets blocked
 
@@ -61,6 +63,7 @@ Tool call
 
 ### What gets prompted
 
+- **Dangerous subcommands** — `npm publish`, `docker run`, `docker exec`, `docker push`, `gh pr create`, `gh pr merge`, `cargo publish`, `pip uninstall`
 - `bash -c`, `sh -c`, `osascript -e` (inline interpreter execution)
 - `rm *` or `rm .*` (wildcard deletion)
 - `find / -delete` or `find / -exec rm` (recursive deletion from root)
@@ -81,7 +84,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `safe_commands` | string array | First-word commands auto-allowed in Bash |
+| `safe_commands` | string array | Commands auto-allowed in Bash — supports single (`git`), multi-word (`flutter doctor`), and wildcards (`kubectl get*`) |
 | `safe_write_paths` | string array | Directories where Write/Edit are auto-allowed (supports `~/`) |
 | `safe_script_paths` | string array | Directories where absolute-path scripts are auto-allowed |
 | `allowed_web_domains` | string array | Domains auto-allowed for WebFetch (subdomains included) |
@@ -129,6 +132,52 @@ The parser handles compound operators (`&&`, `||`, `;`, `|`), quoting, heredocs,
 
 If **any** sub-command in a compound command is unknown, the entire command falls through to the permission prompt.
 
+### Multi-word commands and wildcards
+
+The `safe_commands` list supports multi-word entries for granular subcommand control, and wildcards for flexible matching:
+
+```json
+{
+  "safe_commands": [
+    "flutter doctor",
+    "flutter build",
+    "kubectl get *",
+    "docker compose *",
+    "terraform plan"
+  ]
+}
+```
+
+**Matching priority** (longest match wins):
+- `"docker compose up"` — allows only that exact 3-word command
+- `"flutter doctor"` — allows `flutter doctor` and `flutter doctor --verbose`, but NOT `flutter run`
+- `"kubectl get*"` — allows `kubectl get`, `kubectl get pods`, `kubectl get-contexts`, but NOT `kubectl delete`
+- `"docker *"` — allows all docker subcommands (equivalent to just `"docker"`)
+- `"git"` — single-word, allows all subcommands (existing behavior)
+
+Wildcards use Python's `fnmatch` — `*` matches any characters, `?` matches a single character.
+
+**Auto-learning** is conservative by design:
+- When `flutter doctor` is approved, it learns `"flutter doctor"` — not `"flutter"`. So `flutter run` still prompts separately.
+- Commands with flags before the subcommand (like `docker --context prod build`) are matched correctly but **not auto-learned**, since flag parsing is ambiguous without command-specific knowledge. These commands are still auto-approved each time by the PermissionRequest hook — they just don't get persisted to your config.
+- Single-word base commands are never auto-learned to prevent accidental blanket approvals.
+- If you want blanket approval for a tool, manually add the single-word entry (e.g. `"flutter"`) to your config.
+
+### Default subcommand restrictions
+
+The built-in defaults use multi-word entries to restrict tools that have both safe and dangerous subcommands:
+
+| Tool | Auto-allowed | Prompts |
+|------|-------------|---------|
+| **docker** | `build`, `ps`, `images`, `logs`, `inspect`, `compose *`, `pull`, `stop`, `start`, etc. | `run`, `exec`, `push` |
+| **gh** | `pr view/list/status/diff`, `issue view/list`, `repo view/list/clone`, `run view/list`, `search`, `browse` | `pr create/merge/close`, `issue create`, `repo delete`, `api` |
+| **npm** | `install`, `test`, `run *`, `list`, `audit`, `ci`, `init`, `pack`, `link`, `update`, etc. | `publish`, `unpublish` |
+| **cargo** | `build *`, `test *`, `check *`, `run *`, `clippy *`, `fmt *`, `doc *`, etc. | `publish` |
+| **pip** | `install *`, `list`, `show *`, `freeze`, `check`, etc. | `uninstall` |
+| **pnpm/yarn/poetry** | Common dev subcommands | `publish` |
+
+Tools like `git`, `dotnet`, `make`, and `brew` remain single-word (all subcommands allowed) since their operations are generally safe for local development.
+
 ## Manual setup
 
 If you prefer not to use the plugin system:
@@ -175,7 +224,7 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 |----------|-------------|
 | `SAFETY_HOOK_API_URL` | Chat completions endpoint (e.g. `https://api.openai.com/v1/chat/completions`) |
 | `SAFETY_HOOK_API_KEY` | API key (LLM disabled if empty) |
-| `SAFETY_HOOK_MODEL` | Model name (e.g. `gpt-4o-mini`) |
+| `SAFETY_HOOK_MODEL` | Model name (e.g. `grok-4-1-fast-reasoning`, `gpt-5.4-mini`) |
 | `SAFETY_HOOK_AUTO_LEARN` | Persist LLM-approved commands to config (`true` / `1` / `yes`) |
 
 ## Audit log
