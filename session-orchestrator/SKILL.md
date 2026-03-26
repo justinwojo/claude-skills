@@ -206,6 +206,22 @@ Messages arrive automatically — do NOT poll or sleep. If the teammate
 asks a question, answer it. If it reports a failure it can't resolve,
 help debug.
 
+**Patience with idle notifications**: Teammates go idle after every
+tool call — this is completely normal. A worker running a 5-minute
+build, a long regeneration, or deep research will go idle while the
+command executes, then resume automatically when results arrive.
+
+Rules:
+- Do NOT nudge a teammate just because it went idle
+- Do NOT conclude a teammate is stuck from idle notifications alone
+- Do NOT shut down and replace a teammate that hasn't reported back yet
+- Do NOT spawn a duplicate worker "just in case"
+- A teammate is only stuck if it has gone idle **repeatedly without
+  any progress** (no commits, no messages, no tool output) AND has
+  not responded to a direct status check after **at least 3 minutes**
+- Before replacing a worker, check `git log` and `git status` to see
+  if it made changes you haven't noticed
+
 ### C) When the teammate reports success
 
 1. Verify the commit: `git log -1 --stat`
@@ -241,7 +257,9 @@ After all sessions are complete:
 - Do NOT enter plan mode — there is no human to accept it
 - If AI review is available, workers MUST use it before committing
 - If a teammate is stuck in a loop or fundamentally off track, shut it
-  down and spawn a replacement with clearer instructions
+  down and spawn a replacement with clearer instructions. But idle ≠
+  stuck — workers go idle between every tool call. Wait for actual
+  evidence of no progress before replacing (see Section B).
 - The design doc is the source of truth for each session's scope
 
 
