@@ -583,6 +583,28 @@ def test_arithmetic_heredoc_misparse():
     check('$((x << 3)) && git → allow', result, 'allow')
 
 
+def test_nested_parens_in_command_substitution():
+    """Parens inside $() values (e.g. python -c with function calls) must not
+    confuse the env-var scanner into leaking command fragments."""
+    print('\n--- Correctness: Nested parens in $() assignment ---')
+
+    # For loop with python3 -c containing function call parens
+    result = run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {
+        'command': '''for f in /tmp/test/*/report.json; do
+    lib=$(basename $(dirname "$f"))
+    count=$(python3 -c "import json; d=json.load(open('$f')); print(d.get('skipReasons',{}).get('inout_params',0))" 2>/dev/null)
+    if [ "$count" -gt 0 ] 2>/dev/null; then
+      echo "$lib: $count"
+    fi
+done'''}})
+    check('for loop with python3 -c nested parens → allow', result, 'allow')
+
+    # Simple case: assignment with nested command substitution parens
+    result = run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {
+        'command': 'result=$(python3 -c "print(len(list(range(10))))")'}})
+    check('$() with nested python parens → allow', result, 'allow')
+
+
 # =====================================================================
 #  Config Learning Persistence Tests
 # =====================================================================
@@ -854,6 +876,7 @@ if __name__ == '__main__':
     test_function_case_body_inspection()
     test_write_learning_system_paths()
     test_arithmetic_heredoc_misparse()
+    test_nested_parens_in_command_substitution()
     test_learner_compound_body_bypass()
     test_learner_unknown_commands()
     test_learner_dangerous_denied()

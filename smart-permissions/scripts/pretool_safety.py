@@ -1094,11 +1094,11 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
                         idx += 1
                     continue
 
-            open_parens = value_part.count("$(")
+            open_parens = value_part.count("(")
             close_parens = value_part.count(")")
             while open_parens > close_parens and idx < len(tokens):
                 next_token = tokens[idx]
-                open_parens += next_token.count("$(")
+                open_parens += next_token.count("(")
                 close_parens += next_token.count(")")
                 idx += 1
         else:
@@ -1301,11 +1301,11 @@ def get_first_command_word(cmd):
                         idx += 1
                     continue
 
-            open_parens = value_part.count("$(")
+            open_parens = value_part.count("(")
             close_parens = value_part.count(")")
             while open_parens > close_parens and idx < len(tokens):
                 next_token = tokens[idx]
-                open_parens += next_token.count("$(")
+                open_parens += next_token.count("(")
                 close_parens += next_token.count(")")
                 idx += 1
         else:
