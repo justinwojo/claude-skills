@@ -1,6 +1,6 @@
 ---
 name: ai-pair-programming
-description: Enable AI pair programming by querying external LLMs (OpenAI/ChatGPT, Google Gemini, xAI Grok) with code files, plans, and project context. Use when the user wants to get code review from another AI, ask for improvement suggestions, get feedback on a plan, consult multiple AIs for comparison, or get a second opinion on architecture decisions. Supports passing multiple files, project context (tech stack, frameworks), and additional context like "things we've tried". Triggers on "ask Grok to review", "what does Gemini think about this code", "get feedback from GPT and Gemini", "pair program with", "consult other AIs about".
+description: Enable AI pair programming by querying external LLMs (OpenAI/ChatGPT, Google Gemini, xAI Grok) with code files, plans, and project context. Default provider is OpenAI (gpt-5.4) — always use openai unless the user specifically requests other providers. Use when the user wants to get code review from another AI, ask for improvement suggestions, get feedback on a plan, consult multiple AIs for comparison, or get a second opinion on architecture decisions. Supports passing multiple files, project context (tech stack, frameworks), and additional context like "things we've tried". Triggers on "ask ChatGPT to review", "get feedback from GPT", "pair program with", "consult other AIs about", "ask Grok to review", "what does Gemini think".
 ---
 
 # AI Pair Programming
@@ -59,6 +59,8 @@ Specify what you need:
 - **guidance** - Answer a question or provide direction
 
 ### 5. Target Models
+**Default: `openai` (gpt-5.4).** Always use OpenAI/ChatGPT unless the user specifically requests other providers. Only add gemini/grok as secondary reviewers when explicitly asked.
+
 Query one or more:
 - `openai` (gpt-5.4, gpt-5.2, gpt-5, gpt-4o, o3-mini)
 - `gemini` (gemini-3.1-pro-preview, gemini-3-pro-preview, gemini-3-flash-preview, gemini-2.5-flash)
@@ -88,7 +90,7 @@ Use `--temperature` (or `-t`) to control response creativity. Choose based on th
 ```bash
 # Defaults to --request review --temperature 0.4
 python scripts/query_llm.py \
-  --models openai,grok \
+  --models openai \
   --files src/handlers.ts src/converters/request.ts \
   --diff main \
   --project "Node.js proxy server with Fastify" \
@@ -136,25 +138,25 @@ Keep reviews under ~200K input tokens. Most providers charge higher rates beyond
 
 ### Code Review
 ```
-Ask Grok and Gemini to review the recent changes.
+Ask ChatGPT to review the recent changes.
 Include the diff against main.
 ```
 
 ### Plan Feedback
 ```
-Ask GPT and Gemini for feedback on docs/refactor-plan.md
+Ask GPT for feedback on docs/refactor-plan.md
 Additional context: We tried a gradual migration but had state sync issues
 ```
 
 ### Improvement Suggestions
 ```
-Ask Grok to suggest improvements for src/server/handlers.ts
+Ask ChatGPT to suggest improvements for src/server/handlers.ts
 Focus on performance and error handling.
 ```
 
 ### Multi-Model Comparison
 ```
-Query all three AIs about the best approach for caching in this project.
+Query ChatGPT, Grok, and Gemini about the best approach for caching in this project.
 ```
 
 ## Response Handling

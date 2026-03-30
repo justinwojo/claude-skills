@@ -3,7 +3,7 @@
 Query one or more LLMs with files, project context, and additional context.
 
 Usage:
-    python query_llm.py --models grok,gemini --files file1.cs file2.cs \
+    python query_llm.py --models openai --files file1.cs file2.cs \
         --project "NET 10 app with MvvmCross" --request review \
         --context "Tried X but had issues with Y"
 """
@@ -435,8 +435,8 @@ def parse_model_spec(spec: str) -> tuple[str, Optional[str]]:
 
 def main():
     parser = argparse.ArgumentParser(description="Query LLMs with code and context")
-    parser.add_argument("--models", "-m", required=True,
-                        help="Comma-separated list of models (e.g., grok,gemini,openai:gpt-4-turbo)")
+    parser.add_argument("--models", "-m", default="openai",
+                        help="Comma-separated list of models (default: openai). E.g., openai, openai:gpt-5.2, openai,gemini")
     parser.add_argument("--files", "-f", nargs="+", default=[],
                         help="Files to include in the query")
     parser.add_argument("--diff", "-d", nargs="?", const="unstaged", default=None,
