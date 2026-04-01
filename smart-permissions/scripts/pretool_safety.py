@@ -183,6 +183,10 @@ LLM_MODEL = os.environ.get(
 # next time without an LLM call. Set to "true" to enable.
 AUTO_LEARN = os.environ.get("SAFETY_HOOK_AUTO_LEARN", "").lower() in ("true", "1", "yes")
 
+# Enable verbose logging to stderr (LLM approved/denied, auto-learn events).
+# Errors and unparseable responses always log regardless of this flag.
+DEBUG = os.environ.get("SAFETY_HOOK_DEBUG", "").lower() in ("true", "1", "yes")
+
 LLM_SAFETY_PROMPT = """\
 You are a security evaluator for a software developer's CLI environment.
 
@@ -252,7 +256,8 @@ def learn_to_config(key, value):
             f.write("\n")
         os.replace(tmp_path, USER_CONFIG_PATH)
 
-        print(f"Learned: {key} += {value!r}", file=sys.stderr)
+        if DEBUG:
+            print(f"Learned: {key} += {value!r}", file=sys.stderr)
     except OSError as e:
         print(f"Could not save to config: {e}", file=sys.stderr)
 
@@ -304,6 +309,54 @@ def _auto_learn(tool, tool_input):
             pass
 
 
+def _extract_json_decision(content):
+    """Extract a {"safe": bool} decision from LLM response content.
+
+    Reasoning models (e.g. grok-*-reasoning) often include extra text,
+    markdown fencing, or explanations around the JSON even when told to
+    return only JSON. This function tries multiple extraction strategies.
+
+    Returns the parsed dict or None.
+    """
+    # Strategy 1: direct parse (clean JSON response)
+    try:
+        return json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Strategy 2: strip markdown code fencing
+    if "```" in content:
+        try:
+            start = content.index("```")
+            inner_start = content.index("\n", start) + 1
+            end = content.index("```", inner_start)
+            inner = content[inner_start:end].strip()
+            return json.loads(inner)
+        except (ValueError, json.JSONDecodeError):
+            pass
+
+    # Strategy 3: regex — find {"safe": true/false, ...} anywhere in text
+    match = re.search(
+        r'\{\s*"safe"\s*:\s*(true|false)(?:\s*,\s*"reason"\s*:\s*"(?:[^"\\]|\\.)*")?\s*\}',
+        content,
+    )
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Strategy 4: looser regex for malformed JSON with extra fields
+    match = re.search(r'\{\s*"safe"\s*:\s*(true|false)[^}]*\}', content)
+    if match:
+        try:
+            return json.loads(match.group())
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
+
+
 def llm_evaluate(tool, tool_input):
     """Call an LLM to evaluate a tool call that local rules couldn't decide."""
     if not LLM_API_KEY or not LLM_API_URL or not LLM_MODEL:
@@ -311,14 +364,32 @@ def llm_evaluate(tool, tool_input):
 
     prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
 
-    body = json.dumps({
+    payload = {
         "model": LLM_MODEL,
         "messages": [
             {"role": "system", "content": LLM_SAFETY_PROMPT},
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.0,
-    }).encode()
+        # Structured output — guarantees valid JSON matching this schema.
+        # Supported by xAI Grok and OpenAI GPT models.
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "safety_evaluation",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "safe": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["safe"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    body = json.dumps(payload).encode()
 
     req = urllib.request.Request(
         LLM_API_URL,
@@ -332,27 +403,36 @@ def llm_evaluate(tool, tool_input):
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(req, timeout=38) as resp:
             result = json.loads(resp.read().decode())
             content = result["choices"][0]["message"]["content"].strip()
 
-            # Strip markdown code fencing if present
-            if content.startswith("```"):
-                content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            # json_schema response_format guarantees valid JSON, but fall
+            # back to _extract_json_decision for models that ignore it.
+            try:
+                decision = json.loads(content)
+            except (json.JSONDecodeError, ValueError):
+                decision = _extract_json_decision(content)
 
-            decision = json.loads(content)
+            if decision is None:
+                # Always log — this indicates a real problem
+                print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
+                return ("ask", "LLM response could not be parsed as JSON")
 
             if decision.get("safe"):
-                print(f"LLM APPROVED: {tool}", file=sys.stderr)
+                if DEBUG:
+                    print(f"LLM APPROVED: {tool}", file=sys.stderr)
                 if AUTO_LEARN:
                     _auto_learn(tool, tool_input)
                 return ("allow", "LLM approved")
             else:
                 reason = decision.get("reason", "LLM flagged as unsafe")
-                print(f"LLM DENIED: {tool} — {reason}", file=sys.stderr)
+                if DEBUG:
+                    print(f"LLM DENIED: {tool} — {reason}", file=sys.stderr)
                 return ("deny", f"LLM: {reason}")
 
     except Exception as e:
+        # Always log — API failures need visibility
         print(f"LLM error: {e}", file=sys.stderr)
         return ("ask", f"LLM unavailable ({e}) — manual approval required")
 
