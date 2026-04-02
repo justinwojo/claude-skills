@@ -71,15 +71,14 @@ Plan-type subagents if needed.
 Before spawning any workers, determine whether external AI code review is
 available. This requires TWO things to be true:
 
-1. **The skill is installed** — Run:
+1. **The skill is installed** — Check if `/ai-pair-programming` or
+   `ai-pair-programming` appears in the available skills list in the
+   system prompt. If you can see it listed among available skills, it
+   is installed. As a fallback, you can search the filesystem:
    ```bash
-   find "$(dirname "$(realpath "$0")")" -path "*/ai-pair-programming/SKILL.md" 2>/dev/null || \
    find ~/.claude -path "*/ai-pair-programming/SKILL.md" 2>/dev/null || \
    find . -path "*/ai-pair-programming/SKILL.md" 2>/dev/null
    ```
-   Alternatively, check if `/ai-pair-programming` appears in the available
-   skills list in the system prompt. If you can see it listed among
-   available skills, it is installed.
 
 2. **At least one provider is configured** — Check environment variables:
    ```bash
@@ -144,7 +143,8 @@ Use this prompt when `AI_REVIEW_AVAILABLE = true`:
 > 5. Review the feedback. Fix anything you agree with. Skip anything
 >    incorrect or not applicable. Re-validate after fixes.
 > 6. Once everything is green after addressing review feedback:
->    - Stage specific files (not git add -A)
+>    - Stage only files YOU changed for this session (not git add -A).
+>      If `git status` shows pre-existing dirty files, leave them unstaged.
 >    - Write a descriptive commit message ending with:
 >      Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 >
@@ -185,7 +185,8 @@ Use this prompt when `AI_REVIEW_AVAILABLE = false`:
 > 4. Self-review your changes: read through every diff, check for missed
 >    edge cases, naming consistency, and adherence to the design doc.
 > 5. Once implementation is complete and all validation passes:
->    - Stage specific files (not git add -A)
+>    - Stage only files YOU changed for this session (not git add -A).
+>      If `git status` shows pre-existing dirty files, leave them unstaged.
 >    - Write a descriptive commit message ending with:
 >      Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 >
@@ -200,41 +201,110 @@ Use this prompt when `AI_REVIEW_AVAILABLE = false`:
 >   the lead to double-check)
 > - The commit SHA
 
-### B) Wait for the teammate to finish
+### B) Monitor the worker (optional, requires terminal introspection)
 
-Messages arrive automatically — do NOT poll or sleep. If the teammate
-asks a question, answer it. If it reports a failure it can't resolve,
-help debug.
+**Before spawning**, check whether terminal introspection is available
+by running `which it2`. If `it2` is not found, skip this step entirely
+— you will rely on teammate messages and idle notifications only.
 
-**Patience with idle notifications**: Teammates go idle after every
-tool call — this is completely normal. A worker running a 5-minute
-build, a long regeneration, or deep research will go idle while the
-command executes, then resume automatically when results arrive.
+**If `it2` IS available**, find the worker's terminal session ID:
 
-Rules:
-- Do NOT nudge a teammate just because it went idle
-- Do NOT conclude a teammate is stuck from idle notifications alone
-- Do NOT shut down and replace a teammate that hasn't reported back yet
-- Do NOT spawn a duplicate worker "just in case"
-- A teammate is only stuck if it has gone idle **repeatedly without
-  any progress** (no commits, no messages, no tool output) AND has
-  not responded to a direct status check after **at least 3 minutes**
-- Before replacing a worker, check `git log` and `git status` to see
-  if it made changes you haven't noticed
+```bash
+it2 session list --json | python3 -c "import sys,json; [print(s['id'], s.get('name','')) for s in json.load(sys.stdin)]"
+```
 
-### C) When the teammate reports success
+Run this before AND after spawning the worker. The new session ID is
+the worker's. Then start a `/loop` to monitor it every 3 minutes:
 
-1. Verify the commit: `git log -1 --stat`
-2. Spot-check scope: `git diff HEAD~1 --stat`
-3. Confirm the session's deliverables are all addressed
-4. If anything is missing, message the teammate to fix it
-5. Once satisfied, shut down the teammate
+```
+/loop 3m Read the worker's terminal session and assess whether it is
+making progress. Look for new tool call outputs, new file reads/edits,
+or build output — NOT cosmetic changes like spinners or status bar
+updates. Save the last meaningful line of output to
+/tmp/worker-N-last-check.txt for comparison across checks. Track the
+unstick attempt count in /tmp/worker-N-unstick.txt (default 0).
 
-### D) After the teammate shuts down
+If the meaningful content hasn't changed for 20+ minutes (roughly 7
+consecutive checks with no progress), escalate based on the current
+attempt count:
+
+  Attempt 1: Send Ctrl+C to the session. Sometimes this is enough —
+    the worker will resume on its own.
+  Attempt 2: Send Ctrl+C again, then also message the worker: "resume"
+    (sometimes the worker needs an explicit nudge after the interrupt).
+  Attempt 3+: Repeat the Ctrl+C + "resume" message. If the worker
+    still shows no progress after attempt 3, message the lead that the
+    worker appears genuinely stuck and may need to be replaced.
+
+Reset the attempt count to 0 whenever progress is detected. If the
+session no longer exists, stop the loop.
+```
+
+How to read/send depends on the terminal tool available:
+- **iTerm2 (`it2`)**: `it2 session read -s <ID> -n 40` to read,
+  `it2 session send -s <ID> $'\x03'` to send Ctrl+C,
+  `it2 session send -s <ID> 'resume'` followed by
+  `it2 session send -s <ID> $'\n'` to send a text message
+- **Other terminals**: Adapt the read/send commands to whatever CLI
+  your terminal provides. The logic is the same — read content,
+  compare, escalate through Ctrl+C then Ctrl+C + "resume" if stuck.
+
+If no terminal introspection tool is available, this step is skipped.
+The lead still receives teammate messages and idle notifications, which
+provide basic progress visibility.
+
+### C) Wait for the teammate to finish
+
+Messages arrive automatically — do NOT poll or sleep for worker
+messages. If the teammate asks a question, answer it. If it reports
+a failure it can't resolve, help debug.
+
+**Patience with idle notifications**: Teammates go idle between every
+tool call — this is normal, NOT a sign they are stuck. A worker running
+a 5-minute build command will go idle while the command executes, then
+resume when results arrive. Do NOT:
+- Nudge a teammate just because they went idle
+- Conclude a teammate is stuck after a single idle notification
+- Shut down and replace a teammate that hasn't reported back yet
+- Spawn a duplicate worker "just in case"
+
+The /loop handles stuck detection via an escalation sequence: first a
+Ctrl+C alone (often enough), then Ctrl+C + "resume" message, then
+repeated Ctrl+C + "resume". Only intervene manually if the loop reports
+the worker is genuinely stuck after 3+ attempts.
+
+**Context limits**: Workers have a 200k token context window and will
+auto-compact once or twice during larger sessions. This is normal — let
+them continue. If a worker loses coherence after compaction (repeating
+itself, forgetting its progress, re-reading files it already read),
+shut it down and spawn a replacement with narrower instructions focused
+on what remains unfinished.
+
+### D) When the teammate reports success
+
+Do NOT shut down the worker until you have independently verified.
+Workers can miscount or misreport validation results.
+
+1. Stop the monitoring loop (it will stop on its own if you don't
+   renew it, but cancel explicitly to be clean)
+2. Verify the commit: `git log -1 --stat`
+3. Spot-check scope: `git diff HEAD~1 --stat`
+4. **Independently verify validation claims** — do not trust reported
+   numbers blindly. If the repo has build commands, test suites, or a
+   validation baseline, run them yourself and compare against the
+   pre-session state. Workers can report "all green" when regressions
+   exist.
+5. Confirm the session's deliverables are all addressed
+6. If validation fails or anything is missing, message the teammate
+   with what you found and have it fix the issues. Repeat from step 4.
+7. Once everything actually passes, shut down the teammate
+
+### E) After the teammate shuts down
 
 1. Update the design doc: mark the session complete with the commit SHA
    next to the session header. Note any deviations.
-2. Move to the next session (back to step A).
+2. Move to the next session (back to step A — spawn worker, start
+   monitoring loop, wait).
 
 
 ## Step 3: Finalize
@@ -258,8 +328,10 @@ After all sessions are complete:
 - If AI review is available, workers MUST use it before committing
 - If a teammate is stuck in a loop or fundamentally off track, shut it
   down and spawn a replacement with clearer instructions. But idle ≠
-  stuck — workers go idle between every tool call. Wait for actual
-  evidence of no progress before replacing (see Section B).
+  stuck — workers go idle between tool calls. The monitoring loop
+  handles stuck detection with escalating intervention (Ctrl+C alone,
+  then Ctrl+C + "resume"). Only replace a worker if 3+ unstick
+  attempts fail.
 - The design doc is the source of truth for each session's scope
 
 
@@ -276,16 +348,17 @@ Lead (reads design doc, creates team, directs everything)
  +-- Detects /ai-pair-programming availability
  |
  +-- session-1-worker (full Claude instance, fresh context)
+ |    +-- /loop monitors worker's terminal (if introspection available)
  |    +-- Reads docs + source code
  |    +-- Spawns its own research subagents as needed
  |    +-- Implements -> validates -> [AI review if available] -> commits
+ |    +-- If stuck 20m+ -> lead sends Ctrl+C + messages worker
  |    +-- Reports back -> lead verifies -> shuts down
  |
  +-- Lead marks session 1 complete in design doc
  |
  +-- session-2-worker (full Claude instance, fresh context)
- |    +-- Picks up from session 1's commit
- |    +-- Same workflow
+ |    +-- Same workflow (monitoring, implement, validate, commit)
  |
  +-- (repeat for all remaining sessions)
  |

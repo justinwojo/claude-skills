@@ -93,6 +93,8 @@ Lead (reads design doc, creates team, directs everything)
 
 If the [ai-pair-programming](#ai-pair-programming) skill is installed and configured, workers automatically get external AI code review before committing. Without it, workers perform a self-review instead.
 
+**Stuck detection:** If you use [iTerm2](https://iterm2.com) with the `it2` CLI and Python API enabled, the orchestrator automatically monitors worker terminal sessions via `/loop` and intervenes when a worker hangs — sending Ctrl+C and escalating to "resume" nudges as needed. Without iTerm2, the lead still receives teammate messages and idle notifications for basic visibility.
+
 **Example usage:**
 
 > "Orchestrate this design doc: docs/refactor-plan.md"
