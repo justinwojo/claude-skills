@@ -214,10 +214,10 @@ it2 session list --json | python3 -c "import sys,json; [print(s['id'], s.get('na
 ```
 
 Run this before AND after spawning the worker. The new session ID is
-the worker's. Then start a `/loop` to monitor it every 3 minutes:
+the worker's. Then start a `/loop` to monitor it every 5 minutes:
 
 ```
-/loop 3m Read the worker's terminal session and assess whether it is
+/loop 5m Read the worker's terminal session and assess whether it is
 making progress. Look for new tool call outputs, new file reads/edits,
 or build output — NOT cosmetic changes like spinners or status bar
 updates. Save the last meaningful line of output to
@@ -273,12 +273,14 @@ Ctrl+C alone (often enough), then Ctrl+C + "resume" message, then
 repeated Ctrl+C + "resume". Only intervene manually if the loop reports
 the worker is genuinely stuck after 3+ attempts.
 
-**Context limits**: Workers have a 200k token context window and will
-auto-compact once or twice during larger sessions. This is normal — let
-them continue. If a worker loses coherence after compaction (repeating
-itself, forgetting its progress, re-reading files it already read),
-shut it down and spawn a replacement with narrower instructions focused
-on what remains unfinished.
+**Context window warnings**: If a teammate's context window is getting
+large, ignore it. Autocompaction handles this automatically — the
+system will compress prior messages as needed. Do NOT message the
+worker about context limits or suggest it wrap up early because of
+context size. Let it work until the task is done. If a worker loses
+coherence after compaction (repeating itself, forgetting its progress,
+re-reading files it already read), shut it down and spawn a replacement
+with narrower instructions focused on what remains unfinished.
 
 ### D) When the teammate reports success
 
