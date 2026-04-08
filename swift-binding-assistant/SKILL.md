@@ -25,6 +25,8 @@ The authoritative docs live in the [project wiki](https://github.com/justinwojo/
 | Ownership & Disposal | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Ownership.md` |
 | Upgrading | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Upgrading.md` |
 | Architecture | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Architecture.md` |
+| **Multi-Framework Libraries** | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Multi-Framework-Libraries.md` |
+| **Publishing** | `https://raw.githubusercontent.com/wiki/justinwojo/swift-dotnet-bindings/Publishing.md` |
 
 Fetch docs proactively when:
 - The user hits a build error (fetch Troubleshooting)
@@ -33,6 +35,8 @@ Fetch docs proactively when:
 - You need to explain a gap or skip reason (fetch Known Limitations)
 - The user asks about memory management or disposal (fetch Ownership)
 - The user asks about upgrading versions (fetch Upgrading)
+- The user is binding more than one framework from the same vendor (fetch Multi-Framework Libraries)
+- The user is preparing to publish a NuGet package, sets up CI release workflows, or needs pack metadata details (fetch Publishing)
 - The user has a general question (fetch FAQ first — it may already be answered)
 
 ## Workflow Overview
@@ -93,7 +97,10 @@ Also ask:
 Run these checks and report results to the user:
 
 ```bash
-# macOS check (always true if we're here)
+# Host OS check — Apple platform binding generation requires macOS + Xcode.
+# If this prints anything other than "Darwin", STOP and tell the user the
+# workflow can't proceed on this host (Linux/Windows have no Xcode toolchain
+# and can't compile the Swift wrapper xcframework).
 uname -s
 
 # Xcode check — requires Xcode 26 or later (not just Command Line Tools)
@@ -125,6 +132,8 @@ dotnet new list swift-binding
 
 If any prerequisite is missing, guide the user through installing it before proceeding. Do not continue until all prerequisites pass.
 
+**Hard stop on non-macOS hosts**: if `uname -s` is not `Darwin`, the workflow cannot proceed — Apple platform bindings require Xcode, which only runs on macOS. Inform the user and stop. Do not try to suggest cross-compilation, Docker, or remote-build workarounds; there isn't a supported path today.
+
 ## Step 2: Obtain the xcframework
 
 ### From SPM (Swift Package Manager)
@@ -136,12 +145,17 @@ If the user provides an SPM package URL:
    git clone https://github.com/justinwojo/spm-to-xcframework.git /tmp/spm-to-xcframework
    ```
 
-2. Determine the latest release tag for the Swift package:
+2. Determine the latest release tag for the Swift package. **Do not use `tail -5` on unsorted ls-remote output** — git returns tags in lexicographic order, so `1.10.0` would sort before `1.2.0` and you'd pick the wrong version. Use a version-aware sort instead:
    ```bash
-   git ls-remote --tags <PACKAGE_URL> | grep -v '{}' | tail -5
-   # Output looks like: abc1234  refs/tags/12.7.3
-   # Use the rightmost part after refs/tags/ as the version tag
+   # Sort tags by semver descending; suffix=- pushes prereleases (-rc1, -beta) below stable releases
+   git -c versionsort.suffix=- ls-remote --tags --sort=-version:refname --refs <PACKAGE_URL> \
+     | head -10
+   # Output: abc1234  refs/tags/12.7.3
+   #         def5678  refs/tags/12.7.2
+   #         ...
+   # The first line after filtering prereleases is your latest stable tag.
    ```
+   If the project uses non-semver tags or has unusual versioning, fall back to the GitHub releases page (`https://github.com/<owner>/<repo>/releases/latest`) or ask the user which version they want.
 
 3. Build the xcframework (**capture output — this can take several minutes**):
    ```bash
@@ -207,7 +221,9 @@ ls <PATH>/Library.xcframework/<slice-dir>/Library.framework/Modules/module.modul
 # Pick a working directory
 mkdir -p ~/swift-bindings && cd ~/swift-bindings
 
-# Create the project — naming convention: <LibraryName>.Swift.<Platform> or <LibraryName>.ObjC.<Platform>
+# Create the project — naming convention:
+#   Single library:        <LibraryName>.Swift.<Platform>           (e.g., Nuke.Swift.iOS)
+#   Multi-vendor SDK set:  SwiftBindings.<Vendor>.<Module>          (e.g., SwiftBindings.Stripe.Core)
 # Platform suffixes: iOS, macOS, MacCatalyst, tvOS
 # Use --platform to set the target (default: ios)
 
@@ -246,6 +262,8 @@ The SDK auto-detects the target platform from the TFM — no additional configur
 
 If the library imports other Swift frameworks, the user needs to provide them.
 
+**Auto-detection (default):** The SDK ships with `<SwiftAutoDetectDependencies>true</SwiftAutoDetectDependencies>` enabled by default. The build analyzes the xcframework's binary linkage, finds matching sibling binding projects in the solution, and auto-injects `<ProjectReference>` items. If a needed dependency is missing, it emits **SWIFTBIND080** with a suggested fix. In most multi-project solutions, you do not need to declare dependencies manually.
+
 **Option 1: `<ProjectReference>` (multi-project solutions — preferred)**
 
 For multi-product vendors (e.g., Stripe) where you're binding several frameworks in the same solution:
@@ -256,23 +274,27 @@ For multi-product vendors (e.g., Stripe) where you're binding several frameworks
 </ItemGroup>
 ```
 
-The SDK automatically resolves dependency xcframework search paths and module databases during wrapper compilation — no manual configuration needed.
+The SDK automatically resolves dependency xcframework search paths and module databases during wrapper compilation, propagates native references to the consumer's app bundle, and converts the reference into a transitive `<PackageReference>` during `dotnet pack` — no manual configuration needed.
 
-**Option 2: `<SwiftFrameworkDependency>` (external/pre-built dependencies)**
+**Option 2: `<SwiftFrameworkDependency>` (external/pre-built or internal dependencies)**
 
-For dependencies that are pre-built xcframeworks (not sibling projects):
+For dependencies that are pre-built xcframeworks (not sibling projects), or internal helper frameworks (e.g., ObjC-only support modules) that won't be published as their own NuGet package:
 
 ```xml
 <ItemGroup>
+  <!-- External, published as its own NuGet package -->
   <SwiftFrameworkDependency Include="../DependencyA.xcframework"
                             PackageId="DependencyA.Swift.iOS"
                             PackageVersion="1.0.0" />
+
+  <!-- Internal helper, not published — omit metadata intentionally -->
+  <SwiftFrameworkDependency Include="../InternalHelper.xcframework" />
 </ItemGroup>
 ```
 
 Each dependency also needs to be a built xcframework. If the user used `spm-to-xcframework --include-deps`, these will already exist in the output directory.
 
-Both `PackageId` and `PackageVersion` are required for NuGet packaging (`SWIFTBIND040` warns if missing).
+For published dependencies, both `PackageId` and `PackageVersion` are required for NuGet pack to declare the dependency (`SWIFTBIND040` warns if missing). For internal helpers that won't be published separately, the warning is intentional — consumers will need to add a `<NativeReference>` for the internal framework manually. See the **Multi-Framework Libraries** wiki page for the full pattern.
 
 ## Step 4: Build
 
@@ -318,6 +340,8 @@ Tell the user the build succeeded and move to Step 5.
 | **SWIFTBIND011** | Consumer targets older platform version than library requires | Update `SupportedOSPlatformVersion` to the version shown in the warning |
 | **SWIFTBIND030** | Missing architectures for packing | Set `<SwiftWrapperArchitectures>all</SwiftWrapperArchitectures>` |
 | **SWIFTBIND031** | Wrapper xcframework missing device or simulator slice | Verify xcframework has both slices, or set `<IsPackable>false</IsPackable>` for local-only |
+| **SWIFTBIND035** | Cannot resolve platform version for NuGet pack | Use a versioned TFM (`net10.0-ios26.0`) or install the platform workload |
+| **SWIFTBIND040** | `<SwiftFrameworkDependency>` missing `PackageId`/`PackageVersion` | Add metadata if the dep is published as its own NuGet package; expected/intentional for internal-only helpers |
 | **SWIFTBIND050** | Swift wrapper compilation failed | Missing dependency framework — add `<ProjectReference>` or `<SwiftFrameworkDependency>` |
 | **SWIFTBIND051** | Wrapper required but failed | Fix wrapper compilation, or set `<SwiftWrapperRequired>false</SwiftWrapperRequired>` to downgrade to warning |
 | **SWIFTBIND052** | SwiftUI bridge compilation failed | Bridge sessions will throw `DllNotFoundException`; main bindings unaffected |
@@ -325,7 +349,7 @@ Tell the user the build succeeded and move to Step 5.
 | **SWIFTBIND080** | Cross-module dependency, no sibling project found | Add `<ProjectReference>` to the dependency binding project |
 | **SWIFTBIND090-094** | Internal validation issue | Generated P/Invoke may not work at runtime — [file an issue](https://github.com/justinwojo/swift-dotnet-bindings/issues) with the xcframework |
 | **SWIFTBIND100** | `<SwiftPackage>` used (not available yet) | Build xcframework from SPM first, then use `<SwiftFramework>` |
-| **SWIFTBIND101** | Static xcframework detected | Rebuild as dynamic library (`MACH_O_TYPE = mh_dylib`) |
+| **SWIFTBIND101** | Static xcframework detected on the Swift path | Generator auto-falls back to ObjC pipeline for ObjC static libs (Firebase, etc.) — usually transparent. Only a real failure if the static lib is genuinely Swift (must rebuild as dynamic with `MACH_O_TYPE = mh_dylib`) or if the ObjC fallback also fails (then you'll see "no ObjC module.modulemap and no Swift module") |
 | **SWIFTBIND102** | No Swift module found | ObjC framework (auto-detected) or malformed xcframework |
 | **SWIFTBIND103** | swift-frontend failed to extract ABI | Update Xcode, check `xcode-select -p` |
 | **Generator crash / 0 types** | Missing `BUILD_LIBRARY_FOR_DISTRIBUTION=YES` | Rebuild xcframework with the flag |
@@ -340,18 +364,26 @@ After fixing, rebuild and repeat until successful.
 dotnet pack 2>&1 | tee /tmp/swift-binding-pack.txt
 ```
 
-The SDK defaults to `SwiftWrapperArchitectures=all`, so packing should work out of the box. If you get **SWIFTBIND030** or **SWIFTBIND031**, verify the xcframework has both device and simulator slices.
+The SDK defaults to `SwiftWrapperArchitectures=all`, so packing should work out of the box. If you get **SWIFTBIND030** or **SWIFTBIND031**, verify the xcframework has both device and simulator slices. If you get **SWIFTBIND035**, use a versioned TFM (`net10.0-ios26.0`) or install the platform workload.
 
-To override the auto-extracted version (if the xcframework uses Xcode's default "1.0"):
+To override the auto-extracted version (if the xcframework uses Xcode's default "1.0", you'll see warning **SWIFTBIND020**):
 ```xml
 <PropertyGroup>
   <PackageVersion>2.5.0</PackageVersion>
 </PropertyGroup>
 ```
 
+The package contains everything consumers need: C# bindings DLL, source xcframework, wrapper xcframework, optional SwiftUI bridge xcframework, module database (`{Module}Database.xml`) for downstream binding projects, and a consumer `.targets` file that auto-injects `NativeReference` items.
+
 The output is a `.nupkg` file (e.g., `bin/Release/<tfm>/<LibraryName>.Swift.<Platform>.1.0.0.nupkg`).
 
 Tell the user the NuGet package is ready and where to find it.
+
+**For advanced packaging needs** (CI release workflows, multi-package version coordination, local NuGet testing, publishing to nuget.org), fetch the **Publishing** wiki page from the doc table above. Highlights:
+- Centralize shared metadata in `Directory.Build.props` for multi-package repos
+- Pack leaf dependencies first when packaging a multi-framework set
+- Tag-based GitHub Actions release pattern with dry-run support
+- Local `NuGet.config` setup for iterating before publishing
 
 ## Step 6: Offer Binding Review
 
@@ -511,7 +543,7 @@ using (new SwiftDisposeScope())
 **Important consumer notes:**
 - The consumer does NOT need the Swift Bindings SDK, the generator, or any Swift knowledge
 - The NuGet package includes MSBuild targets that automatically bundle native frameworks and configure diagnostic suppression
-- **Ownership**: Swift class instances have GC-safe finalizers — no explicit disposal needed for typical usage. For batch operations or struct bindings, use `SwiftDisposeScope` or `using`. The `SB1001` Roslyn analyzer warns on undisposed locals. Fetch the Ownership guide (see doc table) if the user asks.
+- **Ownership**: Swift class instances have GC-safe finalizers — no explicit disposal needed for typical usage. For batch operations or struct bindings, use `SwiftDisposeScope` or `using`. The `SB1001` Roslyn analyzer surfaces undisposed locals as an **info diagnostic** (not a warning) — it's a hint for deterministic cleanup, not a correctness requirement. Fetch the Ownership guide (see doc table) if the user asks.
 - **Multi-platform**: Each binding package targets a single platform (iOS, macOS, etc.). Create one binding project per platform if multiple are needed.
 - For production device builds, NativeAOT is recommended:
   ```xml
@@ -532,7 +564,7 @@ using (new SwiftDisposeScope())
 | `SB0002` | **Missing symbol** — P/Invoke entry point not found. Will throw `EntryPointNotFoundException`. | No |
 | `SB0003` | **Non-dispatchable protocol member** — can't be called on protocol-typed values. Use a concrete type instead. | No |
 | `SB0004` | **Empty protocol interface** — all members were skipped. Interface exists for type identity only. | No |
-| `SB1001` | **Undisposed ISwiftObject** — Roslyn analyzer warning. Add `using` or `Dispose()`. | No |
+| `SB1001` | **Undisposed ISwiftObject** — Roslyn analyzer **info diagnostic** (not a warning). Suggests `using` or `Dispose()` for deterministic cleanup. GC finalizer handles correctness. | No |
 
 ## Error Recovery Patterns
 
@@ -560,6 +592,7 @@ Key customization options:
 - **Doc comments**: Automatically extracted from Swift docs. Disable with `<SwiftGenerateDocComments>false</SwiftGenerateDocComments>`
 - **Fast iteration**: `dotnet build -p:SwiftWrapperArchitectures=simulator` for simulator-only builds (~2x faster)
 - **Verbose output**: `dotnet build -p:SwiftGeneratorVerbosity=2` for debug-level generator logging
+- **Auto dependency detection**: Enabled by default. Disable with `<SwiftAutoDetectDependencies>false</SwiftAutoDetectDependencies>` if you need to manage `<ProjectReference>`/`<SwiftFrameworkDependency>` items manually (rare)
 
 ### "My ObjC binding has bgen errors"
 
@@ -592,31 +625,70 @@ SwiftUI views are automatically detected and bridged — the user doesn't need t
 
 ### "I want to bind multiple frameworks from the same vendor"
 
-For multi-framework SDKs (e.g., Stripe), each framework gets its own binding project. Use `<ProjectReference>` for intra-vendor dependencies:
+**Always fetch the Multi-Framework Libraries wiki page** (URL in the doc table above) when the user is binding more than one framework from the same vendor — it has the authoritative guidance and should be your primary reference.
+
+Quick orientation:
+
+For multi-framework SDKs (e.g., Stripe, Firebase), each xcframework gets its own binding project. Organize them in a vendor directory:
 
 ```
-vendor-bindings/
-├── VendorCore.Swift.iOS/
-│   ├── VendorCore.Swift.iOS.csproj
-│   └── VendorCore.xcframework/
-├── VendorPayments.Swift.iOS/
-│   ├── VendorPayments.Swift.iOS.csproj    ← ProjectReference to VendorCore
-│   └── VendorPayments.xcframework/
+payments-bindings/
+├── PaymentsCore/
+│   ├── SwiftBindings.Payments.Core.csproj
+│   └── PaymentsCore.xcframework/
+├── PaymentsCrypto/                          ← internal ObjC-only helper, no csproj
+│   └── PaymentsCrypto.xcframework/
+├── PaymentsAuth/
+│   ├── SwiftBindings.Payments.Auth.csproj   ← depends on Core + Crypto
+│   └── PaymentsAuth.xcframework/
+└── PaymentsUI/
+    ├── SwiftBindings.Payments.UI.csproj
+    └── PaymentsUI.xcframework/
 ```
+
+**Auto-detection does most of the work.** The SDK ships with `<SwiftAutoDetectDependencies>true</SwiftAutoDetectDependencies>` enabled — it analyzes binary linkage, finds matching sibling binding projects, and auto-injects `<ProjectReference>` items. In most cases the user can just put projects in the same solution and build.
+
+When you do declare dependencies explicitly:
+- **`<ProjectReference>`** for sibling binding projects in the same solution. Provides cross-module type resolution, wrapper search paths, native reference propagation, and converts to a transitive `<PackageReference>` during pack — all automatic.
+- **`<SwiftFrameworkDependency>`** for internal helper xcframeworks (no binding project) or external pre-built xcframeworks. Add `PackageId`/`PackageVersion` metadata if the dependency is published as its own NuGet package; omit metadata for internal-only helpers (the `SWIFTBIND040` warning is intentional in that case).
+
+Example with both:
 
 ```xml
-<!-- VendorPayments.Swift.iOS.csproj -->
+<!-- SwiftBindings.Payments.Auth.csproj -->
 <Project Sdk="SwiftBindings.Sdk/X.Y.Z">
   <PropertyGroup>
     <TargetFramework>net10.0-ios</TargetFramework>
+    <PackageId>SwiftBindings.Payments.Auth</PackageId>
+    <Version>2.0.0</Version>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="../VendorCore.Swift.iOS/VendorCore.Swift.iOS.csproj" />
+    <!-- Sibling public dependency, also published as its own package -->
+    <ProjectReference Include="../PaymentsCore/SwiftBindings.Payments.Core.csproj" />
+
+    <!-- Internal ObjC-only helper, won't be published separately -->
+    <SwiftFrameworkDependency Include="../PaymentsCrypto/PaymentsCrypto.xcframework" />
   </ItemGroup>
 </Project>
 ```
 
-The SDK auto-resolves dependency xcframework search paths from `<ProjectReference>` — no `<SwiftFrameworkDependency>` needed.
+**Internal vs public dependencies.** Internal frameworks (no `.swiftmodule`, ObjC-only support libraries) still need their xcframeworks at compile and runtime, but get no binding project. They're declared via `<SwiftFrameworkDependency>` without metadata. **Important:** internal frameworks are NOT bundled into the published NuGet package — consumers of the published package must add a `<NativeReference>` item in their app project to include the internal framework at runtime.
+
+**Two-pass build pattern for CI.** A single `dotnet build` on the leaf consumer with `<ProjectReference>` items works because MSBuild orders dependencies automatically. CI systems that build each `.csproj` individually may need two passes — the first generates bindings (tolerating wrapper failures from missing dependencies), the second completes wrapper compilation:
+
+```bash
+# Pass 1: tolerate failures, generates bindings
+for project in PaymentsCore PaymentsAuth PaymentsUI; do
+  dotnet build $project/SwiftBindings.Payments.$project.csproj || true
+done
+
+# Pass 2: deferred wrapper compilation succeeds
+for project in PaymentsCore PaymentsAuth PaymentsUI; do
+  dotnet build $project/SwiftBindings.Payments.$project.csproj
+done
+```
+
+**Version coordination.** Set the version once in `Directory.Build.props` or pass `/p:Version=X.Y.Z` to all `dotnet pack` calls. Pack leaf dependencies first so dependents can resolve transitive `<PackageReference>` versions. See the **Publishing** wiki page for the full release workflow pattern (tag-based GitHub Actions, dry-run support, multi-pass CI builds).
 
 ### "How do I upgrade to a new version?"
 
