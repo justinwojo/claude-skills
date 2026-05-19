@@ -224,7 +224,8 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 |----------|-------------|
 | `SAFETY_HOOK_API_URL` | Chat completions endpoint (e.g. `https://api.openai.com/v1/chat/completions`) |
 | `SAFETY_HOOK_API_KEY` | API key (LLM disabled if empty) |
-| `SAFETY_HOOK_MODEL` | Model name (e.g. `grok-4-1-fast-reasoning`, `gpt-5.4-mini`) |
+| `SAFETY_HOOK_MODEL` | Model name (e.g. `grok-4.3`, `gpt-5.4-mini`) |
+| `SAFETY_HOOK_REASONING_EFFORT` | Optional `reasoning_effort` value (e.g. `none`, `low`, `medium`, `high`). Only sent if set; otherwise the provider default applies. |
 | `SAFETY_HOOK_AUTO_LEARN` | Persist LLM-approved commands to config (`true` / `1` / `yes`) |
 
 ## Audit log

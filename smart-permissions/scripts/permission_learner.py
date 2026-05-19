@@ -45,6 +45,8 @@ from pretool_safety import (  # noqa: E402
     _extract_function_body,
     _extract_case_arm_bodies,
     _check_inner_commands,
+    _has_interpreter_exec_flag,
+    _resolve_through_wrappers,
 )
 import re
 
@@ -180,22 +182,38 @@ def evaluate_bash_for_learning(command):
                     return "ask"
             continue
 
-        # Regular commands — check interpreter exec flags
+        # Regular commands — check interpreter exec flags.
+        # Delegated to pretool_safety._has_interpreter_exec_flag so that
+        # attached/equals/quoted/clustered forms (e.g. python -c"…",
+        # node --eval=…, bash $'-c', bash -lc) are caught here the same
+        # way evaluate_bash catches them. Also peel off transparent
+        # wrappers (env, timeout, nohup, …) so `env python -c "…"` and
+        # `timeout 5 bash -c "…"` are not hidden.
         first_word = get_first_command_word(cmd)
+        if first_word is None:
+            # Mirror PreToolUse: command substitution as the command word
+            # (`$(which bash) -c …`, `` `python -c …` ``) → ask.
+            stripped = cmd.lstrip()
+            if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
+                return "ask"
         if first_word:
             basename = os.path.basename(first_word)
-            exec_flags = INTERPRETER_EXEC_FLAGS.get(basename)
-            if exec_flags:
-                tokens = cmd.split()
-                # Strip quotes so bash "-c" and bash $'-c' are caught
-                stripped = set()
-                for t in tokens[1:]:
-                    if t.startswith("$'") and t.endswith("'"):
-                        stripped.add(t[2:-1])
-                    else:
-                        stripped.add(t.strip("'\""))
-                if exec_flags & stripped:
-                    return "ask"
+            if _has_interpreter_exec_flag(basename, cmd):
+                return "ask"
+            inner = _resolve_through_wrappers(cmd)
+            if inner != cmd:
+                inner_first = get_first_command_word(inner)
+                if inner_first:
+                    inner_basename = os.path.basename(inner_first)
+                    if _has_interpreter_exec_flag(inner_basename, inner):
+                        return "ask"
+                    # Mirror PreToolUse: a transparent wrapper must not hide
+                    # a non-safe inner. `env kubectl delete pod`, `timeout 5
+                    # terraform apply`, etc. should not be auto-approved by
+                    # the learner just because env/timeout are gone from
+                    # SAFE_COMMANDS.
+                    if not matches_safe_command(inner_first, inner):
+                        return "ask"
 
     # If we got here, the command is just unknown — safe to approve and learn
     return "allow"

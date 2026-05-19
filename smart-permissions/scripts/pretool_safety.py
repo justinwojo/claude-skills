@@ -16,13 +16,16 @@ Configuration:
   - Defaults loaded from config/defaults.json (ships with plugin)
   - User overrides from ~/.claude/smart-permissions-config.json (optional)
   - LLM fallback via env vars: SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY,
-    SAFETY_HOOK_MODEL (supports any OpenAI-compatible API)
+    SAFETY_HOOK_MODEL (supports any OpenAI-compatible API).
+    Optional: SAFETY_HOOK_REASONING_EFFORT (e.g. "none", "low") — only sent
+    if set; otherwise the provider default applies.
 """
 
 import sys
 import json
 import os
 import re
+import shlex
 from fnmatch import fnmatch
 from datetime import datetime
 import urllib.request
@@ -154,8 +157,8 @@ SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_script_paths", [
 ALLOWED_WEB_DOMAINS = _CONFIG.get("allowed_web_domains", [])
 SAFE_MCP_TOOLS = _CONFIG.get("safe_mcp_tools", [])
 SENSITIVE_PATHS = _CONFIG.get("sensitive_paths", [])
-DANGEROUS_PATTERNS = _CONFIG.get("dangerous_patterns", [])
-RISKY_PATTERNS = _CONFIG.get("risky_patterns", [])
+DANGEROUS_PATTERNS = _strip_comments(_CONFIG.get("dangerous_patterns", []))
+RISKY_PATTERNS = _strip_comments(_CONFIG.get("risky_patterns", []))
 
 # Convert interpreter_exec_flags from JSON lists to sets
 _raw_interp = _CONFIG.get("interpreter_exec_flags", {})
@@ -177,6 +180,9 @@ LLM_MODEL = os.environ.get(
     "SAFETY_HOOK_MODEL",
     ""
 )
+# Optional reasoning_effort param (e.g. "none", "low", "medium", "high").
+# Only sent if set — otherwise the provider's default applies.
+LLM_REASONING_EFFORT = os.environ.get("SAFETY_HOOK_REASONING_EFFORT", "").strip()
 
 # When true, commands/paths/domains approved by the LLM are automatically
 # added to ~/.claude/smart-permissions-config.json so they're auto-allowed
@@ -262,29 +268,320 @@ def learn_to_config(key, value):
         print(f"Could not save to config: {e}", file=sys.stderr)
 
 
+_LEARNABLE_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+_LEARNABLE_WORD_MAX_LEN = 64
+
+
+def _is_learnable_word(word):
+    """Reject words that aren't clean command/subcommand identifiers.
+
+    Auto-learn must never persist tokens like $VAR, DEPS+=("...", weird"
+    fragments, or heredoc body words. We require strict identifier shape:
+    leading letter/underscore, then letters/digits/_/./- only. Excessively
+    long tokens are also rejected — a 200-char identifier may match the
+    regex but is almost certainly heredoc/log content rather than a real
+    command name.
+    """
+    if not word or len(word) > _LEARNABLE_WORD_MAX_LEN:
+        return False
+    return bool(_LEARNABLE_WORD_RE.match(word))
+
+
+def _normalize_flag_token(token):
+    """Strip quoting wrappers from a token for flag matching.
+
+    Handles plain quotes ('-c', "-c"), ANSI-C quoting ($'-c'), and
+    Bash $"" locale-quoting ($"-c"). Returns the bare token content.
+    """
+    if token.startswith("$'") and token.endswith("'"):
+        return token[2:-1]
+    if token.startswith('$"') and token.endswith('"'):
+        return token[2:-1]
+    return token.strip("'\"")
+
+
+_INTERPRETER_WRAPPERS = frozenset({
+    "env", "command", "exec", "time", "timeout", "nohup",
+    "stdbuf", "nice", "ionice", "taskset", "chrt", "setsid", "unbuffer",
+})
+
+
+def _shlex_split_safe(cmd):
+    """shlex.split that doesn't raise on unbalanced quotes / unclosed
+    expansions. Falls back to naive split() so resolver callers never
+    crash on hostile inputs."""
+    try:
+        return shlex.split(cmd, posix=True)
+    except ValueError:
+        return cmd.split()
+
+
+def _resolve_through_wrappers(cmd):
+    """If `cmd` starts with a transparent wrapper (env, timeout, nohup, …),
+    return the inner command string starting at the real basename.
+
+    Wrappers are themselves safe but they execute an inner command. If
+    the inner command is an interpreter with an exec flag (`env python -c`,
+    `timeout 5 bash -c`, `nohup python -c`), the inline-exec detection
+    must see the inner basename, not the wrapper. Returns the original
+    `cmd` if no wrapper is detected, so callers can chain safely.
+
+    Handles wrapper-specific positional arguments and flag values:
+      - `env KEY=value KEY=value cmd …`  → skip VAR=value pairs (quote-aware)
+      - `env -S "cmd args"`              → re-parse the -S value as cmd
+      - `timeout [OPTS] DURATION cmd …`  → skip flags + the duration token
+      - `command [-pVv] cmd …`           → skip flags
+      - `exec [-cl] [-a NAME] cmd …`     → skip flags + -a's value
+      - `taskset MASK cmd …`             → skip mask (numeric/hex/list)
+      - `chrt [POLICY-FLAG] PRIO cmd …`  → skip priority
+      - `nohup cmd …`                    → no options to skip
+
+    Uses shlex so quoted env values like `env FOO="bar baz" python -c …`
+    are tokenized correctly. Wrapper chains (`env timeout 5 python -c …`)
+    are handled by tail-calling.
+    """
+    tokens = _shlex_split_safe(cmd)
+    if not tokens:
+        return cmd
+    first = os.path.basename(tokens[0])
+    if first not in _INTERPRETER_WRAPPERS:
+        return cmd
+
+    idx = 1
+    # Skip wrapper-specific flags and positional arguments.
+    while idx < len(tokens):
+        tok = tokens[idx]
+        # env KEY=value assignments — tokens are already shlex-decoded
+        if first == "env" and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tok):
+            idx += 1
+            continue
+        # Flags
+        if tok.startswith("-"):
+            # env -S / --split-string: the value IS a command string that
+            # env will re-split. Any tokens after the -S value are appended
+            # as additional args to the split command. So
+            #   env -S "python -c" print(1)   → python -c print(1)
+            #   env -S python -c "print(1)"   → python -c print(1)
+            # Reassemble: split(-S value) + remaining tokens, then recurse.
+            if first == "env" and tok in ("-S", "--split-string"):
+                if idx + 1 < len(tokens):
+                    s_value = tokens[idx + 1]
+                    rest = tokens[idx + 2:]
+                    inner_tokens = _shlex_split_safe(s_value) + rest
+                    if inner_tokens:
+                        inner_cmd = shlex.join(inner_tokens)
+                        return _resolve_through_wrappers(inner_cmd)
+                return cmd
+            if first == "env" and (tok.startswith("-S") or tok.startswith("--split-string=")):
+                # Attached form: -S"cmd" or --split-string=cmd
+                if tok.startswith("--split-string="):
+                    value = tok[len("--split-string="):]
+                else:
+                    value = tok[2:]
+                rest = tokens[idx + 1:]
+                inner_tokens = _shlex_split_safe(value) + rest
+                if inner_tokens:
+                    inner_cmd = shlex.join(inner_tokens)
+                    return _resolve_through_wrappers(inner_cmd)
+                return cmd
+            # Wrappers with value-flags we care about
+            if first == "env" and tok in ("-u", "--unset"):
+                idx += 2
+                continue
+            if first == "timeout" and tok in ("-s", "-k", "--signal", "--kill-after"):
+                idx += 2
+                continue
+            if first == "exec" and tok in ("-a",):
+                idx += 2
+                continue
+            if first == "stdbuf" and tok in ("-i", "-o", "-e",
+                                              "--input", "--output", "--error"):
+                idx += 2
+                continue
+            if first == "nice" and tok in ("-n", "--adjustment"):
+                idx += 2
+                continue
+            if first == "ionice" and tok in ("-c", "-n", "-p", "-P", "-u",
+                                              "--class", "--classdata", "--pid"):
+                idx += 2
+                continue
+            if first == "taskset" and tok in ("-p", "--pid", "-c", "--cpu-list"):
+                idx += 2
+                continue
+            if first == "chrt" and tok in ("-p", "--pid"):
+                idx += 2
+                continue
+            # Generic boolean flag for any wrapper
+            idx += 1
+            continue
+        # timeout's required positional DURATION (e.g. "5", "1.5", "30s")
+        if first == "timeout" and re.match(r"^[0-9]+(\.[0-9]+)?[smhd]?$", tok):
+            idx += 1
+            break
+        # taskset's required positional MASK: hex (0x1), decimal (3), list
+        # (0,2,4), or range (0-3). Must consume before reaching the command.
+        if first == "taskset" and re.match(r"^(0x[0-9a-fA-F]+|[0-9][0-9,\-]*)$", tok):
+            idx += 1
+            break
+        # chrt's required positional PRIORITY (integer)
+        if first == "chrt" and re.match(r"^[0-9]+$", tok):
+            idx += 1
+            break
+        # Non-flag, non-assignment token = the real command starts here
+        break
+
+    if idx >= len(tokens):
+        return cmd  # nothing past the wrapper — return original
+
+    # shlex.join reassembles with proper shell quoting so downstream
+    # naive splits in _has_interpreter_exec_flag still see the structure
+    inner = shlex.join(tokens[idx:])
+    # Recurse to handle wrapper chains (env timeout 5 python -c …)
+    inner_first = os.path.basename(tokens[idx])
+    if inner_first in _INTERPRETER_WRAPPERS:
+        return _resolve_through_wrappers(inner)
+    return inner
+
+
+def _has_interpreter_exec_flag(basename, cmd):
+    """True if `cmd` invokes basename with an inline-exec flag.
+
+    Recognizes every form an attacker could use to slip past the check:
+      - Separate token:        python -c "code"      perl -e "code"
+      - Attached short:        python -c"code"       perl -ecode
+      - Long with value:       node --eval "code"    deno eval "code"
+      - Long with equals:      node --eval=code      python --command=code
+      - Quoted flag:           bash "-c" "code"      bash '-c' code
+      - ANSI-C / locale quoted: bash $'-c' code       bash $"-c" code
+      - Clustered short flags: bash -lc "code"       sh -ec "code"
+
+    This must stay aligned with INTERPRETER_EXEC_FLAGS so anything we
+    consider a "safe interpreter" doesn't have an unchecked exec form.
+    """
+    exec_flags = INTERPRETER_EXEC_FLAGS.get(basename)
+    if not exec_flags:
+        return False
+    # Build the set of short flag *letters* (without leading dash) once.
+    # bash treats `-lc` as `-l -c`, so we need to detect any of the
+    # interpreter's short exec flags appearing anywhere inside a
+    # clustered short-option token.
+    short_letters = {f[1:] for f in exec_flags
+                     if len(f) == 2 and f.startswith("-") and not f.startswith("--")}
+    tokens = cmd.split()
+    for raw in tokens[1:]:
+        token = _normalize_flag_token(raw)
+        if not token:
+            continue
+        # Exact match: -c, -e, --eval, eval (subcommand-style)
+        if token in exec_flags:
+            return True
+        # --flag=value: split on the first '='
+        if "=" in token:
+            head = token.split("=", 1)[0]
+            if head in exec_flags:
+                return True
+        # Clustered short-flag form: -lc"code", -ec, -fc, etc. Walk the
+        # letters after the single leading dash and stop at the first
+        # value boundary (quote, `=`, end of token). Any short exec
+        # letter present in the cluster counts as inline-exec.
+        if (token.startswith("-") and not token.startswith("--")
+                and len(token) > 2 and short_letters):
+            cluster = []
+            for ch in token[1:]:
+                if ch in ('"', "'", "="):
+                    break
+                cluster.append(ch)
+            for ch in cluster:
+                if ch in short_letters:
+                    return True
+    return False
+
+
+def _contains_inline_interpreter(command):
+    """True if the command invokes an inline interpreter (bash -c, python -c).
+
+    When this is true, auto-learn must skip the entire command — the
+    splitter can't reliably tokenize the contents of the -c string, and
+    naive splits would persist heredoc/script fragments as 'commands'.
+    """
+    if not command or not command.strip():
+        return False
+    parts, _ = split_compound_command(command)
+    for cmd in parts:
+        first_word = get_first_command_word(cmd)
+        if not first_word:
+            continue
+        basename = os.path.basename(first_word)
+        if _has_interpreter_exec_flag(basename, cmd):
+            return True
+        # Also check through transparent wrappers (env, timeout, nohup, …)
+        inner = _resolve_through_wrappers(cmd)
+        if inner != cmd:
+            inner_first = get_first_command_word(inner)
+            if inner_first:
+                inner_basename = os.path.basename(inner_first)
+                if _has_interpreter_exec_flag(inner_basename, inner):
+                    return True
+    return False
+
+
 def _auto_learn(tool, tool_input):
     """Determine what to learn from an approved tool call and persist it."""
     if tool == "Bash":
         command = tool_input.get("command", "")
-        commands, _ = split_compound_command(command)
+        # Inline interpreter (bash -c, python -c, etc.) — the contents
+        # of the -c string can't be reliably tokenized as shell, so any
+        # words we'd extract are likely fragments (heredoc text, embedded
+        # script, regex). Skip auto-learn entirely for these.
+        if _contains_inline_interpreter(command):
+            return
+        commands, uncertain = split_compound_command(command)
+        # Parser hit unbalanced quotes / incomplete heredoc — extracted
+        # words can't be trusted, don't persist anything.
+        if uncertain:
+            return
         for cmd in commands:
+            # Extract up to 3 words so we can DETECT (and reject) 3+ word
+            # commands without persisting them. If we extracted with
+            # max_words=2 and the input was actually 3-word, we'd
+            # silently truncate to a 2-word entry that broadens scope
+            # (approving "foo bar baz" should NOT auto-allow "foo bar
+            # destructive"). Three-word patterns (docker compose up,
+            # gh pr list) belong in defaults.json wildcards instead.
             words = get_command_words(cmd, max_words=3, flag_handling="stop")
             if not words:
                 continue
             basename = os.path.basename(words[0])
+            # Skip wrapper-prefixed forms (env kubectl, timeout ls, …) —
+            # learning them would broaden scope (`nohup kubectl` then
+            # auto-allows `nohup kubectl delete`). The inner command
+            # should be learned on its own merits via a non-wrapped run.
+            if basename in _INTERPRETER_WRAPPERS:
+                continue
             # If the base command is already approved (single-word), skip
             if basename in SAFE_COMMANDS or words[0] in SAFE_COMMANDS:
                 continue
             # Already covered by a multi-word entry (exact or wildcard)?
             if matches_safe_command(words[0], cmd):
                 continue
-            # Learn the most specific form we can: up to 2 subcommand words
-            # e.g. "flutter doctor", "kubectl get pods"
             # Safety: never learn a single-word base command — if we only
             # extracted 1 word it may be because flags obscured the real
             # subcommand, and learning the base command would blanket-approve
             # all subcommands including dangerous ones.
             if len(words) < 2:
+                continue
+            # Refuse to learn 3+ word commands. Truncating to 2 would
+            # broaden scope; the user (or defaults.json) should add the
+            # full pattern explicitly. Also catches prose-shaped 3-word
+            # fragments from misparsed heredocs.
+            if len(words) > 2:
+                continue
+            # Reject anything that doesn't look like a clean command +
+            # subcommand chain. Catches $VAR-prefixed, +=array assignments,
+            # quoted heredoc fragments, words with punctuation.
+            if not _is_learnable_word(basename):
+                continue
+            if not all(_is_learnable_word(w) for w in words[1:]):
                 continue
             to_learn = " ".join([basename] + words[1:])
             learn_to_config("safe_commands", to_learn)
@@ -371,6 +668,7 @@ def llm_evaluate(tool, tool_input):
             {"role": "user", "content": prompt},
         ],
         "temperature": 0.0,
+        **({"reasoning_effort": LLM_REASONING_EFFORT} if LLM_REASONING_EFFORT else {}),
         # Structured output — guarantees valid JSON matching this schema.
         # Supported by xAI Grok and OpenAI GPT models.
         "response_format": {
@@ -491,7 +789,10 @@ def evaluate(tool, tool_input):
     if tool in ("TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
                 "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode",
                 "TaskOutput", "TaskStop", "ToolSearch",
-                "CronCreate", "CronDelete", "CronList"):
+                "CronCreate", "CronDelete", "CronList",
+                "Monitor", "ScheduleWakeup", "PushNotification",
+                "EnterWorktree", "ExitWorktree",
+                "LSP", "RemoteTrigger", "ShareOnboardingGuide"):
         return ("allow", "Internal Claude Code tool")
 
     # Write/Edit/NotebookEdit — check file paths
@@ -694,25 +995,40 @@ def evaluate_bash(command):
 
         first_word = get_first_command_word(cmd)
         if first_word is None:
+            # Command substitution as the command itself (e.g. `$(which
+            # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
+            # statically and is a known interpreter-hiding bypass — ask.
+            stripped = cmd.lstrip()
+            if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
+                return ("ask", "Command substitution as command word")
             continue
 
         # Check for interpreter string execution (bash -c, python -c, etc.)
-        # Must come BEFORE safe-command check since interpreters are in SAFE_COMMANDS
+        # Must come BEFORE safe-command check since interpreters are in SAFE_COMMANDS.
+        # Peel off transparent wrappers (env, timeout, nohup, …) so
+        # `env python -c "…"` is detected the same as `python -c "…"`.
         basename = os.path.basename(first_word)
-        exec_flags = INTERPRETER_EXEC_FLAGS.get(basename)
-        if exec_flags:
-            tokens = cmd.split()
-            # Strip quotes so bash "-c", bash '-c', and bash $'-c' are caught
-            stripped = set()
-            for t in tokens[1:]:
-                if t.startswith("$'") and t.endswith("'"):
-                    stripped.add(t[2:-1])  # ANSI-C quoting
-                else:
-                    stripped.add(t.strip("'\""))
-            matched = exec_flags & stripped
-            if matched:
-                flag = next(iter(matched))
-                return ("ask", f"Inline interpreter execution: {basename} {flag}")
+        inner_cmd = _resolve_through_wrappers(cmd)
+        inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
+        inner_basename = os.path.basename(inner_first) if inner_first else basename
+        if _has_interpreter_exec_flag(basename, cmd):
+            return ("ask", f"Inline interpreter execution: {basename}")
+        if inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd):
+            return ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
+
+        # If a transparent wrapper was peeled, the inner command's safety
+        # is what matters — the wrapper is no longer in SAFE_COMMANDS
+        # exactly so that destructive inners like
+        # `env kubectl delete` / `timeout 5 terraform apply` can't hide.
+        if inner_cmd != cmd and inner_first is not None:
+            if matches_safe_command(inner_first, inner_cmd):
+                continue
+            # Inner is not safe; switch first_word to the inner so the
+            # subsequent unknown-command path logs and prompts on the
+            # real command rather than the wrapper.
+            first_word = inner_first
+            cmd = inner_cmd
+            basename = inner_basename
 
         # Check known-safe commands (supports multi-word like "flutter doctor")
         if matches_safe_command(first_word, cmd):
@@ -785,22 +1101,33 @@ def _check_inner_commands(body_text, defined_functions):
 
         first_word = get_first_command_word(cmd)
         if first_word is None:
+            # Command substitution as the command itself (e.g. `$(which
+            # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
+            # statically and is a known interpreter-hiding bypass — ask.
+            stripped = cmd.lstrip()
+            if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
+                return ("ask", "Command substitution as command word")
             continue
 
-        # Interpreter exec flags
+        # Interpreter exec flags (peel off transparent wrappers first)
         basename = os.path.basename(first_word)
-        exec_flags = INTERPRETER_EXEC_FLAGS.get(basename)
-        if exec_flags:
-            tokens = cmd.split()
-            stripped = set()
-            for t in tokens[1:]:
-                if t.startswith("$'") and t.endswith("'"):
-                    stripped.add(t[2:-1])
-                else:
-                    stripped.add(t.strip("'\""))
-            if exec_flags & stripped:
-                flag = next(iter(exec_flags & stripped))
-                return ("ask", f"Interpreter execution in compound block: {basename} {flag}")
+        inner_cmd = _resolve_through_wrappers(cmd)
+        inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
+        inner_basename = os.path.basename(inner_first) if inner_first else basename
+        if _has_interpreter_exec_flag(basename, cmd):
+            return ("ask", f"Interpreter execution in compound block: {basename}")
+        if inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd):
+            return ("ask", f"Interpreter execution via wrapper in compound block: {basename} … {inner_basename}")
+
+        # Wrapper peel: delegate safety to the inner command (env / timeout /
+        # nohup are no longer single-word safe, so they must not hide
+        # destructive inners like `env kubectl delete`)
+        if inner_cmd != cmd and inner_first is not None:
+            if matches_safe_command(inner_first, inner_cmd):
+                continue
+            first_word = inner_first
+            cmd = inner_cmd
+            basename = inner_basename
 
         # Known-safe commands (supports multi-word like "flutter doctor")
         if matches_safe_command(first_word, cmd):
@@ -1136,8 +1463,12 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
     - "skip_with_value": Skip the flag AND the next token (presumed flag
       value). Handles value flags before subcommands (e.g. "docker --context
       prod build" → ["docker", "build"]).
+    - "include": Treat the flag itself as a subcommand word. Handles tools
+      where the "subcommand" is really a flag (e.g. "spctl --status",
+      "codesign --verify ..."). Only used by matches_safe_command — never
+      by auto-learn (we don't want to persist flag forms).
 
-    matches_safe_command tries all three modes for matching; _auto_learn
+    matches_safe_command tries all four modes for matching; _auto_learn
     uses only "stop" to avoid persisting ambiguous extractions.
     """
     if not cmd:
@@ -1157,10 +1488,10 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
     while idx < len(tokens) and tokens[idx] == "|":
         idx += 1
 
-    # Skip env var assignments
+    # Skip env var assignments (VAR=value and bash += array/string append)
     while idx < len(tokens):
         token = tokens[idx]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token):
             idx += 1
             value_part = token.split("=", 1)[1]
 
@@ -1193,9 +1524,9 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
         return []
     if word.startswith(">") or word.startswith("<"):
         return []
-    if word.startswith("$("):
-        inner = word[2:].rstrip(")")
-        return [inner] if inner else []
+    # Command substitution as the first word — see get_first_command_word.
+    if word.startswith("$(") or word.startswith("`") or word.startswith("\\`"):
+        return []
     if word.startswith("$") and not word.startswith("$("):
         return [word]
     if word == "-":
@@ -1224,7 +1555,18 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
 
         # Handle flags
         if w.startswith("-"):
-            if flag_handling == "skip_with_value":
+            if flag_handling == "include":
+                # Treat the flag itself as the "subcommand" word.
+                # Handles: spctl --status → ["spctl", "--status"],
+                # codesign --verify file → ["codesign", "--verify"].
+                # Strip = value (e.g. "--foo=bar" → "--foo") so that
+                # entries like "codesign --verify" match invocations
+                # with arguments.
+                flag_word = w.split("=", 1)[0]
+                result.append(flag_word)
+                subcommands_needed -= 1
+                continue
+            elif flag_handling == "skip_with_value":
                 # Skip the flag, and if no inline value (no =), also
                 # skip the next token as a presumed flag value.
                 # Handles: docker --context prod build → ["docker", "build"]
@@ -1239,9 +1581,14 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
                 # "stop": conservative mode, stop at the first flag
                 break
 
+        # Strip surrounding quotes from subcommand candidates so
+        # `docker "build"` / `kubectl 'get' pods` match the same multi-word
+        # patterns as their unquoted forms.
+        if len(w) >= 2 and w[0] in ('"', "'") and w[-1] == w[0]:
+            w = w[1:-1]
         # Only treat as a subcommand if it's a plain word —
         # skip paths (/foo, ./bar), variables ($X),
-        # redirections (>, <), quotes, and empty results
+        # redirections (>, <), and empty results
         if _is_subcommand_token(w):
             result.append(w)
             subcommands_needed -= 1
@@ -1265,13 +1612,20 @@ def _is_subcommand_token(w):
             and "/" not in w)
 
 
-def _build_candidates(words):
+def _build_candidates(words, longest_only=False):
     """Build candidate multi-word strings from extracted command words.
 
     ["docker", "compose", "up"] → ["docker compose up", "docker compose"]
+
+    When longest_only=True, only the full-length candidate is returned. This is
+    used for the "include" flag-handling mode so that an entry like
+    `spctl --status` does not also match `spctl --status --master-disable`
+    (where the trailing flag changes behavior).
     """
     if len(words) < 2:
         return []
+    if longest_only:
+        return [" ".join([os.path.basename(words[0])] + words[1:])]
     candidates = []
     for n in range(min(len(words), 3), 1, -1):
         candidates.append(" ".join([os.path.basename(words[0])] + words[1:n]))
@@ -1309,13 +1663,16 @@ def _check_candidates(basename, candidates):
 def matches_safe_command(first_word, cmd):
     """Check if a command matches SAFE_COMMANDS, supporting multi-word entries.
 
-    Uses three extraction strategies and accepts if any matches:
+    Uses four extraction strategies and accepts if any matches:
     1. "stop" (adjacent-only): handles "docker build -t myapp"
     2. "skip" (skip flags only): handles "docker --verbose build"
     3. "skip_with_value" (skip flag + value): handles "docker --context prod build"
+    4. "include" (flag is the subcommand): handles "spctl --status",
+       "codesign --verify file"
 
-    This covers boolean flags, value flags, and no-flag cases without
-    any strategy producing false positives that could bypass restrictions.
+    This covers boolean flags, value flags, no-flag, and flag-as-subcommand
+    cases without any strategy producing false positives that could bypass
+    restrictions (matching is against the same allowlist either way).
 
     Args:
         first_word: The first command word (from get_first_command_word).
@@ -1329,10 +1686,14 @@ def matches_safe_command(first_word, cmd):
 
     basename = os.path.basename(first_word)
 
-    # Try all three extraction strategies — accept if any matches
-    for mode in ("stop", "skip", "skip_with_value"):
+    # Try all four extraction strategies — accept if any matches
+    for mode in ("stop", "skip", "skip_with_value", "include"):
         words = get_command_words(cmd, max_words=3, flag_handling=mode)
-        candidates = _build_candidates(words)
+        # In include mode the flag IS the subcommand identity. Match only the
+        # full-length candidate so a later flag (which may change behavior)
+        # cannot be silently dropped to hit a shorter exact entry. Example:
+        # `spctl --status --master-disable` must not match `spctl --status`.
+        candidates = _build_candidates(words, longest_only=(mode == "include"))
         if _check_candidates(basename, candidates):
             return True
 
@@ -1364,10 +1725,10 @@ def get_first_command_word(cmd):
     while idx < len(tokens) and tokens[idx] == "|":
         idx += 1
 
-    # Skip env var assignments
+    # Skip env var assignments (VAR=value and bash += array/string append)
     while idx < len(tokens):
         token = tokens[idx]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token):
             idx += 1
             value_part = token.split("=", 1)[1]
 
@@ -1402,9 +1763,13 @@ def get_first_command_word(cmd):
     if word.startswith(">") or word.startswith("<"):
         return None
 
-    if word.startswith("$("):
-        inner = word[2:].rstrip(")")
-        return inner if inner else None
+    # Command substitution as the FIRST word: `$(which bash) -c "evil"` or
+    # `\`python -c …\`` selects the interpreter dynamically and previously
+    # collapsed to the inner safe command (e.g. "which") — bypassing the
+    # interpreter-exec check on the *actual* command that runs. Return None
+    # so the caller treats the whole command as unknown and prompts.
+    if word.startswith("$(") or word.startswith("`") or word.startswith("\\`"):
+        return None
 
     # Variable expansion as first word — can't resolve statically, treat as
     # unknown so it gets prompted (prevents $CMD bypasses like $'\x73udo')
