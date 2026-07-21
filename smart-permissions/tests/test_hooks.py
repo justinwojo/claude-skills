@@ -20,6 +20,7 @@ import base64
 import tempfile
 import shutil
 import atexit
+import time
 
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 PRETOOL = os.path.join(SCRIPT_DIR, 'pretool_safety.py')
@@ -324,13 +325,19 @@ def test_pretool_mcp_tools():
 # =====================================================================
 
 def test_learner_unknown_commands():
-    """Unknown-but-not-dangerous commands should be auto-approved."""
+    """Unknown-but-not-dangerous commands should be auto-approved (no LLM).
+
+    NOTE: ansible-playbook was replaced with flyctl here. Under C0,
+    ansible-playbook is a restricted (multi-word-only) family, so bare
+    `ansible-playbook site.yml` now asks rather than blanket-approving —
+    see test_c0_restricted_base_matrix. flyctl is a genuinely-unknown,
+    non-restricted base and still auto-approves without an LLM."""
     print('\n--- PermissionRequest: Unknown commands (auto-approve) ---')
     cases = [
         ('terraform plan', 'terraform plan'),
         ('kubectl get pods', 'kubectl get pods'),
         ('flutter build', 'flutter build ios'),
-        ('ansible-playbook', 'ansible-playbook site.yml'),
+        ('flyctl deploy', 'flyctl deploy'),
     ]
     for name, cmd in cases:
         result = run_hook(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}})
@@ -1553,6 +1560,919 @@ def test_include_mode_extra_flags_caught():
 
 
 # =====================================================================
+#  C8 — Comprehensive tests for C0/C1/C2/C4/C5/C6/C9
+# =====================================================================
+#
+# These exercise the new subsystems end-to-end through real subprocess hook
+# runs. A shared wrapper (_run_cfg) points each hook at a *fresh, isolated*
+# temp config dir and can mock the LLM's HTTP call so the decision cache and
+# learner LLM path are testable without any network.
+
+import hashlib  # noqa: E402
+
+
+def _fresh_cfg(initial=None):
+    """Create an isolated temp config dir. Returns (dir, config_path)."""
+    d = tempfile.mkdtemp(prefix='sp-c8-')
+    atexit.register(shutil.rmtree, d, ignore_errors=True)
+    cp = os.path.join(d, 'smart-permissions-config.json')
+    if initial is not None:
+        with open(cp, 'w') as f:
+            json.dump(initial, f)
+    return d, cp
+
+
+def _read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _decision_records(cfg_dir):
+    """Parsed records from the decision JSONL in a config dir's hooks/."""
+    p = os.path.join(cfg_dir, 'hooks', 'smart-permissions-decisions.jsonl')
+    recs = []
+    try:
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    recs.append(json.loads(line))
+    except OSError:
+        pass
+    return recs
+
+
+def _cache_file(cfg_dir):
+    return os.path.join(cfg_dir, 'hooks', 'smart-permissions-llm-cache.json')
+
+
+def _cache_key(tool, tool_input):
+    """Replicate pretool_safety._llm_cache_key (C4'' key formula) independently."""
+    canonical = json.dumps(tool_input, sort_keys=True, separators=(',', ':'))
+    raw = tool + '\0' + canonical
+    return hashlib.sha256(raw.encode('utf-8', 'replace')).hexdigest()
+
+
+def _run_cfg(script, payload, config_path, llm=None, auto_learn=False,
+             raw_input=None, extra_env=None):
+    """Run a hook against config_path with the LLM optionally mocked.
+
+    llm:
+      None                 -> LLM not configured (env vars unset)
+      {'safe': bool,...}   -> configured; mocked urlopen returns this decision
+      'error'              -> configured; mocked urlopen raises
+    extra_env: optional dict merged into the subprocess env (e.g. to point
+      SMART_PERMISSIONS_DEFAULTS at a broken path for fail-closed tests).
+    Returns the decision string ('allow' | 'deny' | 'ask').
+    """
+    env = os.environ.copy()
+    for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'SAFETY_HOOK_API_URL',
+              'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_AUTO_LEARN',
+              'SAFETY_HOOK_REASONING_EFFORT'):
+        env.pop(k, None)
+    env['SMART_PERMISSIONS_CONFIG'] = config_path
+    if auto_learn:
+        env['SAFETY_HOOK_AUTO_LEARN'] = 'true'
+    if extra_env:
+        env.update(extra_env)
+
+    mock = ''
+    if llm is not None:
+        env['SAFETY_HOOK_API_URL'] = 'https://mock.invalid/v1/chat/completions'
+        env['SAFETY_HOOK_API_KEY'] = 'test-key'
+        env['SAFETY_HOOK_MODEL'] = 'mock-model'
+        if llm == 'error':
+            mock = ("def _f(req, timeout=None):\n"
+                    "    raise Exception('mock network error')\n"
+                    "urllib.request.urlopen = _f\n")
+        else:
+            resp = json.dumps({'choices': [{'message': {'content': json.dumps(llm)}}]})
+            mock = ("class _R:\n"
+                    "    def __enter__(self): return self\n"
+                    "    def __exit__(self, *a): return False\n"
+                    "    def read(self): return %r.encode()\n"
+                    "def _f(req, timeout=None): return _R()\n"
+                    "urllib.request.urlopen = _f\n" % resp)
+
+    module = 'pretool_safety' if script == PRETOOL else 'permission_learner'
+    wrapper = (
+        "import sys, json\n"
+        "sys.path.insert(0, %r)\n"
+        "import urllib.request\n"
+        "%s"
+        "import %s as _m\n"
+        "_m.main()\n"
+    ) % (SCRIPT_DIR, mock, module)
+
+    stdin = raw_input if raw_input is not None else json.dumps(payload)
+    r = subprocess.run([sys.executable, '-c', wrapper], input=stdin,
+                       capture_output=True, text=True, env=env)
+    out = r.stdout.strip()
+    if out:
+        hook = json.loads(out).get('hookSpecificOutput', {})
+        if 'permissionDecision' in hook:
+            return hook['permissionDecision']
+        if 'behavior' in hook.get('decision', {}):
+            return hook['decision']['behavior']
+    return 'ask'
+
+
+# ---- C1: decision log --------------------------------------------------
+
+def test_c1_decision_log():
+    print('\n--- C1: decision log (both hooks, parse-error, rotation) ---')
+
+    # PreToolUse allow → one rule record with the expected fields.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}, cp)
+    recs = _decision_records(cfg)
+    check('pretool logs a record', len(recs) >= 1, True)
+    if recs:
+        r = recs[-1]
+        check('pretool record hook', r.get('hook'), 'pretool')
+        check('pretool record decision', r.get('decision'), 'allow')
+        check('pretool record source', r.get('source'), 'rule')
+        check('pretool record tool', r.get('tool'), 'Bash')
+        check('pretool record input captured', r.get('input'), 'ls -la')
+        check('pretool record has ts', bool(r.get('ts')), True)
+        check('pretool record has reason', bool(r.get('reason')), True)
+
+    # Learner allow (no LLM) → learner-source record.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}, cp)
+    recs = _decision_records(cfg)
+    lrec = [r for r in recs if r.get('hook') == 'permission_request']
+    check('learner logs a record', len(lrec) >= 1, True)
+    if lrec:
+        check('learner record decision', lrec[-1].get('decision'), 'allow')
+        check('learner record source', lrec[-1].get('source'), 'learner')
+
+    # Parse-error exit path still logs (both hooks).
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, None, cp, raw_input='this is not json{')
+    recs = _decision_records(cfg)
+    check('pretool parse-error logged', any('parse' in r.get('reason', '').lower()
+                                            for r in recs), True)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, None, cp, raw_input='}{ bad')
+    recs = _decision_records(cfg)
+    check('learner parse-error logged', any('parse' in r.get('reason', '').lower()
+                                           for r in recs), True)
+
+    # Input truncated to 500 chars.
+    cfg, cp = _fresh_cfg()
+    longcmd = 'echo ' + ('x' * 2000)
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': longcmd}}, cp)
+    recs = _decision_records(cfg)
+    check('input truncated to 500', all(len(r.get('input', '')) <= 500 for r in recs), True)
+
+    # Disabled via config → no log file written.
+    cfg, cp = _fresh_cfg({'decision_log': False})
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, cp)
+    check('decision_log:false writes nothing', _decision_records(cfg), [])
+
+
+def test_c1_log_rotation():
+    print('\n--- C1: decision log 5MB single-generation rotation ---')
+    cfg, cp = _fresh_cfg()
+    logdir = os.path.join(cfg, 'hooks')
+    os.makedirs(logdir, exist_ok=True)
+    logpath = os.path.join(logdir, 'smart-permissions-decisions.jsonl')
+    # Pre-fill just over 5 MB so the next write rotates.
+    with open(logpath, 'w') as f:
+        f.write('{"old": "line"}\n' * 350000)
+    check('pre-roll log > 5MB', os.path.getsize(logpath) > 5 * 1024 * 1024, True)
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, cp)
+    check('rotated .1 created', os.path.exists(logpath + '.1'), True)
+    # Live log now holds only the fresh record(s).
+    recs = _decision_records(cfg)
+    check('post-roll live log small', len(recs) <= 2, True)
+
+
+# ---- C0: restricted-base matrix ---------------------------------------
+
+def test_c0_restricted_base_matrix():
+    print('\n--- C0: restricted command families (learner) ---')
+
+    restricted = ['docker run x', 'npm publish', 'gh pr create x',
+                  'terraform apply', 'kubectl delete pod x']
+    # No LLM: restricted families ask, plain unknowns allow.
+    for cmd in restricted:
+        cfg, cp = _fresh_cfg()
+        check(f'no-LLM restricted asks: {cmd}',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+    cfg, cp = _fresh_cfg()
+    check('no-LLM non-restricted allows: flyctl deploy',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}, cp),
+          'allow')
+
+    # LLM allow / deny drive the verdict for restricted families.
+    cfg, cp = _fresh_cfg()
+    check('LLM-allow restricted → allow',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
+                   cp, llm={'safe': True, 'reason': 'ok'}),
+          'allow')
+    cfg, cp = _fresh_cfg()
+    check('LLM-deny restricted → deny',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
+                   cp, llm={'safe': False, 'reason': 'no'}),
+          'deny')
+
+    # C0 learn rejection: even LLM-approved + AUTO_LEARN never persists a
+    # restricted family to the allowlist.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
+             cp, llm={'safe': True, 'reason': 'ok'}, auto_learn=True)
+    learned = _read_json(cp, {}).get('safe_commands', [])
+    check('C0: restricted family not learned even by LLM',
+          any('docker' in e for e in learned), False)
+
+    # Defaults anchoring: subtracting docker entries can't demote the family.
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'safe_commands': ['docker run *', 'docker build *']}})
+    check('C0: docker stays restricted under remove_from_defaults',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}}, cp),
+          'ask')
+
+    # Subtracting a single-word safe command makes that base restricted (C0
+    # component 3 — a removal means "ask me", never "unknown → allow").
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'safe_commands': ['git']}})
+    check('C0: subtracted single-word base is restricted',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'git status'}}, cp),
+          'ask')
+
+
+def test_c0_pretool_restricted():
+    print('\n--- C0: restricted families ask in PreToolUse ---')
+    for cmd in ['docker run x', 'npm publish', 'terraform apply']:
+        cfg, cp = _fresh_cfg()
+        check(f'pretool restricted asks: {cmd}',
+              _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+
+
+def test_c0_sibling_learning_restored():
+    print('\n--- C0: self-learned multi-only base does not poison siblings ---')
+    # Regression for the merged-multi-only plan defect: learning "znovel plan"
+    # must not make "znovel" restricted and block learning "znovel apply".
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'znovel plan'}}, cp)
+    check('first subcommand learned',
+          'znovel plan' in _read_json(cp, {}).get('safe_commands', []), True)
+    check('sibling subcommand still allowed',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'znovel apply'}}, cp),
+          'allow')
+    check('sibling subcommand learned',
+          'znovel apply' in _read_json(cp, {}).get('safe_commands', []), True)
+
+
+# ---- C3: filename-shaped subcommand guard -----------------------------
+
+def test_c3_extension_guard():
+    print('\n--- C3: reject filename-shaped 2nd learn word ---')
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'zpdftool report.pdf'}}, cp)
+    learned = _read_json(cp, {}).get('safe_commands', [])
+    check('C3: extension-shaped subcommand not learned',
+          'zpdftool report.pdf' in learned, False)
+    # A clean subcommand of the same shape-family still learns.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'zbuildtool compile'}}, cp)
+    check('C3: clean subcommand still learned',
+          'zbuildtool compile' in _read_json(cp, {}).get('safe_commands', []), True)
+
+
+# ---- C2: MCP auto-learn -----------------------------------------------
+
+def test_c2_mcp_learn():
+    print('\n--- C2: MCP tool auto-learn + gate ---')
+    # LLM-approved MCP tool with AUTO_LEARN persists the EXACT name.
+    cfg, cp = _fresh_cfg()
+    dec = _run_cfg(LEARNER, {'tool_name': 'mcp__foo__do_thing', 'tool_input': {'a': 1}},
+                   cp, llm={'safe': True, 'reason': 'ok'}, auto_learn=True)
+    check('MCP LLM-allow → allow', dec, 'allow')
+    check('C2: exact MCP name learned',
+          'mcp__foo__do_thing' in _read_json(cp, {}).get('safe_mcp_tools', []), True)
+
+    # After learning, PreToolUse allows it by rule (exact match).
+    check('learned MCP tool allowed by rule in pretool',
+          _run_cfg(PRETOOL, {'tool_name': 'mcp__foo__do_thing', 'tool_input': {}}, cp),
+          'allow')
+
+    # Gate off → not learned.
+    cfg, cp = _fresh_cfg({'auto_learn_mcp_tools': False})
+    _run_cfg(LEARNER, {'tool_name': 'mcp__foo__do_thing', 'tool_input': {}},
+             cp, llm={'safe': True, 'reason': 'ok'}, auto_learn=True)
+    check('C2: gate off suppresses MCP learn',
+          'mcp__foo__do_thing' in _read_json(cp, {}).get('safe_mcp_tools', []), False)
+
+    # No AUTO_LEARN → not learned even when approved.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'mcp__foo__do_thing', 'tool_input': {}},
+             cp, llm={'safe': True, 'reason': 'ok'}, auto_learn=False)
+    check('C2: no AUTO_LEARN → MCP not learned',
+          'mcp__foo__do_thing' in _read_json(cp, {}).get('safe_mcp_tools', []), False)
+
+
+# ---- C6: merge / subtraction ------------------------------------------
+
+def test_c6_merge_and_subtraction():
+    print('\n--- C6: safe_internal_tools merge + subtraction discipline ---')
+    # Internal tools now come from defaults.json.
+    cfg, cp = _fresh_cfg()
+    check('internal tool allowed from defaults',
+          _run_cfg(PRETOOL, {'tool_name': 'ReportFindings', 'tool_input': {}}, cp), 'allow')
+    # User can extend via array merge.
+    cfg, cp = _fresh_cfg({'safe_internal_tools': ['MyCustomHarnessTool']})
+    check('user-added internal tool allowed',
+          _run_cfg(PRETOOL, {'tool_name': 'MyCustomHarnessTool', 'tool_input': {}}, cp), 'allow')
+    # remove_from_defaults can subtract an allowlist entry.
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'safe_internal_tools': ['ReportFindings']}})
+    check('subtracted internal tool now asks',
+          _run_cfg(PRETOOL, {'tool_name': 'ReportFindings', 'tool_input': {}}, cp), 'ask')
+
+    # Deny/prompt lists are NOT subtractable.
+    home = os.path.expanduser('~')
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'sensitive_paths': ['/.ssh/']}})
+    check('C6: sensitive_paths not subtractable',
+          _run_cfg(PRETOOL, {'tool_name': 'Write',
+                             'tool_input': {'file_path': f'{home}/.ssh/config'}}, cp), 'deny')
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'always_ask_write_paths': ['smart-permissions-config.json']}})
+    check('C6: always_ask_write_paths not subtractable',
+          _run_cfg(PRETOOL, {'tool_name': 'Write',
+                             'tool_input': {'file_path': f'{home}/.claude/smart-permissions-config.json'}}, cp),
+          'ask')
+
+    # learn_to_config must not re-add a subtracted entry (via a non-restricted
+    # key: allowed_web_domains). Learner approves the fetch but can't persist it.
+    cfg, cp = _fresh_cfg({'remove_from_defaults': {'allowed_web_domains': ['zsub.example']}})
+    _run_cfg(LEARNER, {'tool_name': 'WebFetch', 'tool_input': {'url': 'https://zsub.example/x'}}, cp)
+    check('C6: subtracted domain not re-learned',
+          'zsub.example' in _read_json(cp, {}).get('allowed_web_domains', []), False)
+
+
+# ---- C5: learner LLM flows --------------------------------------------
+
+def test_c5_learner_llm_flows():
+    print('\n--- C5: learner LLM allow/deny/error x configured/unconfigured ---')
+    base = {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}}
+
+    cfg, cp = _fresh_cfg()
+    check('configured allow → allow', _run_cfg(LEARNER, base, cp, llm={'safe': True}), 'allow')
+    cfg, cp = _fresh_cfg()
+    check('configured deny → deny', _run_cfg(LEARNER, base, cp, llm={'safe': False, 'reason': 'x'}), 'deny')
+    cfg, cp = _fresh_cfg()
+    check('configured error → ask', _run_cfg(LEARNER, base, cp, llm='error'), 'ask')
+    cfg, cp = _fresh_cfg()
+    check('unconfigured restricted → ask', _run_cfg(LEARNER, base, cp, llm=None), 'ask')
+
+    # Learner honors AUTO_LEARN on the LLM-approved path (non-restricted cmd).
+    learn_case = {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, learn_case, cp, llm={'safe': True}, auto_learn=True)
+    check('C5: LLM-allow + AUTO_LEARN persists',
+          'flyctl deploy' in _read_json(cp, {}).get('safe_commands', []), True)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, learn_case, cp, llm={'safe': True}, auto_learn=False)
+    check('C5: LLM-allow without AUTO_LEARN does not persist',
+          'flyctl deploy' in _read_json(cp, {}).get('safe_commands', []), False)
+
+
+# ---- C4'': LLM decision cache -----------------------------------------
+
+def test_c4_cache_matrix():
+    print("\n--- C4'': exact-match LLM allow cache ---")
+    cmd = {'tool_name': 'Bash', 'tool_input': {'command': 'docker run alpine'}}
+
+    # Miss → LLM allow populates cache; subsequent no-LLM run hits it.
+    cfg, cp = _fresh_cfg()
+    check('LLM allow (pretool)', _run_cfg(PRETOOL, cmd, cp, llm={'safe': True}), 'allow')
+    cache = _read_json(_cache_file(cfg), {})
+    key = _cache_key('Bash', {'command': 'docker run alpine'})
+    check('C4: allow cached under exact key', key in cache, True)
+    # H5: with NO LLM configured the allow-cache is NOT consulted — a planted
+    # or stale entry must never grant allow with no LLM in the loop.
+    check('C4/H5: no-LLM cache hit does NOT serve allow',
+          _run_cfg(PRETOOL, cmd, cp, llm=None), 'ask')
+    # With the LLM configured, the exact-match cache still short-circuits to
+    # allow BEFORE any LLM call — proven here by mocking a would-be deny that
+    # is never reached (cache hit wins).
+    check('C4: LLM-configured cache hit serves allow (pre-empts LLM)',
+          _run_cfg(PRETOOL, cmd, cp, llm={'safe': False, 'reason': 'unreached'}), 'allow')
+
+    # Allow-only: a deny is never cached.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'docker exec y'}},
+             cp, llm={'safe': False, 'reason': 'no'})
+    check('C4: deny not cached', _read_json(_cache_file(cfg), {}), {})
+
+    # Risky-class ask: LLM override allowed but NOT cached (cacheable=False).
+    cfg, cp = _fresh_cfg()
+    risky = {'tool_name': 'Bash', 'tool_input': {'command': 'rm *'}}
+    check('risky LLM-allow → allow', _run_cfg(PRETOOL, risky, cp, llm={'safe': True}), 'allow')
+    check('C4: risky decision not cached', _read_json(_cache_file(cfg), {}), {})
+    check('C4: risky repeat without LLM asks', _run_cfg(PRETOOL, risky, cp, llm=None), 'ask')
+
+    # TTL: an expired entry is ignored. With the LLM configured, an expired
+    # allow-entry must NOT be served — the call falls through to the LLM
+    # (mocked deny here), proving the stale allow wasn't returned.
+    cfg, cp = _fresh_cfg()
+    os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
+    key = _cache_key('Bash', {'command': 'docker run stale'})
+    with open(_cache_file(cfg), 'w') as f:
+        json.dump({key: {'decision': 'allow', 'reason': 'old', 'ts': 1.0}}, f)
+    check('C4: expired entry ignored (falls through to LLM, not served)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run stale'}},
+                   cp, llm={'safe': False, 'reason': 'stale-not-served'}), 'deny')
+
+    # Corrupt cache file tolerated.
+    cfg, cp = _fresh_cfg()
+    os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
+    with open(_cache_file(cfg), 'w') as f:
+        f.write('{not valid json')
+    check('C4: corrupt cache tolerated (rule still works)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, cp, llm=None),
+          'allow')
+    check('C4: corrupt cache overwritten on LLM allow',
+          _run_cfg(PRETOOL, cmd, cp, llm={'safe': True}), 'allow')
+    check('C4: cache valid dict after overwrite',
+          isinstance(_read_json(_cache_file(cfg), None), dict), True)
+
+    # Disabled via config → nothing cached.
+    cfg, cp = _fresh_cfg({'llm_cache': False})
+    _run_cfg(PRETOOL, cmd, cp, llm={'safe': True})
+    check('C4: llm_cache:false caches nothing',
+          os.path.exists(_cache_file(cfg)), False)
+
+    # 500-entry cap: pre-fill 500 fresh entries, add one via LLM allow.
+    cfg, cp = _fresh_cfg()
+    os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
+    now = 10 ** 9 * 2  # far-future-ish but within TTL of time.time()? use time-based below
+    import time as _t
+    now = _t.time()
+    big = {('%064x' % i): {'decision': 'allow', 'reason': 'x', 'ts': now}
+           for i in range(500)}
+    with open(_cache_file(cfg), 'w') as f:
+        json.dump(big, f)
+    _run_cfg(PRETOOL, cmd, cp, llm={'safe': True})
+    cache = _read_json(_cache_file(cfg), {})
+    newkey = _cache_key('Bash', {'command': 'docker run alpine'})
+    check('C4: cap holds at 500', len(cache) <= 500, True)
+    check('C4: newest entry present after cap', newkey in cache, True)
+
+
+# ---- C9: always-ask permission-config writes --------------------------
+
+def test_c9_always_ask_paths():
+    print('\n--- C9: permission-config writes always ask (both hooks) ---')
+    home = os.path.expanduser('~')
+    targets = [
+        f'{home}/.claude/smart-permissions-config.json',
+        f'{home}/.claude/settings.json',
+        f'{home}/.claude/hooks/pretool_safety.py',
+        f'{home}/.claude/keybindings.json',
+    ]
+    # Both hooks, even with the LLM mocked to allow, must return ask.
+    for path in targets:
+        cfg, cp = _fresh_cfg()
+        check(f'pretool C9 ask (LLM-allow ignored): {os.path.basename(path)}',
+              _run_cfg(PRETOOL, {'tool_name': 'Write', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'ask')
+        cfg, cp = _fresh_cfg()
+        check(f'learner C9 ask (LLM-allow ignored): {os.path.basename(path)}',
+              _run_cfg(LEARNER, {'tool_name': 'Edit', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'ask')
+
+    # NotebookEdit variant (uses notebook_path).
+    cfg, cp = _fresh_cfg()
+    check('C9 NotebookEdit to hooks dir asks',
+          _run_cfg(PRETOOL, {'tool_name': 'NotebookEdit',
+                             'tool_input': {'notebook_path': f'{home}/.claude/hooks/x.ipynb'}},
+                   cp, llm={'safe': True}), 'ask')
+
+    # C9 target is never learned even when AUTO_LEARN + LLM allow.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Write',
+                       'tool_input': {'file_path': f'{home}/.claude/settings.json'}},
+             cp, llm={'safe': True}, auto_learn=True)
+    check('C9: config write not learned',
+          any('.claude' in e for e in _read_json(cp, {}).get('safe_write_paths', [])),
+          False)
+
+    # A normal ~/.claude/ file (not a config file) still allows by rule.
+    cfg, cp = _fresh_cfg()
+    check('C9: normal ~/.claude file still allowed',
+          _run_cfg(PRETOOL, {'tool_name': 'Write',
+                             'tool_input': {'file_path': f'{home}/.claude/notes.txt'}}, cp),
+          'allow')
+
+
+def test_c9_case_insensitive_guard():
+    print('\n--- C9/sensitive: case-variant paths do not bypass the guard ---')
+    home = os.path.expanduser('~')
+    # On case-insensitive filesystems (macOS APFS, Windows) a cased variant
+    # resolves to the REAL file, so the always-ask / sensitive guards must match
+    # case-insensitively. realpath preserves the caller's case, so these strings
+    # exercise the exact bypass.
+    ask_targets = [
+        f'{home}/.CLAUDE/settings.json',
+        f'{home}/.Claude/hooks/x.json',
+        f'{home}/.claude/SMART-PERMISSIONS-CONFIG.json',
+        f'{home}/.claude/Settings.Local.json',
+    ]
+    for path in ask_targets:
+        # Even with the LLM mocked to allow, both hooks must return ask.
+        cfg, cp = _fresh_cfg()
+        check(f'pretool cased C9 → ask: {os.path.basename(path)}',
+              _run_cfg(PRETOOL, {'tool_name': 'Write', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'ask')
+        cfg, cp = _fresh_cfg()
+        check(f'learner cased C9 → ask: {os.path.basename(path)}',
+              _run_cfg(LEARNER, {'tool_name': 'Edit', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'ask')
+
+    # Case-variant sensitive path must still DENY (in both hooks).
+    for path in [f'{home}/.SSH/id_rsa', f'{home}/.Aws/credentials']:
+        cfg, cp = _fresh_cfg()
+        check(f'pretool cased sensitive → deny: {os.path.basename(path)}',
+              _run_cfg(PRETOOL, {'tool_name': 'Write', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'deny')
+        cfg, cp = _fresh_cfg()
+        check(f'learner cased sensitive → deny: {os.path.basename(path)}',
+              _run_cfg(LEARNER, {'tool_name': 'Write', 'tool_input': {'file_path': path}},
+                       cp, llm={'safe': True}), 'deny')
+
+    # A cased C9 target must never be auto-learned into safe_write_paths.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(LEARNER, {'tool_name': 'Write',
+                       'tool_input': {'file_path': f'{home}/.CLAUDE/settings.json'}},
+             cp, llm={'safe': True}, auto_learn=True)
+    check('cased C9 target not learned',
+          any('claude' in e.lower() for e in _read_json(cp, {}).get('safe_write_paths', [])),
+          False)
+
+
+# ---- H2: reserved tool names can't be marked internal-safe -------------
+
+def test_h2_reserved_tools_not_internal_safe():
+    print('\n--- H2: reserved tool names never internal-safe via config ---')
+    home = os.path.expanduser('~')
+    cfg, cp = _fresh_cfg({'safe_internal_tools': ['Bash', 'Write', 'Edit', 'WebFetch']})
+    # 'sudo id' — base64 to keep the literal out of this file / live hooks.
+    sudo_cmd = base64.b64decode(b'c3VkbyBpZA==').decode()
+    check('H2: Bash not internal-safe (sudo still denied)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': sudo_cmd}}, cp),
+          'deny')
+    check('H2: Bash not internal-safe (docker run still asks)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}}, cp),
+          'ask')
+    check('H2: Write not internal-safe (sensitive still denied)',
+          _run_cfg(PRETOOL, {'tool_name': 'Write',
+                             'tool_input': {'file_path': f'{home}/.ssh/id_rsa'}}, cp),
+          'deny')
+    check('H2: WebFetch not internal-safe (unknown domain still asks)',
+          _run_cfg(PRETOOL, {'tool_name': 'WebFetch',
+                             'tool_input': {'url': 'https://evil.example/x'}}, cp),
+          'ask')
+    # A genuine non-reserved internal tool still merges and is allowed.
+    cfg, cp = _fresh_cfg({'safe_internal_tools': ['MyHarnessThing']})
+    check('H2: non-reserved internal tool still allowed',
+          _run_cfg(PRETOOL, {'tool_name': 'MyHarnessThing', 'tool_input': {}}, cp), 'allow')
+
+
+# ---- H1: Bash writes to permission-config/state paths ------------------
+
+def test_h1_bash_config_write_guard():
+    print('\n--- H1: Bash writes to permission-config paths ask (both hooks) ---')
+    home = os.path.expanduser('~')
+    cfgfile = f'{home}/.claude/smart-permissions-config.json'
+    cache = f'{home}/.claude/hooks/smart-permissions-llm-cache.json'
+    log = f'{home}/.claude/hooks/smart-permissions-decisions.jsonl'
+    write_vectors = [
+        f'printf hi > {cfgfile}',
+        f'echo x >> {cfgfile}',
+        f'tee {cache}',
+        f'cp /tmp/x {cache}',
+        f'mv /tmp/x {cache}',
+    ]
+    for cmd in write_vectors:
+        cfg, cp = _fresh_cfg()
+        check(f'H1 pretool write→ask: {cmd.split()[0]} {os.path.basename(cmd.split()[-1])}',
+              _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}},
+                       cp, llm={'safe': True}), 'ask')
+        cfg, cp = _fresh_cfg()
+        check(f'H1 learner write→ask: {cmd.split()[0]} {os.path.basename(cmd.split()[-1])}',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}},
+                       cp, llm={'safe': True}), 'ask')
+    # Read-only inspection of the same paths stays allowed (the stats command).
+    read_ok = [f'jq . {log}', f'cat {log}', f'grep deny {log}']
+    for cmd in read_ok:
+        cfg, cp = _fresh_cfg()
+        check(f'H1 read still allowed: {cmd.split()[0]}',
+              _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'allow')
+    # A write NOT touching a config path is unaffected.
+    cfg, cp = _fresh_cfg()
+    check('H1: unrelated redirect still allowed',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'echo hi > /tmp/notes.txt'}}, cp),
+          'allow')
+
+
+# ---- M3: relocated state paths covered by C9 ---------------------------
+
+def test_m3_relocated_state_paths():
+    print('\n--- M3: relocated log/cache paths covered by C9 ---')
+    # A custom cache path with no default always-ask substring — only M3's
+    # appended resolved path can make this match.
+    custom_cache = '/tmp/sp-relocated-xyz/mycache.json'
+    cfg, cp = _fresh_cfg({'llm_cache_path': custom_cache})
+    check('M3: write to relocated cache → ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Write', 'tool_input': {'file_path': custom_cache}},
+                   cp, llm={'safe': True}), 'ask')
+    custom_log = '/tmp/sp-relocated-abc/mylog.jsonl'
+    cfg, cp = _fresh_cfg({'decision_log_path': custom_log})
+    check('M3: write to relocated log → ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Write', 'tool_input': {'file_path': custom_log}},
+                   cp, llm={'safe': True}), 'ask')
+    # Bash write to a relocated cache is caught too (H1 + M3 together).
+    cfg, cp = _fresh_cfg({'llm_cache_path': custom_cache})
+    check('M3: Bash write to relocated cache → ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': f'tee {custom_cache}'}},
+                   cp, llm={'safe': True}), 'ask')
+
+
+# ---- M4: malformed config must not crash the hook ----------------------
+
+def test_m4_malformed_config_no_crash():
+    print('\n--- M4: malformed (non-list) config values do not crash import ---')
+    # Malformed (non-list) values on list-typed keys must not crash the hook.
+    # (safe_commands is deliberately left at defaults — replacing it with a
+    # non-list is legitimate merge behavior that would strip git's safety,
+    # which is a config choice, not a crash.)
+    cfg, cp = _fresh_cfg({
+        'always_ask_write_paths': False,
+        'never_learn_commands': 123,
+        'safe_internal_tools': 'nope',
+        'sensitive_paths': 42,
+    })
+    check('M4: malformed config → hook still runs (git status allow)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'git status'}}, cp),
+          'allow')
+    check('M4: malformed config → dangerous still denied',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash',
+                             'tool_input': {'command': base64.b64decode(b'c3VkbyBpZA==').decode()}}, cp),
+          'deny')
+
+
+# ---- M1: $VAR / indirect command word ----------------------------------
+
+def test_m1_variable_command_word():
+    print('\n--- M1: variable/indirect command word asks in learner ---')
+    for cmd in ['$DOCKER run alpine', '${TOOL} deploy', '$CMD --wipe']:
+        cfg, cp = _fresh_cfg()
+        check(f'M1: {cmd.split()[0]} → ask',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+
+
+# ---- M2: wrapper peel restores non-safe-inner → ask --------------------
+
+def test_m2_wrapped_nonsafe_inner():
+    print('\n--- M2: wrapped non-safe inner asks in learner ---')
+    for cmd in ['env evil-tool --wipe', 'timeout 5 evil-tool run', 'nohup unknown-bin go']:
+        cfg, cp = _fresh_cfg()
+        check(f'M2: {cmd} → ask',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+    # A wrapper hiding a genuinely SAFE inner is still allowed (not over-tightened).
+    cfg, cp = _fresh_cfg()
+    check('M2: wrapped safe inner still allowed (env git status)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'env git status'}}, cp),
+          'allow')
+    # A bare (unwrapped) unknown keeps its historic consult/allow.
+    cfg, cp = _fresh_cfg()
+    check('M2: bare unknown still allowed (flyctl deploy)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}, cp),
+          'allow')
+
+
+# ---- H6: type-confusion fail-open on safety keys -----------------------
+
+def test_h6_type_confused_safety_keys():
+    print('\n--- H6: wrong-type safety-key values can\'t gut defaults ---')
+    sudo_cmd = base64.b64decode(b'c3VkbyBpZA==').decode()
+    # A dict where a list is expected must NOT replace (empty) the deny list.
+    cfg, cp = _fresh_cfg({'dangerous_patterns': {}})
+    check('H6: dangerous_patterns:{} → sudo still deny',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': sudo_cmd}}, cp),
+          'deny')
+    # An empty dict for interpreter_exec_flags must not erase `python -c`.
+    cfg, cp = _fresh_cfg({'interpreter_exec_flags': {}})
+    check('H6: interpreter_exec_flags:{} → python -c still ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+          'ask')
+    # A wrong type on interpreter_exec_flags (list) is ignored, defaults kept.
+    cfg, cp = _fresh_cfg({'interpreter_exec_flags': ['nope']})
+    check('H6: interpreter_exec_flags:[...] → python -c still ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+          'ask')
+    # bool for a list key: import OK + guard intact (old M4 crash + H6 wipe).
+    cfg, cp = _fresh_cfg({'always_ask_write_paths': False})
+    check('H6: always_ask_write_paths:false → import OK (git status allow)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'git status'}}, cp),
+          'allow')
+    home = os.path.expanduser('~')
+    check('H6: always_ask_write_paths:false → C9 guard still intact',
+          _run_cfg(PRETOOL, {'tool_name': 'Write',
+                             'tool_input': {'file_path': f'{home}/.claude/smart-permissions-config.json'}},
+                   cp, llm={'safe': True}), 'ask')
+    # A legit dict-union still ADDS a watched flag (can't remove a default).
+    cfg, cp = _fresh_cfg({'interpreter_exec_flags': {'python': ['--zap']},
+                          'safe_commands': ['python']})
+    check('H6: dict-union keeps default python -c flag',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "x"'}}, cp),
+          'ask')
+
+
+# ---- H5: poisoned cache can't grant allow with no LLM ------------------
+
+def test_h5_poisoned_cache_no_llm():
+    print('\n--- H5: planted cache never serves allow when LLM unset ---')
+    cmd = {'tool_name': 'Bash', 'tool_input': {'command': 'docker run alpine'}}
+    cfg, cp = _fresh_cfg()
+    os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
+    key = _cache_key('Bash', {'command': 'docker run alpine'})
+    # Plant a fresh allow entry directly, as a poisoned-cache write would.
+    with open(_cache_file(cfg), 'w') as f:
+        json.dump({key: {'decision': 'allow', 'reason': 'planted', 'ts': time.time()}}, f)
+    check('H5: planted allow + no LLM → still ask',
+          _run_cfg(PRETOOL, cmd, cp, llm=None), 'ask')
+    # Same planted entry IS honored once an LLM is configured (real cache use).
+    check('H5: planted allow + LLM configured → allow (cache used)',
+          _run_cfg(PRETOOL, cmd, cp, llm={'safe': False, 'reason': 'unreached'}), 'allow')
+
+
+# ---- H4: indirect / meta-execution command words (learner) -------------
+
+def test_h4_indirect_command_words():
+    print('\n--- H4: indirect/meta command words ask in learner ---')
+    for cmd in ['eval docker run', '\\docker run alpine', "$'docker' run",
+                'source /tmp/x.sh', '. /tmp/x.sh', 'command docker run',
+                'exec docker run']:
+        cfg, cp = _fresh_cfg()
+        check(f'H4: {cmd!r} → ask',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+    # A plain unknown (no indirection) keeps its historic consult/allow.
+    cfg, cp = _fresh_cfg()
+    check('H4: plain unknown still allowed (spotread -v)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'spotread -v'}}, cp),
+          'allow')
+
+
+# ---- H3: xargs runner peel exposes restricted inner --------------------
+
+def test_h3_xargs_peel():
+    print('\n--- H3: xargs peels to inner command (both hooks) ---')
+    cfg, cp = _fresh_cfg()
+    check('H3: xargs docker run → ask (pretool, unknown/restricted inner)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'xargs docker run alpine'}}, cp),
+          'ask')
+    cfg, cp = _fresh_cfg()
+    check('H3: xargs docker run → ask (learner, C0 restricted)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'xargs docker run alpine'}}, cp),
+          'ask')
+    # With a value-flag consuming a token, the inner is still reached.
+    cfg, cp = _fresh_cfg()
+    check('H3: xargs -n 1 docker run → ask (flag value skipped)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'xargs -n 1 docker run alpine'}}, cp),
+          'ask')
+    # A safe inner through xargs is still allowed (not over-tightened).
+    cfg, cp = _fresh_cfg()
+    check('H3: xargs git status still allowed',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'xargs git status'}}, cp),
+          'allow')
+
+
+# ---- their-M1: fail CLOSED when defaults can't load --------------------
+
+def test_theirm1_fail_closed_on_missing_defaults():
+    print('\n--- their-M1: broken defaults → fail closed (both hooks) ---')
+    broken = os.path.join(tempfile.mkdtemp(prefix='sp-nodef-'), 'does-not-exist.json')
+    atexit.register(shutil.rmtree, os.path.dirname(broken), ignore_errors=True)
+    env = {'SMART_PERMISSIONS_DEFAULTS': broken}
+    cfg, cp = _fresh_cfg()
+    check('their-M1: pretool docker run → NOT allow (fail closed)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
+                   cp, extra_env=env), 'ask')
+    check('their-M1: pretool ls → NOT allow (fail closed)',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}},
+                   cp, extra_env=env), 'ask')
+    check('their-M1: learner unknown → NOT allow/learn (fail closed)',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'someunknown foo'}},
+                   cp, extra_env=env), 'ask')
+    # A corrupt (non-JSON) defaults file also fails closed, not open.
+    corrupt = os.path.join(tempfile.mkdtemp(prefix='sp-baddef-'), 'defaults.json')
+    atexit.register(shutil.rmtree, os.path.dirname(corrupt), ignore_errors=True)
+    with open(corrupt, 'w') as f:
+        f.write('{ not valid json')
+    cfg, cp = _fresh_cfg()
+    check('their-M1: corrupt defaults → fail closed',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}},
+                   cp, extra_env={'SMART_PERMISSIONS_DEFAULTS': corrupt}), 'ask')
+
+
+# ---- their-M2: null tool_input must not crash --------------------------
+
+def test_theirm2_null_tool_input():
+    print('\n--- their-M2: null tool_input → clean ask, no crash ---')
+    cfg, cp = _fresh_cfg()
+    check('their-M2: pretool null tool_input → ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': None}, cp), 'ask')
+    cfg, cp = _fresh_cfg()
+    check('their-M2: learner null tool_input → ask',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': None}, cp), 'ask')
+    # Entirely absent tool_input, and a null top-level payload, also survive.
+    cfg, cp = _fresh_cfg()
+    check('their-M2: pretool missing tool_input → ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash'}, cp), 'ask')
+    cfg, cp = _fresh_cfg()
+    check('their-M2: pretool null payload → ask',
+          _run_cfg(PRETOOL, None, cp, raw_input='null'), 'ask')
+
+
+# ---- FIX 1: nested non-list exec-flags keep shipped defaults -----------
+
+def test_fix1_nested_nonlist_exec_flags():
+    print('\n--- FIX 1: nested non-list exec-flags keep shipped defaults ---')
+    for bad in [{'python': 'wipe'}, {'python': {}}, {'python': 5}]:
+        cfg, cp = _fresh_cfg({'interpreter_exec_flags': bad})
+        check(f'FIX1: python={bad["python"]!r} → python -c still ask',
+              _run_cfg(PRETOOL, {'tool_name': 'Bash',
+                                 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+              'ask')
+    # A nested LIST still unions — adds a watched flag while keeping shipped -c.
+    cfg, cp = _fresh_cfg({'interpreter_exec_flags': {'python': ['--zap']},
+                          'safe_commands': ['python']})
+    check('FIX1: nested list unions — python -c still ask',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "x"'}}, cp),
+          'ask')
+    check('FIX1: nested list unions — added --zap now flagged too',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python --zap "x"'}}, cp),
+          'ask')
+
+
+# ---- FIX 2: restricted base is case-folded (macOS bypass) --------------
+
+def test_fix2_restricted_base_case_insensitive():
+    print('\n--- FIX 2: restricted base case-folded (learner) ---')
+    for cmd in ['docker run alpine', 'Docker run alpine', 'DOCKER run alpine']:
+        cfg, cp = _fresh_cfg()
+        check(f'FIX2: {cmd!r} → learner ask',
+              _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'ask')
+    # An unrelated (non-restricted) command still auto-allows — not over-tightened.
+    cfg, cp = _fresh_cfg()
+    check('FIX2: spotread -v still allow',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'spotread -v'}}, cp),
+          'allow')
+
+
+# ---- FIX 3: dispatchers tolerate a non-dict tool_input -----------------
+
+def test_fix3_evaluate_nondict_tool_input():
+    print('\n--- FIX 3: evaluate()/evaluate_for_learning() tolerate non-dict ---')
+    cfg, cp = _fresh_cfg()
+    env = os.environ.copy()
+    for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'SAFETY_HOOK_API_URL',
+              'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_AUTO_LEARN',
+              'SAFETY_HOOK_REASONING_EFFORT'):
+        env.pop(k, None)
+    env['SMART_PERMISSIONS_CONFIG'] = cp  # scratch — never touches real state
+    code = (
+        "import sys, json\n"
+        "sys.path.insert(0, %r)\n"
+        "import pretool_safety as p, permission_learner as l\n"
+        "out = [p.evaluate('Bash', None)[0],\n"
+        "       l.evaluate_for_learning('Bash', None)[0],\n"
+        "       p.evaluate('Bash', 'not-a-dict')[0],\n"
+        "       l.evaluate_for_learning('Write', 12345)[0]]\n"
+        "print(json.dumps(out))\n"
+    ) % SCRIPT_DIR
+    r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env)
+    check('FIX3: no crash (exit 0)', r.returncode, 0)
+    vals = json.loads(r.stdout.strip()) if r.stdout.strip() else None
+    # Each call must return cleanly with a non-empty string verdict/decision
+    # (pretool: allow/deny/ask; learner verdict vocab also includes "consult").
+    check('FIX3: all dispatch calls returned cleanly (no crash)',
+          bool(vals) and len(vals) == 4 and all(isinstance(v, str) and v for v in vals),
+          True)
+
+
+# =====================================================================
 #  Run all tests
 # =====================================================================
 
@@ -1610,6 +2530,35 @@ if __name__ == '__main__':
     test_command_substitution_first_word_prompts()
     test_curl_chain_to_temp_script_prompts()
     test_learner_wrapper_hides_destructive_inner()
+
+    # C8 — comprehensive tests for the new subsystems
+    test_c1_decision_log()
+    test_c1_log_rotation()
+    test_c0_restricted_base_matrix()
+    test_c0_pretool_restricted()
+    test_c0_sibling_learning_restored()
+    test_c3_extension_guard()
+    test_c2_mcp_learn()
+    test_c6_merge_and_subtraction()
+    test_c5_learner_llm_flows()
+    test_c4_cache_matrix()
+    test_c9_always_ask_paths()
+    test_c9_case_insensitive_guard()
+    test_h2_reserved_tools_not_internal_safe()
+    test_h1_bash_config_write_guard()
+    test_m3_relocated_state_paths()
+    test_m4_malformed_config_no_crash()
+    test_m1_variable_command_word()
+    test_m2_wrapped_nonsafe_inner()
+    test_h6_type_confused_safety_keys()
+    test_h5_poisoned_cache_no_llm()
+    test_h4_indirect_command_words()
+    test_h3_xargs_peel()
+    test_theirm1_fail_closed_on_missing_defaults()
+    test_theirm2_null_tool_input()
+    test_fix1_nested_nonlist_exec_flags()
+    test_fix2_restricted_base_case_insensitive()
+    test_fix3_evaluate_nondict_tool_input()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

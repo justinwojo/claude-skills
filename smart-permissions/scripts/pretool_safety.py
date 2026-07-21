@@ -26,6 +26,8 @@ import json
 import os
 import re
 import shlex
+import time
+import hashlib
 from fnmatch import fnmatch
 from datetime import datetime
 import urllib.request
@@ -42,12 +44,41 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(SCRIPT_DIR)
 HOME_DIR = os.path.expanduser("~")
 
-DEFAULTS_PATH = os.path.join(PLUGIN_ROOT, "config", "defaults.json")
+DEFAULTS_PATH = os.environ.get(
+    "SMART_PERMISSIONS_DEFAULTS",
+    os.path.join(PLUGIN_ROOT, "config", "defaults.json"),
+)
 USER_CONFIG_PATH = os.environ.get(
     "SMART_PERMISSIONS_CONFIG",
     os.path.join(HOME_DIR, ".claude", "smart-permissions-config.json"),
 )
 UNKNOWN_LOG = os.path.join(HOME_DIR, ".claude", "hooks", "unknown-permissions.log")
+
+
+# User-config keys from which remove_from_defaults may subtract. Restricted
+# to positive allowlists — deny/prompt lists (dangerous_patterns,
+# risky_patterns, sensitive_paths, always_ask_write_paths) are NOT
+# subtractable so user config can never weaken a safety control.
+SUBTRACTABLE_KEYS = frozenset({
+    "safe_commands", "safe_write_paths", "safe_script_paths",
+    "allowed_web_domains", "safe_mcp_tools", "safe_internal_tools",
+})
+
+# H6: safety-critical config keys and the container type each REQUIRES. The
+# merge below unions list∪list but otherwise REPLACES — so a wrong-type
+# user/agent value (e.g. {"dangerous_patterns": {}}) would silently gut a
+# safety list (empty deny list → `sudo` downgrades deny→ask; empty
+# interpreter_exec_flags → `python -c` slips to allow). Type-guard the merge:
+# a value whose type doesn't match its key's expected container is IGNORED
+# (defaults kept) with a stderr warning — config can only ADD to a safety
+# control, never erase it. This also subsumes the old non-list import crash.
+_SAFETY_LIST_KEYS = frozenset({
+    "dangerous_patterns", "risky_patterns", "sensitive_paths",
+    "always_ask_write_paths", "never_learn_commands", "safe_internal_tools",
+    "safe_commands", "safe_write_paths", "safe_script_paths",
+    "allowed_web_domains", "safe_mcp_tools",
+})
+_SAFETY_DICT_KEYS = frozenset({"interpreter_exec_flags"})
 
 
 def load_config():
@@ -56,14 +87,31 @@ def load_config():
     Arrays are merged (union) so user additions extend defaults.
     Scalar values and objects are replaced by user overrides.
     Entries starting with '__ ' are section comments — stripped before use.
+
+    Returns (config, defaults_safe_commands, removals):
+      - config: the fully merged config (defaults + platform + user − removals)
+      - defaults_safe_commands: the raw shipped safe_commands (defaults.json +
+        platform overlay) BEFORE user merge/subtraction — anchors C0's
+        restricted-family set so user config can never demote a shipped
+        multi-word family back to unknown-allow.
+      - removals: the user's remove_from_defaults map (allowlist keys only),
+        used by C0 (subtracted safe_commands bases stay restricted) and by
+        learn_to_config (never re-add an entry the user explicitly removed).
     """
     # Load defaults
+    defaults_ok = True
     try:
         with open(DEFAULTS_PATH, "r") as f:
             config = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
+        if not isinstance(config, dict):
+            raise ValueError("defaults.json is not a JSON object")
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        # their-M1: the shipped safety lists are gone. Don't proceed with empty
+        # guards (that fails OPEN — every unknown command blanket-allows). Signal
+        # fail-closed so both hooks ask for everything until defaults are fixed.
         print(f"Warning: Could not load defaults: {e}", file=sys.stderr)
         config = {}
+        defaults_ok = False
 
     # Load platform-specific overlay (e.g., defaults-windows.json)
     if sys.platform == "win32":
@@ -81,6 +129,10 @@ def load_config():
                     config[key] = value
         except (OSError, json.JSONDecodeError):
             pass  # No platform overlay — use base defaults
+
+    # Snapshot the shipped safe_commands (defaults + platform) before the
+    # user's config can touch it — this is C0's subtraction-proof anchor.
+    defaults_safe_commands = list(config.get("safe_commands", []))
 
     # Load user overrides, bootstrapping the file if it doesn't exist
     try:
@@ -102,6 +154,7 @@ def load_config():
                     "_allowed_web_domains_examples": ["docs.flutter.dev", "pub.dev", "registry.terraform.io"],
                     "safe_mcp_tools": [],
                     "_safe_mcp_tools_examples": ["mcp__sentry__get_*", "mcp__sentry__list_*", "mcp__github__get_*", "mcp__github__list_*", "mcp__github__search_*"],
+                    "_remove_from_defaults_help": "Subtract shipped allowlist entries (allowlist keys only). Example: {\"safe_commands\": [\"rm\", \"docker build *\"]}",
                 }, f, indent=2)
                 f.write("\n")
         except OSError:
@@ -112,7 +165,43 @@ def load_config():
 
     # Merge: arrays are unioned, everything else is replaced
     for key, value in user.items():
-        if key.startswith("_"):
+        if key.startswith("_") or key == "remove_from_defaults":
+            continue
+        # H6: safety-critical keys keep their container type — a wrong-type
+        # value is ignored (defaults kept) so it can never gut a safety list.
+        if key in _SAFETY_LIST_KEYS:
+            if not isinstance(value, list):
+                print(f"Warning: smart-permissions ignoring non-list value for "
+                      f"safety key '{key}' (keeping defaults)", file=sys.stderr)
+                continue
+            base = config[key] if isinstance(config.get(key), list) else []
+            existing = set(base)
+            config[key] = base + [v for v in value if v not in existing]
+            continue
+        if key in _SAFETY_DICT_KEYS:
+            if not isinstance(value, dict):
+                print(f"Warning: smart-permissions ignoring non-dict value for "
+                      f"safety key '{key}' (keeping defaults)", file=sys.stderr)
+                continue
+            # Union per interpreter so config can add exec-flags to watch but
+            # never remove a shipped one ({} therefore leaves defaults intact).
+            base = dict(config[key]) if isinstance(config.get(key), dict) else {}
+            for ik, iv in value.items():
+                # A nested non-list (e.g. {"python": "wipe"} or {"python": {}})
+                # must NOT replace or drop a shipped interpreter's flag set —
+                # that would silently un-guard its inline-exec form. Ignore it
+                # and keep the default for that interpreter.
+                if not isinstance(iv, list):
+                    print(f"Warning: smart-permissions ignoring non-list "
+                          f"interpreter_exec_flags for '{ik}' (keeping default)",
+                          file=sys.stderr)
+                    continue
+                if isinstance(base.get(ik), list):
+                    ex = set(base[ik])
+                    base[ik] = base[ik] + [v for v in iv if v not in ex]
+                else:
+                    base[ik] = list(iv)
+            config[key] = base
             continue
         if isinstance(value, list) and isinstance(config.get(key), list):
             # Union: add user items not already in defaults
@@ -121,7 +210,20 @@ def load_config():
         else:
             config[key] = value
 
-    return config
+    # Apply remove_from_defaults LAST (after defaults + overlay + user union),
+    # ONLY for allowlist keys. Deny/prompt lists are never subtractable.
+    removals = {}
+    raw_removals = user.get("remove_from_defaults", {})
+    if isinstance(raw_removals, dict):
+        for key, vals in raw_removals.items():
+            if key not in SUBTRACTABLE_KEYS or not isinstance(vals, list):
+                continue
+            removals[key] = list(vals)
+            if isinstance(config.get(key), list):
+                drop = set(vals)
+                config[key] = [x for x in config[key] if x not in drop]
+
+    return config, defaults_safe_commands, removals, defaults_ok
 
 
 IS_WINDOWS = sys.platform == "win32"
@@ -137,13 +239,25 @@ def _expand_path(p):
     return p
 
 
+def _as_list(v):
+    """Coerce a config value to a list. A malformed non-list (e.g. a user typo
+    like {"always_ask_write_paths": false}) would otherwise crash _strip_comments
+    at import — hooks must never crash — so fall back to an empty list."""
+    return v if isinstance(v, list) else []
+
+
 def _strip_comments(items):
     """Remove section comment entries (starting with '__ ') from a list."""
-    return [x for x in items if not (isinstance(x, str) and x.startswith("__ "))]
+    return [x for x in _as_list(items) if not (isinstance(x, str) and x.startswith("__ "))]
 
 
 # Load configuration once at module level
-_CONFIG = load_config()
+_CONFIG, _DEFAULTS_SAFE_COMMANDS, _REMOVALS, _DEFAULTS_OK = load_config()
+
+# their-M1: if the shipped defaults failed to load, all safety lists are empty.
+# A permission hook must FAIL CLOSED — evaluate()/evaluate_for_learning() return
+# ask for everything rather than blanket-allowing with no guards.
+_FAIL_CLOSED = not _DEFAULTS_OK
 
 _ALL_SAFE_COMMANDS = _strip_comments(_CONFIG.get("safe_commands", []))
 # Single-word commands: "git", "npm", etc. — O(1) set lookup
@@ -152,17 +266,176 @@ SAFE_COMMANDS = set(c for c in _ALL_SAFE_COMMANDS if " " not in c and "*" not in
 SAFE_COMMANDS_MULTI = set(c for c in _ALL_SAFE_COMMANDS if " " in c and "*" not in c and "?" not in c)
 # Wildcard entries (single or multi-word): "kubectl get*", "docker *" — fnmatch
 SAFE_COMMANDS_WILD = [c for c in _ALL_SAFE_COMMANDS if "*" in c or "?" in c]
-SAFE_WRITE_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_write_paths", [])]
-SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _CONFIG.get("safe_script_paths", [])]
-ALLOWED_WEB_DOMAINS = _CONFIG.get("allowed_web_domains", [])
-SAFE_MCP_TOOLS = _CONFIG.get("safe_mcp_tools", [])
-SENSITIVE_PATHS = _CONFIG.get("sensitive_paths", [])
-DANGEROUS_PATTERNS = _strip_comments(_CONFIG.get("dangerous_patterns", []))
-RISKY_PATTERNS = _strip_comments(_CONFIG.get("risky_patterns", []))
+SAFE_WRITE_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_write_paths"))]
+SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_script_paths"))]
+ALLOWED_WEB_DOMAINS = _as_list(_CONFIG.get("allowed_web_domains"))
+SAFE_MCP_TOOLS = _as_list(_CONFIG.get("safe_mcp_tools"))
+SENSITIVE_PATHS = _as_list(_CONFIG.get("sensitive_paths"))
 
-# Convert interpreter_exec_flags from JSON lists to sets
+# Real tool names can NEVER be marked "internal-safe" via config — an entry of
+# "Bash"/"Write" here would short-circuit to allow in evaluate() BEFORE the
+# Bash/Write/sensitive/dangerous checks ever run (H2). Subtract them at load so
+# no config merge can escalate. safe_internal_tools is only for side-effect-free
+# harness tools (TaskCreate, Skill, …).
+RESERVED_TOOLS = frozenset({
+    "Bash", "Write", "Edit", "NotebookEdit", "MultiEdit", "WebFetch",
+    "Read", "Glob", "Grep", "Task", "Agent",
+})
+_configured_internal = set(_strip_comments(_CONFIG.get("safe_internal_tools")))
+_reserved_attempt = _configured_internal & RESERVED_TOOLS
+if _reserved_attempt:
+    print("Warning: smart-permissions ignoring reserved tool name(s) in "
+          "safe_internal_tools: " + ", ".join(sorted(_reserved_attempt)),
+          file=sys.stderr)
+SAFE_INTERNAL_TOOLS = _configured_internal - RESERVED_TOOLS
+
+# Permission-config paths that must always prompt (never auto-allow, never
+# learn) even when their parent is a safe_write_path — self-escalation guard.
+ALWAYS_ASK_WRITE_PATHS = _strip_comments(_CONFIG.get("always_ask_write_paths"))
+DANGEROUS_PATTERNS = _strip_comments(_CONFIG.get("dangerous_patterns"))
+RISKY_PATTERNS = _strip_comments(_CONFIG.get("risky_patterns"))
+# Commands never persisted to the allowlist regardless of family logic
+# (they can still be LLM-approved per-call — just never made permanent).
+NEVER_LEARN_COMMANDS = set(_strip_comments(_CONFIG.get("never_learn_commands")))
+
+# Convert interpreter_exec_flags from JSON lists to sets. Guard the shapes
+# (H6): a malformed top-level value or inner non-list must not crash at import.
 _raw_interp = _CONFIG.get("interpreter_exec_flags", {})
-INTERPRETER_EXEC_FLAGS = {k: set(v) for k, v in _raw_interp.items()}
+INTERPRETER_EXEC_FLAGS = {
+    k: set(v)
+    for k, v in (_raw_interp.items() if isinstance(_raw_interp, dict) else [])
+    if isinstance(v, list)
+}
+
+
+# ============================================================
+# C0 — RESTRICTED-FAMILY ENFORCEMENT (learner-side)
+# ============================================================
+# A "restricted base" is a command whose destructive subcommands are gated:
+# it appears only as multi-word/wildcard safe_commands entries, never as a
+# bare single-word entry. The learner must never treat such a base as a
+# plain unknown (which would blanket-approve `docker run`, `npm publish`, …).
+
+def _restricted_first_word(entry):
+    """First real word of a multi-word/wildcard safe_commands entry.
+
+    "docker build *" → "docker"; "kubectl get*" → "kubectl";
+    single-word wildcard "kube*" → "kube". Returns None for empties.
+    """
+    toks = entry.split()
+    if not toks:
+        return None
+    first = toks[0].rstrip("*?")
+    return first or None
+
+
+def _compute_restricted_bases(safe_commands):
+    """Bases that appear ONLY as multi-word/wildcard entries in `safe_commands`.
+
+    A base present as a bare single-word entry is NOT restricted — explicit
+    single-word trust is the documented override.
+    """
+    singles = set(
+        c for c in safe_commands
+        if isinstance(c, str) and not c.startswith("__ ")
+        and " " not in c and "*" not in c and "?" not in c
+    )
+    restricted = set()
+    for c in safe_commands:
+        if not isinstance(c, str) or c.startswith("__ "):
+            continue
+        if " " in c or "*" in c or "?" in c:
+            base = _restricted_first_word(c)
+            if base and base not in singles:
+                restricted.add(base)
+    return restricted
+
+
+# Two components (see plan C0, as amended — a plan defect fix):
+#  1. defaults-anchored — from raw shipped defaults + overlay, immune to
+#     user subtraction (docker/npm/… can never be demoted to unknown-allow).
+#     Every known-dangerous family (docker, npm, gh, terraform, kubectl,
+#     cargo, helm, pip, yarn, ansible*, …) ships here.
+#  2. subtracted safe_commands first words — removing `rm`/`docker build *`
+#     means "ask me", never "unknown → allow".
+#
+# The plan's third component — "merged-multi-only", any live-config base
+# appearing only as multi-word entries — was DROPPED. In the merged config a
+# self-learned 2-word entry (e.g. "foo bar", persisted by _auto_learn) is
+# structurally identical to a hand-authored multi-only family, so including it
+# made the learner poison its own future learning: once "foo bar" was learned,
+# "foo" became restricted and every sibling subcommand ("foo baz") stopped
+# learning and asked forever (no-LLM). Since the defaults component already
+# covers all shipped-dangerous families subtraction-proof, dropping merged-
+# multi-only costs only novel user-hand-authored multi-only families (rare,
+# and indistinguishable from accumulation) while restoring sibling learning.
+_DEFAULTS_RESTRICTED = _compute_restricted_bases(
+    _strip_comments(_DEFAULTS_SAFE_COMMANDS))
+_SUBTRACTED_FIRST_WORDS = set()
+for _entry in _REMOVALS.get("safe_commands", []):
+    _fw = _restricted_first_word(_entry) if isinstance(_entry, str) else None
+    if _fw:
+        _SUBTRACTED_FIRST_WORDS.add(_fw)
+RESTRICTED_BASES = _DEFAULTS_RESTRICTED | _SUBTRACTED_FIRST_WORDS
+# Case-folded view for matching (FIX 2): on a case-insensitive filesystem
+# (macOS APFS default), `Docker`/`DOCKER` resolve to and execute the real
+# `docker` binary, so an exact-case check let the learner auto-allow a
+# restricted family. Fold to lower — this only ever makes the guard match
+# MORE (fail-closed); a differently-cased name that ISN'T the real binary is
+# simply asked instead of blanket-approved.
+_RESTRICTED_BASES_LOWER = frozenset(b.lower() for b in RESTRICTED_BASES)
+
+
+def is_restricted_base(basename):
+    """True if `basename` is a restricted command family (see RESTRICTED_BASES).
+
+    Consulted only for commands not already matched as safe — an explicit
+    single-word allowlist entry short-circuits before this check. Case-folded
+    so a cased variant (`Docker`) can't slip a restricted family past the
+    learner's no-LLM path on a case-insensitive filesystem.
+    """
+    return isinstance(basename, str) and basename.lower() in _RESTRICTED_BASES_LOWER
+
+
+# ============================================================
+# DECISION LOG + LLM CACHE STATE PATHS
+# ============================================================
+# Both live beside the user config (…/.claude/hooks/ in production; a temp
+# dir in tests where SMART_PERMISSIONS_CONFIG is redirected) so they are
+# never touched during hermetic test runs. Overridable via config.
+_HOOK_STATE_DIR = os.path.join(os.path.dirname(USER_CONFIG_PATH) or ".", "hooks")
+
+DECISION_LOG_ENABLED = bool(_CONFIG.get("decision_log", True))
+_decision_log_override = _CONFIG.get("decision_log_path")
+DECISION_LOG_PATH = (
+    _expand_path(_decision_log_override) if _decision_log_override
+    else os.path.join(_HOOK_STATE_DIR, "smart-permissions-decisions.jsonl")
+)
+DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024  # single-generation rotation at 5 MB
+
+LLM_CACHE_ENABLED = bool(_CONFIG.get("llm_cache", True))
+_llm_cache_override = _CONFIG.get("llm_cache_path")
+LLM_CACHE_PATH = (
+    _expand_path(_llm_cache_override) if _llm_cache_override
+    else os.path.join(_HOOK_STATE_DIR, "smart-permissions-llm-cache.json")
+)
+LLM_CACHE_TTL_DAYS = _CONFIG.get("llm_cache_ttl_days", 7)
+LLM_CACHE_MAX_ENTRIES = 500
+
+# Persist exact MCP tool names to safe_mcp_tools on approval (C2). Gate lets
+# users restore the previous "MCP tools are never auto-learned" behavior.
+AUTO_LEARN_MCP_TOOLS = bool(_CONFIG.get("auto_learn_mcp_tools", True))
+
+# M3: relocated state files must be covered by the C9 self-escalation guard.
+# If the user moved the config, log, or cache off the default paths (via
+# SMART_PERMISSIONS_CONFIG / decision_log_path / llm_cache_path), those resolved
+# paths aren't substrings of the shipped always_ask_write_paths, so writes to
+# them would sneak past C9. Append the resolved absolute paths (deduped) so both
+# the Write/Edit guard and the H1 Bash-write guard cover them too.
+for _state_path in (USER_CONFIG_PATH, DECISION_LOG_PATH,
+                    DECISION_LOG_PATH + ".1", LLM_CACHE_PATH):
+    if _state_path and _state_path not in ALWAYS_ASK_WRITE_PATHS:
+        ALWAYS_ASK_WRITE_PATHS.append(_state_path)
 
 
 # ============================================================
@@ -229,12 +502,187 @@ def log_unknown(kind, name):
         pass  # Don't block on logging failures
 
 
+def _elapsed_ms(start):
+    """Milliseconds since a time.monotonic() start marker (None on error)."""
+    try:
+        return int((time.monotonic() - start) * 1000)
+    except Exception:
+        return None
+
+
+def _reason_is_risky(reason):
+    """True if a local ask-reason came from a risky_pattern match.
+
+    Risky means "confirm each time" — an LLM override on such a call must
+    not be cached (C4″), so the cache is skipped for these on read and write.
+    """
+    return bool(reason) and "Risky" in reason
+
+
+def _decision_log_input(tool, tool_input):
+    """Extract the human-meaningful input string for a tool, truncated 500 chars.
+
+    Bash → command, file tools → path, WebFetch → url, else the tool name.
+    Only tool inputs are ever logged (never API keys).
+    """
+    if tool == "Bash":
+        val = tool_input.get("command", "")
+    elif tool in ("Write", "Edit", "NotebookEdit"):
+        val = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+    elif tool == "WebFetch":
+        val = tool_input.get("url", "")
+    else:
+        val = tool
+    if not isinstance(val, str):
+        val = str(val)
+    return val[:500]
+
+
+def log_decision(hook, tool, tool_input, decision, source, reason,
+                 duration_ms=None, llm_ms=None, learned=None):
+    """Append one JSONL record describing a permission decision.
+
+    Best-effort: never raises, never blocks the hook (blanket guard like
+    log_unknown). The `input` field holds the tool input truncated to 500
+    chars — it may embed secrets, so the log is the same trust class as
+    shell history (see README privacy note). Rotates at 5 MB to a single
+    `.1` generation. `source` is one of rule|llm|llm-cache|learner.
+    """
+    if not DECISION_LOG_ENABLED:
+        return
+    try:
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "hook": hook,
+            "tool": tool,
+            "input": _decision_log_input(tool, tool_input),
+            "decision": decision,
+            "source": source,
+            "reason": reason,
+        }
+        if duration_ms is not None:
+            record["duration_ms"] = duration_ms
+        if llm_ms is not None:
+            record["llm_ms"] = llm_ms
+        if learned:
+            record["learned"] = learned
+        os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
+        # Single-generation rotation before appending.
+        try:
+            if os.path.getsize(DECISION_LOG_PATH) > DECISION_LOG_MAX_BYTES:
+                os.replace(DECISION_LOG_PATH, DECISION_LOG_PATH + ".1")
+        except OSError:
+            pass
+        with open(DECISION_LOG_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # Never block on logging failures
+
+
+# ============================================================
+# C4″ — EXACT-MATCH LLM DECISION CACHE (allow-only, TTL'd)
+# ============================================================
+# Caches LLM "allow" decisions keyed on the exact tool call so identical
+# repeats stop paying the LLM. Nothing is ever promoted to a permanent
+# allowlist entry from this cache — expiry (TTL) and the 500-entry cap keep
+# it bounded, and only allow decisions are stored (a cached false-deny would
+# stick, so denies stay live).
+
+def _llm_cache_key(tool, tool_input):
+    """sha256 over the tool name + canonical JSON of the full tool input."""
+    try:
+        canonical = json.dumps(tool_input, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        canonical = str(tool_input)
+    raw = tool + "\0" + canonical
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
+
+
+def _llm_cache_load():
+    """Load the cache dict, tolerating a missing/corrupt file (→ {})."""
+    try:
+        with open(LLM_CACHE_PATH, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return {}
+
+
+def _llm_cache_get(tool, tool_input):
+    """Return a live cached allow record for this exact call, or None.
+
+    Prunes expired entries on read. Only allow records are ever stored, so a
+    hit always means "allow".
+    """
+    if not LLM_CACHE_ENABLED:
+        return None
+    try:
+        cache = _llm_cache_load()
+        entry = cache.get(_llm_cache_key(tool, tool_input))
+        if not isinstance(entry, dict):
+            return None
+        ts = entry.get("ts", 0)
+        if (time.time() - ts) > (LLM_CACHE_TTL_DAYS * 86400):
+            return None
+        if entry.get("decision") != "allow":
+            return None
+        return entry
+    except Exception:
+        return None
+
+
+def _llm_cache_put(tool, tool_input, reason):
+    """Store an allow decision for this exact call. Best-effort, never raises.
+
+    Prunes expired entries and caps the file at LLM_CACHE_MAX_ENTRIES,
+    evicting the oldest by timestamp on overflow.
+    """
+    if not LLM_CACHE_ENABLED:
+        return
+    try:
+        cache = _llm_cache_load()
+        now = time.time()
+        cutoff = now - (LLM_CACHE_TTL_DAYS * 86400)
+        # Drop expired entries.
+        cache = {k: v for k, v in cache.items()
+                 if isinstance(v, dict) and v.get("ts", 0) >= cutoff}
+        cache[_llm_cache_key(tool, tool_input)] = {
+            "decision": "allow",
+            "reason": reason,
+            "ts": now,
+        }
+        # Cap: evict oldest by ts on overflow.
+        if len(cache) > LLM_CACHE_MAX_ENTRIES:
+            ordered = sorted(cache.items(), key=lambda kv: kv[1].get("ts", 0))
+            for k, _ in ordered[:len(cache) - LLM_CACHE_MAX_ENTRIES]:
+                cache.pop(k, None)
+        os.makedirs(os.path.dirname(LLM_CACHE_PATH), exist_ok=True)
+        tmp_path = LLM_CACHE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp_path, LLM_CACHE_PATH)
+    except Exception:
+        pass  # Never block on cache failures
+
+
+def llm_is_configured():
+    """True if all three LLM env vars are set (URL, key, model)."""
+    return bool(LLM_API_KEY and LLM_API_URL and LLM_MODEL)
+
+
 def learn_to_config(key, value):
     """Add a value to the user's config file for future auto-approval.
 
     Reads ~/.claude/smart-permissions-config.json, appends `value` to the
     array at `key` (creating both if needed), and writes back. Silently
-    no-ops on any error to avoid blocking tool execution.
+    no-ops on any error to avoid blocking tool execution. Returns True if
+    the value was newly persisted, False otherwise.
+
+    Never re-adds an entry the user explicitly subtracted via
+    remove_from_defaults[key] — an explicit removal must not be undone by
+    self-learning (C6).
     """
     try:
         # Read existing config
@@ -244,13 +692,18 @@ def learn_to_config(key, value):
         except (FileNotFoundError, json.JSONDecodeError):
             user_config = {}
 
+        # Respect an explicit user subtraction — don't re-learn it.
+        removals = user_config.get("remove_from_defaults", {})
+        if isinstance(removals, dict) and value in (removals.get(key) or []):
+            return False
+
         # Ensure array exists
         if key not in user_config or not isinstance(user_config[key], list):
             user_config[key] = []
 
         # Don't duplicate
         if value in user_config[key]:
-            return
+            return False
 
         user_config[key].append(value)
 
@@ -264,8 +717,10 @@ def learn_to_config(key, value):
 
         if DEBUG:
             print(f"Learned: {key} += {value!r}", file=sys.stderr)
+        return True
     except OSError as e:
         print(f"Could not save to config: {e}", file=sys.stderr)
+        return False
 
 
 _LEARNABLE_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
@@ -287,6 +742,21 @@ def _is_learnable_word(word):
     return bool(_LEARNABLE_WORD_RE.match(word))
 
 
+_LEARNABLE_MCP_RE = re.compile(r"^mcp__[A-Za-z0-9_.\-]+__[A-Za-z0-9_.\-]+$")
+
+
+def _is_learnable_mcp_tool(tool):
+    """Reject MCP tool names that aren't clean, wildcard-free identifiers.
+
+    Auto-learn persists the EXACT tool name (never a glob), so anything with
+    a '*'/'?' or odd shape is refused — a learned pattern must not broaden
+    scope beyond the single tool that was approved.
+    """
+    if not tool or "*" in tool or "?" in tool or len(tool) > 200:
+        return False
+    return bool(_LEARNABLE_MCP_RE.match(tool))
+
+
 def _normalize_flag_token(token):
     """Strip quoting wrappers from a token for flag matching.
 
@@ -303,7 +773,16 @@ def _normalize_flag_token(token):
 _INTERPRETER_WRAPPERS = frozenset({
     "env", "command", "exec", "time", "timeout", "nohup",
     "stdbuf", "nice", "ionice", "taskset", "chrt", "setsid", "unbuffer",
+    # H3: xargs runs its trailing argument as a command, so a single-word-safe
+    # `xargs` would let `xargs docker run` skip C0. Peel it to the inner command.
+    "xargs",
 })
+
+# H4: meta-execution builtins run their argument list as a command, so the
+# real command family hides behind them (`eval docker run`, `source x`). The
+# learner's no-LLM path must treat these as consult/ask, never unknown-allow.
+# (exec/command are also peeled as wrappers above; eval/source/. are not.)
+_META_EXEC_BUILTINS = frozenset({"eval", "exec", "source", ".", "command"})
 
 
 def _shlex_split_safe(cmd):
@@ -409,6 +888,16 @@ def _resolve_through_wrappers(cmd):
                 idx += 2
                 continue
             if first == "chrt" and tok in ("-p", "--pid"):
+                idx += 2
+                continue
+            # xargs value-flags that consume the next token, so the real
+            # command isn't mistaken for a flag value (attached forms like
+            # -n1 / -I{} are single tokens and fall to the generic skip below).
+            if first == "xargs" and tok in ("-I", "-i", "--replace", "-n",
+                                            "--max-args", "-L", "-P",
+                                            "--max-procs", "-s", "--max-chars",
+                                            "-a", "--arg-file", "-E", "-d",
+                                            "--delimiter"):
                 idx += 2
                 continue
             # Generic boolean flag for any wrapper
@@ -526,7 +1015,12 @@ def _contains_inline_interpreter(command):
 
 
 def _auto_learn(tool, tool_input):
-    """Determine what to learn from an approved tool call and persist it."""
+    """Determine what to learn from an approved tool call and persist it.
+
+    Returns a list of entries actually persisted (for the decision log's
+    `learned` field); empty list when nothing new was learned.
+    """
+    learned = []
     if tool == "Bash":
         command = tool_input.get("command", "")
         # Inline interpreter (bash -c, python -c, etc.) — the contents
@@ -534,12 +1028,12 @@ def _auto_learn(tool, tool_input):
         # words we'd extract are likely fragments (heredoc text, embedded
         # script, regex). Skip auto-learn entirely for these.
         if _contains_inline_interpreter(command):
-            return
+            return learned
         commands, uncertain = split_compound_command(command)
         # Parser hit unbalanced quotes / incomplete heredoc — extracted
         # words can't be trusted, don't persist anything.
         if uncertain:
-            return
+            return learned
         for cmd in commands:
             # Extract up to 3 words so we can DETECT (and reject) 3+ word
             # commands without persisting them. If we extracted with
@@ -583,11 +1077,23 @@ def _auto_learn(tool, tool_input):
                 continue
             if not all(_is_learnable_word(w) for w in words[1:]):
                 continue
+            # C3: reject a subcommand shaped like a filename (extension tail).
+            # "pdfinfo px1_check.pdf" dies; "docker compose"/"flutter doctor"
+            # are unaffected. Collateral: version-shaped words like "v1.2".
+            if re.search(r"\.[A-Za-z0-9]{1,5}$", words[1]):
+                continue
+            # C0: never persist a restricted family (npm publish, docker run,
+            # …) or an explicitly never-learn command — these can still be
+            # LLM-approved per call, they just can't become permanent.
+            if basename in NEVER_LEARN_COMMANDS or is_restricted_base(basename):
+                continue
             to_learn = " ".join([basename] + words[1:])
-            learn_to_config("safe_commands", to_learn)
+            if learn_to_config("safe_commands", to_learn):
+                learned.append(to_learn)
     elif tool in ("Write", "Edit", "NotebookEdit"):
         path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
-        if path:
+        # C9: never learn a parent that would cover a permission-config file.
+        if path and not is_always_ask_write_path(path):
             # Learn the parent directory (not the specific file)
             parent = os.path.dirname(os.path.realpath(os.path.expanduser(path)))
             if not parent.endswith("/"):
@@ -595,15 +1101,23 @@ def _auto_learn(tool, tool_input):
             # Collapse home dir back to ~/
             if parent.startswith(HOME_DIR):
                 parent = "~" + parent[len(HOME_DIR):]
-            learn_to_config("safe_write_paths", parent)
+            if learn_to_config("safe_write_paths", parent):
+                learned.append(parent)
     elif tool == "WebFetch":
         url = tool_input.get("url", "")
         try:
             hostname = urlparse(url).hostname or ""
-            if hostname:
-                learn_to_config("allowed_web_domains", hostname)
+            if hostname and learn_to_config("allowed_web_domains", hostname):
+                learned.append(hostname)
         except Exception:
             pass
+    elif tool.startswith("mcp__"):
+        # C2: persist the EXACT MCP tool name (never a wildcard) on approval,
+        # gated by auto_learn_mcp_tools (default true).
+        if AUTO_LEARN_MCP_TOOLS and _is_learnable_mcp_tool(tool):
+            if learn_to_config("safe_mcp_tools", tool):
+                learned.append(tool)
+    return learned
 
 
 def _extract_json_decision(content):
@@ -654,10 +1168,37 @@ def _extract_json_decision(content):
     return None
 
 
-def llm_evaluate(tool, tool_input):
-    """Call an LLM to evaluate a tool call that local rules couldn't decide."""
-    if not LLM_API_KEY or not LLM_API_URL or not LLM_MODEL:
-        return ("ask", "LLM not configured — set SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY, and SAFETY_HOOK_MODEL")
+def llm_evaluate(tool, tool_input, timeout=38, cacheable=True):
+    """Call an LLM to evaluate a tool call that local rules couldn't decide.
+
+    Returns (decision, reason, info) where info is a dict with:
+      - source: "llm-cache" on a cache hit, else "llm"
+      - llm_ms: HTTP round-trip time in ms (None on cache hit / not configured)
+
+    `timeout` is the urlopen client timeout (38s for PreToolUse under the 45s
+    hook budget; 15s from the learner). `cacheable` is False when the local
+    decision was risky-class — the cache is then skipped on both read and
+    write (an LLM override on a "confirm each time" call must not stick).
+
+    Auto-learn is intentionally NOT performed here — callers decide whether
+    to learn (PreToolUse/learner gate on SAFETY_HOOK_AUTO_LEARN; a cache hit
+    never learns). Only live-LLM allow decisions are written to the cache.
+    """
+    # H5: the LLM env gate comes FIRST. The cache stores LLM allow decisions;
+    # consulting it when no LLM is configured would let a planted or stale entry
+    # grant an allow with neither LLM nor human in the loop (poisoned-cache
+    # escalation). With no LLM set we always ask — the cache is never read.
+    if not llm_is_configured():
+        return ("ask",
+                "LLM not configured — set SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY, and SAFETY_HOOK_MODEL",
+                {"source": "llm", "llm_ms": None})
+
+    # Exact-match cache: identical repeats stop paying the LLM (allow-only).
+    if cacheable:
+        hit = _llm_cache_get(tool, tool_input)
+        if hit is not None:
+            return ("allow", hit.get("reason", "LLM approved (cached)"),
+                    {"source": "llm-cache", "llm_ms": None})
 
     prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
 
@@ -700,10 +1241,12 @@ def llm_evaluate(tool, tool_input):
         method="POST",
     )
 
+    _t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=38) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             result = json.loads(resp.read().decode())
             content = result["choices"][0]["message"]["content"].strip()
+            llm_ms = _elapsed_ms(_t0)
 
             # json_schema response_format guarantees valid JSON, but fall
             # back to _extract_json_decision for models that ignore it.
@@ -715,49 +1258,90 @@ def llm_evaluate(tool, tool_input):
             if decision is None:
                 # Always log — this indicates a real problem
                 print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
-                return ("ask", "LLM response could not be parsed as JSON")
+                return ("ask", "LLM response could not be parsed as JSON",
+                        {"source": "llm", "llm_ms": llm_ms})
 
             if decision.get("safe"):
                 if DEBUG:
                     print(f"LLM APPROVED: {tool}", file=sys.stderr)
-                if AUTO_LEARN:
-                    _auto_learn(tool, tool_input)
-                return ("allow", "LLM approved")
+                # Cache only live-LLM allow decisions (allow-only cache).
+                if cacheable:
+                    _llm_cache_put(tool, tool_input, "LLM approved")
+                return ("allow", "LLM approved", {"source": "llm", "llm_ms": llm_ms})
             else:
                 reason = decision.get("reason", "LLM flagged as unsafe")
                 if DEBUG:
                     print(f"LLM DENIED: {tool} — {reason}", file=sys.stderr)
-                return ("deny", f"LLM: {reason}")
+                return ("deny", f"LLM: {reason}", {"source": "llm", "llm_ms": llm_ms})
 
     except Exception as e:
         # Always log — API failures need visibility
         print(f"LLM error: {e}", file=sys.stderr)
-        return ("ask", f"LLM unavailable ({e}) — manual approval required")
+        return ("ask", f"LLM unavailable ({e}) — manual approval required",
+                {"source": "llm", "llm_ms": _elapsed_ms(_t0)})
 
 
 def main():
+    start = time.monotonic()
     try:
         input_data = json.loads(sys.stdin.read())
     except json.JSONDecodeError:
+        log_decision("pretool", "", {}, "ask", "rule",
+                     "Could not parse hook input", duration_ms=_elapsed_ms(start))
         output_decision("ask", "Could not parse hook input")
         return
 
+    if not isinstance(input_data, dict):
+        input_data = {}
     tool = input_data.get("tool_name", "")
-    tool_input = input_data.get("tool_input", {})
+    # their-M2: a JSON null tool_input ({"tool_input": null}) must not crash the
+    # hook with AttributeError — coerce any non-dict to an empty dict.
+    tool_input = input_data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
 
     decision, reason = evaluate(tool, tool_input)
+    source = "rule"
+    llm_ms = None
+    learned = None
 
-    # If local rules can't decide, hand off to LLM (if configured)
+    # If local rules can't decide, hand off to LLM (if configured). Skip the
+    # cache for risky-class asks — an LLM override there must not become sticky.
     if decision == "ask":
-        decision, reason = llm_evaluate(tool, tool_input)
+        # C9: permission-config writes NEVER consult the LLM (and never learn)
+        # — an LLM cannot vouch for an edit to the hook's own permission rules.
+        # Mirrors the learner, which routes these to a definite "ask".
+        if tool in ("Write", "Edit", "NotebookEdit"):
+            _p = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+            if is_always_ask_write_path(_p):
+                log_decision("pretool", tool, tool_input, "ask", "rule", reason,
+                             duration_ms=_elapsed_ms(start))
+                sys.exit(0)
+        # H1: same guard for a Bash command that writes to a config/state path.
+        if tool == "Bash" and bash_writes_to_config_path(tool_input.get("command", "")):
+            log_decision("pretool", tool, tool_input, "ask", "rule", reason,
+                         duration_ms=_elapsed_ms(start))
+            sys.exit(0)
+        cacheable = not _reason_is_risky(reason)
+        decision, reason, info = llm_evaluate(tool, tool_input, cacheable=cacheable)
+        source = info["source"]
+        llm_ms = info.get("llm_ms")
+        # Auto-learn only on a live-LLM allow (never on a cache hit) and only
+        # when SAFETY_HOOK_AUTO_LEARN is set.
+        if decision == "allow" and source == "llm" and AUTO_LEARN:
+            learned = _auto_learn(tool, tool_input)
 
     # If still "ask" after both local rules and LLM, exit silently
     # so the built-in permission system takes over (which includes
     # the "Always allow" option). Outputting "ask" would show a
     # hook-specific Yes/No dialog instead.
     if decision == "ask":
+        log_decision("pretool", tool, tool_input, "ask", source, reason,
+                     duration_ms=_elapsed_ms(start), llm_ms=llm_ms)
         sys.exit(0)
 
+    log_decision("pretool", tool, tool_input, decision, source, reason,
+                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, learned=learned)
     output_decision(decision, reason)
 
 
@@ -777,6 +1361,18 @@ def output_decision(decision, reason=""):
 def evaluate(tool, tool_input):
     """Main evaluation dispatcher. Returns (decision, reason)."""
 
+    # FIX 3: be safe regardless of caller — a non-dict tool_input would
+    # AttributeError on the .get() calls below (main() already coerces, but
+    # evaluate() may be called directly).
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    # their-M1: shipped defaults failed to load → every safety list is empty.
+    # Fail CLOSED (ask for everything) rather than blanket-allow through the
+    # unguarded checks below.
+    if _FAIL_CLOSED:
+        return ("ask", "smart-permissions defaults unavailable — failing closed")
+
     # Read-only tools — always safe
     if tool in ("Read", "Glob", "Grep", "WebSearch"):
         return ("allow", "Read-only tool")
@@ -785,14 +1381,9 @@ def evaluate(tool, tool_input):
     if tool in ("Task", "Agent"):
         return ("allow", "Subagent operation")
 
-    # Claude Code internal tools — always safe
-    if tool in ("TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
-                "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode",
-                "TaskOutput", "TaskStop", "ToolSearch",
-                "CronCreate", "CronDelete", "CronList",
-                "Monitor", "ScheduleWakeup", "PushNotification",
-                "EnterWorktree", "ExitWorktree",
-                "LSP", "RemoteTrigger", "ShareOnboardingGuide"):
+    # Claude Code internal tools — always safe (list lives in defaults.json
+    # under safe_internal_tools; user-extensible via normal array merge).
+    if tool in SAFE_INTERNAL_TOOLS:
         return ("allow", "Internal Claude Code tool")
 
     # Write/Edit/NotebookEdit — check file paths
@@ -821,27 +1412,120 @@ def evaluate(tool, tool_input):
     return ("ask", f"Unknown tool: {tool} (logged)")
 
 
+def _file_path_check_variants(file_path):
+    """Original + normalized (+ Windows forward-slash) variants of a path."""
+    normalized = os.path.realpath(os.path.expanduser(file_path))
+    check_paths = [file_path, normalized]
+    if IS_WINDOWS:
+        check_paths += [file_path.replace("\\", "/"), normalized.replace("\\", "/")]
+    return normalized, check_paths
+
+
+def is_always_ask_write_path(file_path):
+    """True if a Write/Edit target is a permission-config file (C9).
+
+    Substring match like sensitive_paths. These must always prompt — never
+    auto-allow, never learn, never LLM-vouch — even when their parent is a
+    safe_write_path, so the agent cannot rewrite its own permission rules.
+    """
+    if not file_path:
+        return False
+    _, check_paths = _file_path_check_variants(file_path)
+    # Case-insensitive: realpath preserves the caller's case (".CLAUDE" stays
+    # ".CLAUDE"), but on case-insensitive filesystems (macOS APFS, Windows) that
+    # still resolves to the real settings/config file. Match fail-closed so a
+    # cased variant can never slip past this self-escalation guard.
+    for pattern in ALWAYS_ASK_WRITE_PATHS:
+        pat = pattern.lower()
+        for p in check_paths:
+            if pat in p.lower():
+                return True
+    return False
+
+
+# H1: file-writing commands whose effective first word signals write intent
+# even without a shell redirect. `cat`/`jq`/`grep`/`less` are deliberately
+# absent — reading the decision log (e.g. the /smart-permissions:stats command)
+# must stay auto-allowed. A redirect (>, >>) is handled separately as write intent.
+_FILE_WRITER_COMMANDS = frozenset({
+    "cp", "mv", "dd", "tee", "install", "ln", "truncate",
+    "touch", "rsync", "sed",
+})
+
+
+def _references_always_ask_path(text):
+    """Case-insensitive: does the command text mention an always-ask path?"""
+    if not text:
+        return False
+    low = text.lower()
+    for pattern in ALWAYS_ASK_WRITE_PATHS:
+        if pattern and pattern.lower() in low:
+            return True
+    return False
+
+
+def bash_writes_to_config_path(command):
+    """H1/C9: True if a Bash command shows WRITE intent toward a permission-
+    config/state path (always_ask_write_paths).
+
+    C9 previously guarded only the Write/Edit/NotebookEdit tools, so a Bash
+    write to the same paths (`printf x > cfg`, `tee cache`, `cp /tmp/x cfg`)
+    was auto-approved — the cache case is a live self-escalation (plant an
+    allow-entry → next call gets a sticky cache allow with no LLM/human).
+
+    Scoped to write intent so read-only inspection stays allowed: per
+    sub-command, ask only when it references an always-ask path AND either
+    contains an output redirection (`>`/`>>`) or its effective first word
+    (after wrapper peel) is a known file-writer. `jq/cat/grep <log>` with no
+    redirect is not flagged.
+    """
+    if not command or not _references_always_ask_path(command):
+        return False
+    try:
+        commands, _unc = split_compound_command(command)
+    except Exception:
+        commands = None
+    for cmd in (commands or [command]):
+        if not _references_always_ask_path(cmd):
+            continue
+        if ">" in cmd:  # output redirection (> or >>) — clearest write signal
+            return True
+        inner = _resolve_through_wrappers(cmd)
+        first = get_first_command_word(inner) or get_first_command_word(cmd)
+        if first and os.path.basename(first) in _FILE_WRITER_COMMANDS:
+            return True
+    return False
+
+
 def evaluate_file_path(file_path):
     """Evaluate Write/Edit/NotebookEdit operations."""
     if not file_path:
         return ("ask", "No file path provided")
 
-    # Normalize path to resolve .., symlinks, and ~
-    normalized = os.path.realpath(os.path.expanduser(file_path))
+    # Normalize path to resolve .., symlinks, and ~; build check variants.
+    normalized, check_paths = _file_path_check_variants(file_path)
 
-    # On Windows, also check with forward slashes so sensitive path
-    # patterns like "/.ssh/" match regardless of separator style
-    check_paths = [file_path, normalized]
-    if IS_WINDOWS:
-        check_paths += [file_path.replace("\\", "/"), normalized.replace("\\", "/")]
-
-    # Deny sensitive paths (check both original and normalized)
+    # Deny sensitive paths (check both original and normalized). Case-insensitive
+    # so ".SSH/id_rsa" can't slip past on a case-insensitive filesystem — this is
+    # a security guard, so it fails closed (Linux can only over-deny, never leak).
     for pattern in SENSITIVE_PATHS:
+        pat = pattern.lower()
         for p in check_paths:
-            if pattern in p:
+            if pat in p.lower():
                 return ("deny", f"Sensitive path: {pattern}")
 
-    # Allow safe paths (use normalized path)
+    # Self-escalation guard: permission-config files always prompt — checked
+    # AFTER sensitive deny but BEFORE the safe-path allow (C9). Returns "ask",
+    # not "deny" — users legitimately ask Claude to edit settings.
+    for pattern in ALWAYS_ASK_WRITE_PATHS:
+        pat = pattern.lower()
+        for p in check_paths:
+            if pat in p.lower():
+                return ("ask", f"Permission-config path requires confirmation: {pattern}")
+
+    # Allow safe paths (use normalized path). Deliberately case-SENSITIVE: this
+    # is the allow side, so loosening it would broaden trust — a cased variant
+    # must fall through to "ask", never match a safe prefix it doesn't equal.
     for safe_path in SAFE_WRITE_PATHS:
         if normalized.startswith(safe_path):
             return ("allow", f"Safe path: {safe_path}")
@@ -938,6 +1622,12 @@ def evaluate_bash(command):
     for pattern in RISKY_PATTERNS:
         if re.search(pattern, command):
             return ("ask", "Risky command pattern — confirm before running")
+
+    # C9/H1: a Bash command that WRITES to a permission-config/state path is a
+    # self-escalation vector (rewrite settings, plant a cache allow-entry).
+    # Reads of the same paths (jq/cat the log) stay allowed.
+    if bash_writes_to_config_path(command):
+        return ("ask", "Bash write to permission-config path")
 
     # Try to split into individual commands
     commands, parse_uncertain = split_compound_command(command)

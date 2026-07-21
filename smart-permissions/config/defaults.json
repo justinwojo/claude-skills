@@ -190,6 +190,20 @@
     "basename", "dirname", "realpath", "readlink"
   ],
 
+  "safe_internal_tools": [
+    "__ Claude Code / harness internal tools — always safe (no side effects __",
+    "__ outside the harness). User-extensible via array merge. __",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet",
+    "AskUserQuestion", "Skill", "EnterPlanMode", "ExitPlanMode",
+    "TaskOutput", "TaskStop", "ToolSearch",
+    "CronCreate", "CronDelete", "CronList",
+    "Monitor", "ScheduleWakeup", "PushNotification",
+    "EnterWorktree", "ExitWorktree",
+    "LSP", "RemoteTrigger", "ShareOnboardingGuide",
+    "ReportFindings", "Artifact", "Workflow",
+    "DesignSync", "EndConversation"
+  ],
+
   "safe_write_paths": [
     "~/Dev/",
     "/tmp/",
@@ -227,6 +241,24 @@
     "/.aws/",
     "/.config/gh/",
     "/.env"
+  ],
+
+  "__ always_ask_write_paths __": "Permission-config files: Write/Edit always prompts (never auto-allow, never learn, never LLM-vouch) even when the parent is a safe_write_path. Substring match. NOT subtractable via remove_from_defaults.",
+  "always_ask_write_paths": [
+    "smart-permissions-config.json",
+    "smart-permissions-llm-cache",
+    "smart-permissions-decisions",
+    "/.claude/settings",
+    "/.claude/hooks/",
+    "/.claude/keybindings.json"
+  ],
+
+  "__ never_learn_commands __": "First words never persisted to the allowlist regardless of family logic. They can still be LLM-approved per call.",
+  "never_learn_commands": [
+    "rm", "mv", "dd", "sudo", "chmod", "chown", "kill", "pkill",
+    "curl", "wget", "ssh", "scp", "eval", "exec", "source", "command",
+    "bash", "sh", "zsh", "fish", "python", "python3", "perl", "ruby",
+    "node", "deno", "osascript"
   ],
 
   "dangerous_patterns": [
@@ -268,5 +300,11 @@
     "ruby": ["-e"],
     "node": ["-e", "-p", "--eval", "--print"],
     "deno": ["eval"]
-  }
+  },
+
+  "__ Behavior toggles (scalars — replaced, not merged) __": "",
+  "decision_log": true,
+  "llm_cache": true,
+  "llm_cache_ttl_days": 7,
+  "auto_learn_mcp_tools": true
 }

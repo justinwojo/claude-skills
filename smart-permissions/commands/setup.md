@@ -43,7 +43,7 @@ Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
     },
     {
       "label": "No, skip LLM evaluation",
-      "description": "Unknown commands will show the standard Claude permission prompt"
+      "description": "Unknown-but-safe commands are still auto-approved and learned by the PermissionRequest hook; restricted families (docker/npm/gh/…), MCP tools, and permission-config writes show the standard prompt"
     }
   ]
 }
@@ -188,6 +188,11 @@ If yes:
    - `mcp__<server>__*` — full trust (all operations)
 3. Ask which patterns they want to add.
 4. Update `safe_mcp_tools` in the config file.
+
+Also mention: when LLM evaluation + auto-learn are enabled, MCP tools approved by
+the LLM are auto-learned by their **exact** name (never a wildcard). To disable
+that and rely only on the patterns above, set `"auto_learn_mcp_tools": false` in
+the config.
 
 ## Step 7: Review Existing settings.json Permissions
 

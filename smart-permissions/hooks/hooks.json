@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/permission_learner.py",
-            "timeout": 30
+            "timeout": 45
           }
         ]
       }
