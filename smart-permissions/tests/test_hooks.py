@@ -34,6 +34,19 @@ _TEST_CONFIG_DIR = tempfile.mkdtemp(prefix='sp-test-')
 HERMETIC_CONFIG_PATH = os.path.join(_TEST_CONFIG_DIR, 'smart-permissions-config.json')
 atexit.register(shutil.rmtree, _TEST_CONFIG_DIR, ignore_errors=True)
 
+# Auto-learn only persists commands that exist on PATH. The learn tests use
+# made-up tool names, so give them stub executables (inherited by every
+# hook subprocess via os.environ).
+_STUB_BIN = os.path.join(_TEST_CONFIG_DIR, 'bin')
+os.makedirs(_STUB_BIN)
+for _name in ('flyctl', 'zbuildtool', 'znovel', 'zpdftool', 'zzztesttool123', 'zzzauto_sanity', 'zzzauto2', 'zzzauto3',
+              'kubectl', 'terraform', 'helm', 'gcloud', 'aws'):
+    _stub = os.path.join(_STUB_BIN, _name)
+    with open(_stub, 'w') as _f:
+        _f.write('#!/bin/sh\n')
+    os.chmod(_stub, 0o755)
+os.environ['PATH'] = _STUB_BIN + os.pathsep + os.environ.get('PATH', '')
+
 # Counters
 passed = 0
 failed = 0
@@ -1128,6 +1141,43 @@ def test_auto_learn_rejects_garbage_words():
             os.unlink(config_path)
 
 
+def test_auto_learn_rejects_script_text_and_functions():
+    """Regression for real junk entries: heredoc/script lines ('var
+    testModule', 'import json') and same-command shell functions ('chk
+    before') must never be persisted — none of them are on PATH."""
+    print('\n--- Regression: auto-learn rejects script text and functions ---')
+    config_path = '/tmp/test-sp-config-scripttext.json'
+    cases = [
+        # <<'CS' used to end at the first "CSharpTypeName" in the body.
+        "cat > T.cs <<'CS'\nvar x = new TypeRecord { CSharpTypeName = n };\n"
+        "var testModule = new ModuleTypeDatabase();\nCS\nznovel plan",
+        'echo "n: $(python3 -c "\nimport json;print(1)\n")"',
+        'chk(){ ls "$1"; }\nchk before; sleep 1; chk after',
+    ]
+    try:
+        for cmd in cases:
+            if os.path.exists(config_path):
+                os.unlink(config_path)
+            learned = _run_auto_learn(cmd, config_path)
+            check(f'no script/function words learned: {cmd[:30]!r}',
+                  [e for e in learned if e.split()[0] in ('var', 'import', 'chk')], [])
+        check('real command after a heredoc still learned', 'znovel plan' in _run_auto_learn(cases[0], config_path), True)
+    finally:
+        if os.path.exists(config_path):
+            os.unlink(config_path)
+
+
+def test_heredoc_terminator_is_whole_line():
+    print('\n--- Heredoc ends only at a line equal to the delimiter ---')
+    pretool = _pretool_module()
+    cmd = "cat > T.cs <<'CS'\nCSharpTypeName = x;\n  CS inside\nCS\nls -la"
+    parts, _ = pretool.split_compound_command(cmd)
+    check('body kept inside the heredoc part', parts, [cmd.rsplit('\n', 1)[0], 'ls -la'])
+    tabbed = "cat <<-EOF\n\tbody EOF text\n\tEOF\nls"
+    parts, _ = pretool.split_compound_command(tabbed)
+    check('<<- allows a tab-indented terminator', parts[-1], 'ls')
+
+
 def test_dollar_prefixed_not_auto_learned():
     """Even if the LLM approves something starting with $VAR or $'\\x...',
     we must never persist the encoded form (would create a long-term
@@ -2145,8 +2195,18 @@ def test_h2_reserved_tools_not_internal_safe():
 
 # ---- H1: Bash writes to permission-config/state paths ------------------
 
+def _pretool_module():
+    """Import pretool_safety in-process against an isolated empty config."""
+    _, cp = _fresh_cfg()
+    os.environ['SMART_PERMISSIONS_CONFIG'] = cp
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety
+    return pretool_safety
+
+
 def test_h1_bash_config_write_guard():
     print('\n--- H1: Bash writes to permission-config paths ask (both hooks) ---')
+    pretool = _pretool_module()
     home = os.path.expanduser('~')
     cfgfile = f'{home}/.claude/smart-permissions-config.json'
     cache = f'{home}/.claude/hooks/smart-permissions-llm-cache.json'
@@ -2179,6 +2239,67 @@ def test_h1_bash_config_write_guard():
     check('H1: unrelated redirect still allowed',
           _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'echo hi > /tmp/notes.txt'}}, cp),
           'allow')
+    # A `>` that is not a file redirect must not count as write intent
+    # (observed false positive: a quoted `m>t*1000` in `python3 -c`).
+    not_writes = [
+        f'grep -c ok {log} 2>/dev/null',
+        f'grep -c ok {log} 2>&1 | head -1',
+        f'grep -F "a>b" {log}',
+        f"awk '$3 > 5' {log}",
+    ]
+    for cmd in not_writes:
+        cfg, cp = _fresh_cfg()
+        check(f'H1 non-write `>` not a config write: {cmd[:40]}',
+              _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
+              'allow')
+    for cmd in (f'grep ok {log} > {log}.bak', f'cat x 2> {cfgfile}', f'echo x &> {cache}',
+                f'echo "unterminated > {cfgfile}'):
+        check(f'H1 real redirect still flagged: {cmd[:40]}',
+              pretool.bash_writes_to_config_path(cmd), True)
+
+
+def test_llm_wall_clock_deadline():
+    print('\n--- LLM call: hard wall-clock deadline + one retry on hang ---')
+    pretool = _pretool_module()
+    import threading
+    calls = []
+
+    def hang_then_answer(req, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            threading.Event().wait(5)  # hangs past the first attempt's deadline
+        return 'ok'
+
+    class _Ctx:
+        def __init__(self, v): self.v = v
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps({'v': self.v}).encode()
+
+    orig = pretool.urllib.request.urlopen
+    try:
+        pretool.urllib.request.urlopen = lambda req, timeout=None: _Ctx(hang_then_answer(req, timeout))
+        t0 = time.monotonic()
+        try:
+            pretool._llm_post_once(None, 0.3)
+            check('single attempt hang raises TimeoutError', False, True)
+        except TimeoutError:
+            check('single attempt hang raises TimeoutError', True, True)
+        check('single attempt returns near its deadline', time.monotonic() - t0 < 2, True)
+
+        calls.clear()
+        # budget >= 20 retries; shrink the real sleep by patching _llm_post_once's
+        # first deadline via a small budget wrapper.
+        orig_once = pretool._llm_post_once
+        pretool._llm_post_once = lambda req, s: orig_once(req, min(s, 0.3))
+        try:
+            result = pretool._llm_post_with_deadline(None, 24)
+        finally:
+            pretool._llm_post_once = orig_once
+        check('hung first attempt → retry succeeds', result, {'v': 'ok'})
+        check('retry made exactly two attempts', len(calls), 2)
+    finally:
+        pretool.urllib.request.urlopen = orig
 
 
 # ---- M3: relocated state paths covered by C9 ---------------------------
@@ -2514,6 +2635,8 @@ if __name__ == '__main__':
     test_python_interpreter_exec()
     test_auto_learn_rejects_inline_interpreter()
     test_auto_learn_rejects_garbage_words()
+    test_auto_learn_rejects_script_text_and_functions()
+    test_heredoc_terminator_is_whole_line()
     test_dollar_prefixed_not_auto_learned()
     test_destructive_infra_subcommands_prompt()
     test_auto_learn_does_not_persist_three_word_prose()
@@ -2546,6 +2669,7 @@ if __name__ == '__main__':
     test_c9_case_insensitive_guard()
     test_h2_reserved_tools_not_internal_safe()
     test_h1_bash_config_write_guard()
+    test_llm_wall_clock_deadline()
     test_m3_relocated_state_paths()
     test_m4_malformed_config_no_crash()
     test_m1_variable_command_word()

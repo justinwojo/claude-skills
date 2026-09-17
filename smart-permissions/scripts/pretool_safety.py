@@ -27,7 +27,9 @@ import os
 import re
 import shlex
 import time
+import threading
 import hashlib
+import shutil
 from fnmatch import fnmatch
 from datetime import datetime
 import urllib.request
@@ -456,6 +458,9 @@ LLM_MODEL = os.environ.get(
 # Optional reasoning_effort param (e.g. "none", "low", "medium", "high").
 # Only sent if set — otherwise the provider's default applies.
 LLM_REASONING_EFFORT = os.environ.get("SAFETY_HOOK_REASONING_EFFORT", "").strip()
+# Total LLM budget for PreToolUse, retry included. Claude Code kills the hook
+# at 30s (a manual prompt), so this leaves headroom for startup + logging.
+LLM_PRETOOL_BUDGET_S = 24
 
 # When true, commands/paths/domains approved by the LLM are automatically
 # added to ~/.claude/smart-permissions-config.json so they're auto-allowed
@@ -1087,6 +1092,12 @@ def _auto_learn(tool, tool_input):
             # LLM-approved per call, they just can't become permanent.
             if basename in NEVER_LEARN_COMMANDS or is_restricted_base(basename):
                 continue
+            # Only persist real executables. Misparsed script text (`import
+            # json`, `var testModule`) and shell functions defined in the same
+            # command (`chk before`) aren't on PATH — they can still be
+            # LLM-approved per call, they just never become permanent entries.
+            if shutil.which(words[0]) is None:
+                continue
             to_learn = " ".join([basename] + words[1:])
             if learn_to_config("safe_commands", to_learn):
                 learned.append(to_learn)
@@ -1168,15 +1179,62 @@ def _extract_json_decision(content):
     return None
 
 
-def llm_evaluate(tool, tool_input, timeout=38, cacheable=True):
+def _llm_post_once(req, seconds):
+    """One POST with a hard wall-clock deadline.
+
+    urlopen's `timeout` bounds each socket read, not the whole request, so a
+    slowly-streaming response can outlive it (observed: calls killed by Claude
+    Code's 30s hook timeout, which surfaces as a manual prompt with no log).
+    """
+    box = {}
+
+    def _run():
+        try:
+            with urllib.request.urlopen(req, timeout=seconds) as resp:
+                box["result"] = json.loads(resp.read().decode())
+        except Exception as e:  # re-raised on the calling thread
+            box["error"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(seconds)
+    if t.is_alive():
+        raise TimeoutError(f"no LLM response within {seconds:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _llm_post_with_deadline(req, budget):
+    """POST within `budget` seconds total; one retry if the first attempt hangs.
+
+    Normal latency is a few seconds with rare hangs well past 30s, so for a
+    budget >= 20s a hung first attempt (capped at ~60% of the budget) gets a
+    second try with the remainder. Only timeouts retry — HTTP errors don't.
+    """
+    if budget < 20:
+        return _llm_post_once(req, budget)
+    first = round(budget * 0.6)
+    start = time.monotonic()
+    try:
+        return _llm_post_once(req, first)
+    except TimeoutError:
+        remaining = budget - (time.monotonic() - start)
+        if remaining < 3:
+            raise
+        return _llm_post_once(req, remaining)
+
+
+def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True):
     """Call an LLM to evaluate a tool call that local rules couldn't decide.
 
     Returns (decision, reason, info) where info is a dict with:
       - source: "llm-cache" on a cache hit, else "llm"
       - llm_ms: HTTP round-trip time in ms (None on cache hit / not configured)
 
-    `timeout` is the urlopen client timeout (38s for PreToolUse under the 45s
-    hook budget; 15s from the learner). `cacheable` is False when the local
+    `timeout` is a total wall-clock budget including one retry on a hang
+    (24s for PreToolUse — Claude Code kills hooks at 30s regardless of the
+    hooks.json value; 15s from the learner). `cacheable` is False when the local
     decision was risky-class — the cache is then skipped on both read and
     write (an LLM override on a "confirm each time" call must not stick).
 
@@ -1243,36 +1301,35 @@ def llm_evaluate(tool, tool_input, timeout=38, cacheable=True):
 
     _t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            result = json.loads(resp.read().decode())
-            content = result["choices"][0]["message"]["content"].strip()
-            llm_ms = _elapsed_ms(_t0)
+        result = _llm_post_with_deadline(req, timeout)
+        content = result["choices"][0]["message"]["content"].strip()
+        llm_ms = _elapsed_ms(_t0)
 
-            # json_schema response_format guarantees valid JSON, but fall
-            # back to _extract_json_decision for models that ignore it.
-            try:
-                decision = json.loads(content)
-            except (json.JSONDecodeError, ValueError):
-                decision = _extract_json_decision(content)
+        # json_schema response_format guarantees valid JSON, but fall
+        # back to _extract_json_decision for models that ignore it.
+        try:
+            decision = json.loads(content)
+        except (json.JSONDecodeError, ValueError):
+            decision = _extract_json_decision(content)
 
-            if decision is None:
-                # Always log — this indicates a real problem
-                print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
-                return ("ask", "LLM response could not be parsed as JSON",
-                        {"source": "llm", "llm_ms": llm_ms})
+        if decision is None:
+            # Always log — this indicates a real problem
+            print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
+            return ("ask", "LLM response could not be parsed as JSON",
+                    {"source": "llm", "llm_ms": llm_ms})
 
-            if decision.get("safe"):
-                if DEBUG:
-                    print(f"LLM APPROVED: {tool}", file=sys.stderr)
-                # Cache only live-LLM allow decisions (allow-only cache).
-                if cacheable:
-                    _llm_cache_put(tool, tool_input, "LLM approved")
-                return ("allow", "LLM approved", {"source": "llm", "llm_ms": llm_ms})
-            else:
-                reason = decision.get("reason", "LLM flagged as unsafe")
-                if DEBUG:
-                    print(f"LLM DENIED: {tool} — {reason}", file=sys.stderr)
-                return ("deny", f"LLM: {reason}", {"source": "llm", "llm_ms": llm_ms})
+        if decision.get("safe"):
+            if DEBUG:
+                print(f"LLM APPROVED: {tool}", file=sys.stderr)
+            # Cache only live-LLM allow decisions (allow-only cache).
+            if cacheable:
+                _llm_cache_put(tool, tool_input, "LLM approved")
+            return ("allow", "LLM approved", {"source": "llm", "llm_ms": llm_ms})
+        else:
+            reason = decision.get("reason", "LLM flagged as unsafe")
+            if DEBUG:
+                print(f"LLM DENIED: {tool} — {reason}", file=sys.stderr)
+            return ("deny", f"LLM: {reason}", {"source": "llm", "llm_ms": llm_ms})
 
     except Exception as e:
         # Always log — API failures need visibility
@@ -1464,6 +1521,36 @@ def _references_always_ask_path(text):
     return False
 
 
+_REDIRECT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
+
+
+def _has_output_redirect(cmd):
+    """True if `cmd` contains a real output redirection to a file.
+
+    Tokenizes shell-style so a `>` inside quotes (`python3 -c "x>1"`) is not a
+    redirect, and ignores fd duplication (`2>&1`) and `/dev/null` targets.
+    Unparseable input falls back to a raw `>` check (fail closed).
+    """
+    if ">" not in cmd:
+        return False
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    for i, tok in enumerate(tokens):
+        if tok not in _REDIRECT_OPS:
+            continue
+        target = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if tok == ">&" and (target.isdigit() or target == "-"):
+            continue
+        if target == "/dev/null":
+            continue
+        return True
+    return False
+
+
 def bash_writes_to_config_path(command):
     """H1/C9: True if a Bash command shows WRITE intent toward a permission-
     config/state path (always_ask_write_paths).
@@ -1477,7 +1564,8 @@ def bash_writes_to_config_path(command):
     sub-command, ask only when it references an always-ask path AND either
     contains an output redirection (`>`/`>>`) or its effective first word
     (after wrapper peel) is a known file-writer. `jq/cat/grep <log>` with no
-    redirect is not flagged.
+    redirect is not flagged; neither is a quoted `>` (`python3 -c "a>b"`),
+    `2>&1`, or `>/dev/null`.
     """
     if not command or not _references_always_ask_path(command):
         return False
@@ -1488,7 +1576,7 @@ def bash_writes_to_config_path(command):
     for cmd in (commands or [command]):
         if not _references_always_ask_path(cmd):
             continue
-        if ">" in cmd:  # output redirection (> or >>) — clearest write signal
+        if _has_output_redirect(cmd):  # clearest write signal
             return True
         inner = _resolve_through_wrappers(cmd)
         first = get_first_command_word(inner) or get_first_command_word(cmd)
@@ -1892,6 +1980,7 @@ def split_compound_command(command):
     in_double_quote = False
     in_heredoc = False
     heredoc_marker = None
+    strip_tabs = False
     paren_level = 0
     brace_level = 0
 
@@ -1920,14 +2009,22 @@ def split_compound_command(command):
                     while j < len(command) and command[j] not in " \t\n;|&)":
                         j += 1
                     heredoc_marker = command[marker_start:j]
+                strip_tabs = command[i+2:i+3] == "-"
                 current.append(command[i:j+1] if j < len(command) else command[i:])
                 i = j + 1 if j < len(command) else j
                 continue
 
-        # Inside heredoc — consume until marker
+        # Inside heredoc — consume until the terminator LINE. A bare substring
+        # search ended `<<'CS'` at the first "CSharpTypeName" in the body and
+        # parsed the rest of the body as shell commands.
         if in_heredoc:
-            if heredoc_marker and heredoc_marker in command[i:]:
-                end_idx = command.index(heredoc_marker, i) + len(heredoc_marker)
+            end = None
+            if heredoc_marker:
+                indent = r"\t*" if strip_tabs else ""
+                end = re.compile(r"^" + indent + re.escape(heredoc_marker) + r"$",
+                                 re.MULTILINE).search(command, i)
+            if end:
+                end_idx = end.end()
                 current.append(command[i:end_idx])
                 i = end_idx
                 in_heredoc = False
