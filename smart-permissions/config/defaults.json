@@ -253,6 +253,9 @@
     "/.claude/keybindings.json"
   ],
 
+  "__ protected_delete_paths __": "Folders a recursive rm may never delete, nor anything above them. Denied locally, never sent to the LLM. Globs expand against the disk; '~/*' covers every top-level folder in home (Dev, Desktop, Documents, Library, .ssh, ...). Add '~/Dev/*' to protect each project root too.",
+  "protected_delete_paths": ["~", "~/*"],
+
   "__ never_learn_commands __": "First words never persisted to the allowlist regardless of family logic. They can still be LLM-approved per call.",
   "never_learn_commands": [
     "rm", "mv", "dd", "sudo", "chmod", "chown", "kill", "pkill",

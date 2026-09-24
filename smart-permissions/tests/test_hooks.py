@@ -523,7 +523,7 @@ def test_pretool_edge_cases():
 
     # Escaped semicolons (find -exec)
     result = run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {
-        'command': 'find . -name "*.tmp" -exec rm {} \\;'}})
+        'command': 'find . -name "*.tmp" -exec wc -l {} \\;'}})
     check('find -exec with \\; → allow', result, 'allow')
 
     # Case statement
@@ -1667,21 +1667,27 @@ def _cache_key(tool, tool_input):
 
 
 def _run_cfg(script, payload, config_path, llm=None, auto_learn=False,
-             raw_input=None, extra_env=None):
+             raw_input=None, extra_env=None, requests_log=None, full=False):
     """Run a hook against config_path with the LLM optionally mocked.
 
     llm:
       None                 -> LLM not configured (env vars unset)
       {'safe': bool,...}   -> configured; mocked urlopen returns this decision
+      [dict, dict, ...]    -> configured; successive calls return these in
+                              order ('error' entries raise), last one repeats
       'error'              -> configured; mocked urlopen raises
     extra_env: optional dict merged into the subprocess env (e.g. to point
       SMART_PERMISSIONS_DEFAULTS at a broken path for fail-closed tests).
+    requests_log: optional path; each mocked request body is appended as a
+      JSON line so tests can inspect prompts and reasoning effort.
+    full: return (decision, stdout_emitted) instead of just the decision, to
+      tell an explicit hook "ask" from a silent fall-through.
     Returns the decision string ('allow' | 'deny' | 'ask').
     """
     env = os.environ.copy()
     for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'SAFETY_HOOK_API_URL',
               'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_AUTO_LEARN',
-              'SAFETY_HOOK_REASONING_EFFORT'):
+              'SAFETY_HOOK_REASONING_EFFORT', 'SAFETY_HOOK_RECHECK_REASONING_EFFORT'):
         env.pop(k, None)
     env['SMART_PERMISSIONS_CONFIG'] = config_path
     if auto_learn:
@@ -1694,18 +1700,28 @@ def _run_cfg(script, payload, config_path, llm=None, auto_learn=False,
         env['SAFETY_HOOK_API_URL'] = 'https://mock.invalid/v1/chat/completions'
         env['SAFETY_HOOK_API_KEY'] = 'test-key'
         env['SAFETY_HOOK_MODEL'] = 'mock-model'
-        if llm == 'error':
-            mock = ("def _f(req, timeout=None):\n"
-                    "    raise Exception('mock network error')\n"
-                    "urllib.request.urlopen = _f\n")
-        else:
-            resp = json.dumps({'choices': [{'message': {'content': json.dumps(llm)}}]})
-            mock = ("class _R:\n"
-                    "    def __enter__(self): return self\n"
-                    "    def __exit__(self, *a): return False\n"
-                    "    def read(self): return %r.encode()\n"
-                    "def _f(req, timeout=None): return _R()\n"
-                    "urllib.request.urlopen = _f\n" % resp)
+        seq = llm if isinstance(llm, list) else [llm]
+        resps = [None if r == 'error' else
+                 json.dumps({'choices': [{'message': {'content': json.dumps(r)}}]})
+                 for r in seq]
+        mock = ("_RESPS = %r\n"
+                "_LOG = %r\n"
+                "_N = [0]\n"
+                "class _R:\n"
+                "    def __init__(self, body): self.body = body\n"
+                "    def __enter__(self): return self\n"
+                "    def __exit__(self, *a): return False\n"
+                "    def read(self): return self.body.encode()\n"
+                "def _f(req, timeout=None):\n"
+                "    if _LOG:\n"
+                "        with open(_LOG, 'a') as fh:\n"
+                "            fh.write(req.data.decode() + '\\n')\n"
+                "    body = _RESPS[min(_N[0], len(_RESPS) - 1)]\n"
+                "    _N[0] += 1\n"
+                "    if body is None:\n"
+                "        raise Exception('mock network error')\n"
+                "    return _R(body)\n"
+                "urllib.request.urlopen = _f\n" % (resps, requests_log))
 
     module = 'pretool_safety' if script == PRETOOL else 'permission_learner'
     wrapper = (
@@ -1721,13 +1737,14 @@ def _run_cfg(script, payload, config_path, llm=None, auto_learn=False,
     r = subprocess.run([sys.executable, '-c', wrapper], input=stdin,
                        capture_output=True, text=True, env=env)
     out = r.stdout.strip()
+    decision = 'ask'
     if out:
         hook = json.loads(out).get('hookSpecificOutput', {})
         if 'permissionDecision' in hook:
-            return hook['permissionDecision']
-        if 'behavior' in hook.get('decision', {}):
-            return hook['decision']['behavior']
-    return 'ask'
+            decision = hook['permissionDecision']
+        elif 'behavior' in hook.get('decision', {}):
+            decision = hook['decision']['behavior']
+    return (decision, bool(out)) if full else decision
 
 
 # ---- C1: decision log --------------------------------------------------
@@ -1820,17 +1837,17 @@ def test_c0_restricted_base_matrix():
           _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}, cp),
           'allow')
 
-    # LLM allow / deny drive the verdict for restricted families.
+    # LLM allow / confirmed flag drive the verdict for restricted families.
     cfg, cp = _fresh_cfg()
     check('LLM-allow restricted → allow',
           _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
                    cp, llm={'safe': True, 'reason': 'ok'}),
           'allow')
     cfg, cp = _fresh_cfg()
-    check('LLM-deny restricted → deny',
+    check('LLM-flag restricted (confirmed) → ask',
           _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run x'}},
                    cp, llm={'safe': False, 'reason': 'no'}),
-          'deny')
+          'ask')
 
     # C0 learn rejection: even LLM-approved + AUTO_LEARN never persists a
     # restricted family to the allowlist.
@@ -1973,7 +1990,7 @@ def test_c5_learner_llm_flows():
     cfg, cp = _fresh_cfg()
     check('configured allow → allow', _run_cfg(LEARNER, base, cp, llm={'safe': True}), 'allow')
     cfg, cp = _fresh_cfg()
-    check('configured deny → deny', _run_cfg(LEARNER, base, cp, llm={'safe': False, 'reason': 'x'}), 'deny')
+    check('configured confirmed flag → ask', _run_cfg(LEARNER, base, cp, llm={'safe': False, 'reason': 'x'}), 'ask')
     cfg, cp = _fresh_cfg()
     check('configured error → ask', _run_cfg(LEARNER, base, cp, llm='error'), 'ask')
     cfg, cp = _fresh_cfg()
@@ -2028,7 +2045,7 @@ def test_c4_cache_matrix():
 
     # TTL: an expired entry is ignored. With the LLM configured, an expired
     # allow-entry must NOT be served — the call falls through to the LLM
-    # (mocked deny here), proving the stale allow wasn't returned.
+    # (mocked flag here → ask), proving the stale allow wasn't returned.
     cfg, cp = _fresh_cfg()
     os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
     key = _cache_key('Bash', {'command': 'docker run stale'})
@@ -2036,7 +2053,7 @@ def test_c4_cache_matrix():
         json.dump({key: {'decision': 'allow', 'reason': 'old', 'ts': 1.0}}, f)
     check('C4: expired entry ignored (falls through to LLM, not served)',
           _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'docker run stale'}},
-                   cp, llm={'safe': False, 'reason': 'stale-not-served'}), 'deny')
+                   cp, llm={'safe': False, 'reason': 'stale-not-served'}), 'ask')
 
     # Corrupt cache file tolerated.
     cfg, cp = _fresh_cfg()
@@ -2593,9 +2610,300 @@ def test_fix3_evaluate_nondict_tool_input():
           True)
 
 
+# ---- LLM recheck: a first-pass flag gets a second opinion ----------------
+
+_FLAG = {'safe': False, 'category': 1, 'reason': 'wipes home'}
+
+
+def _requests(path):
+    """Mocked LLM request bodies logged by _run_cfg, in call order."""
+    try:
+        with open(path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def _flag_file(cfg_dir):
+    return os.path.join(cfg_dir, 'hooks', 'smart-permissions-llm-flags.json')
+
+
+def test_llm_recheck_flow():
+    print('\n--- LLM recheck: flag → second pass → allow or human ---')
+    call = {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'}}
+
+    # Second pass clears the flag → allow, logged as a recheck, never cached
+    # or learned (a borderline call must not become sticky).
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    check('flag then clear → allow',
+          _run_cfg(PRETOOL, call, cp, llm=[_FLAG, {'safe': True}],
+                   auto_learn=True, requests_log=reqs), 'allow')
+    sent = _requests(reqs)
+    check('recheck makes exactly two LLM calls', len(sent), 2)
+    if len(sent) == 2:
+        check('first pass sends no reasoning_effort when unset',
+              'reasoning_effort' in sent[0], False)
+        check('recheck defaults to reasoning_effort high',
+              sent[1].get('reasoning_effort'), 'high')
+        user2 = sent[1]['messages'][1]['content']
+        check('recheck prompt carries the first-pass flag',
+              'A first pass flagged this call: category 1: wipes home' in user2, True)
+        check('first pass prompt has no recheck note',
+              'first pass flagged' in sent[0]['messages'][1]['content'], False)
+    rec = [r for r in _decision_records(cfg) if r.get('hook') == 'pretool'][-1:]
+    check('recheck allow logged with source llm-recheck',
+          rec[0].get('source') if rec else None, 'llm-recheck')
+    check('recheck allow not cached', _read_json(_cache_file(cfg), {}), {})
+    check('recheck allow not learned',
+          'flyctl deploy' in _read_json(cp, {}).get('safe_commands', []), False)
+
+    # Both passes flag → explicit hook "ask" (not deny, not a silent
+    # fall-through that auto mode's classifier would decide).
+    cfg, cp = _fresh_cfg()
+    decision, emitted = _run_cfg(PRETOOL, call, cp, llm=[_FLAG, _FLAG], full=True)
+    check('confirmed flag → ask (never deny)', decision, 'ask')
+    check('confirmed flag → explicit hook output', emitted, True)
+    rec = [r for r in _decision_records(cfg) if r.get('hook') == 'pretool'][-1:]
+    check('confirmed flag reason logged',
+          'wipes home' in (rec[0].get('reason', '') if rec else ''), True)
+    check('confirmed flag recorded for the learner',
+          _cache_key('Bash', {'command': 'flyctl deploy'}) in _read_json(_flag_file(cfg), {}),
+          True)
+
+    # The learner that fires for that prompt skips the LLM and leaves it to
+    # the human — a third opinion (mocked allow here) must not overrule.
+    reqs = os.path.join(cfg, 'learner-reqs.jsonl')
+    check('learner defers to confirmed flag → ask',
+          _run_cfg(LEARNER, call, cp, llm={'safe': True}, requests_log=reqs), 'ask')
+    check('learner made no LLM call on a flagged call', _requests(reqs), [])
+    # A different call is unaffected by the flag.
+    check('flag is exact-match only',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl status'}},
+                   cp, llm={'safe': True}), 'allow')
+
+    # Expired flag is ignored → learner consults the LLM again.
+    cfg, cp = _fresh_cfg()
+    os.makedirs(os.path.join(cfg, 'hooks'), exist_ok=True)
+    with open(_flag_file(cfg), 'w') as f:
+        json.dump({_cache_key('Bash', {'command': 'flyctl deploy'}):
+                   {'reason': 'old', 'ts': 1.0}}, f)
+    check('expired flag ignored', _run_cfg(LEARNER, call, cp, llm={'safe': True}), 'allow')
+
+    # Recheck unavailable → silent fall-through to the normal prompt path,
+    # no flag recorded (nothing was confirmed).
+    cfg, cp = _fresh_cfg()
+    decision, emitted = _run_cfg(PRETOOL, call, cp, llm=[_FLAG, 'error'], full=True)
+    check('recheck error → ask', decision, 'ask')
+    check('recheck error → silent fall-through', emitted, False)
+    check('recheck error records no flag', os.path.exists(_flag_file(cfg)), False)
+
+    # Learner runs the same two passes.
+    cfg, cp = _fresh_cfg()
+    check('learner: flag then clear → allow',
+          _run_cfg(LEARNER, call, cp, llm=[_FLAG, {'safe': True}]), 'allow')
+
+    # Recheck effort is configurable; empty means provider default.
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    _run_cfg(PRETOOL, call, cp, llm=[_FLAG, {'safe': True}], requests_log=reqs,
+             extra_env={'SAFETY_HOOK_RECHECK_REASONING_EFFORT': '',
+                        'SAFETY_HOOK_REASONING_EFFORT': 'low'})
+    sent = _requests(reqs)
+    check('first pass uses SAFETY_HOOK_REASONING_EFFORT',
+          sent[0].get('reasoning_effort') if sent else None, 'low')
+    check('empty recheck effort sends none',
+          'reasoning_effort' in sent[1] if len(sent) == 2 else None, False)
+
+
+# ---- LLM context: working directory + the developer's recent messages ----
+
+def _transcript(path, records):
+    with open(path, 'w') as f:
+        for r in records:
+            f.write(json.dumps(r) + '\n')
+
+
+def _human(text):
+    return {'type': 'user', 'origin': {'kind': 'human'},
+            'message': {'role': 'user', 'content': text}}
+
+
+def test_llm_context():
+    print('\n--- LLM context: cwd + recent human messages, nothing else ---')
+    cfg, cp = _fresh_cfg()
+    tpath = os.path.join(cfg, 'transcript.jsonl')
+    _transcript(tpath, [
+        _human('msg-oldest should be dropped by the limit'),
+        _human('msg-two deploying the staging app tonight'),
+        {'type': 'assistant', 'message': {'role': 'assistant',
+                                          'content': [{'type': 'text', 'text': 'ASSISTANT-TEXT'}]}},
+        {'type': 'user', 'toolUseResult': {},
+         'message': {'role': 'user', 'content': [
+             {'type': 'tool_result', 'tool_use_id': 'x', 'content': 'TOOL-RESULT-TEXT'}]}},
+        {'type': 'user', 'origin': {'kind': 'task-notification'},
+         'message': {'role': 'user', 'content': '<task-notification>TASK-NOTE</task-notification>'}},
+        {'type': 'user', 'isMeta': True,
+         'message': {'role': 'user', 'content': 'META-TEXT'}},
+        _human('msg-three <system-reminder>REMINDER-TEXT</system-reminder> keep this'),
+        {'type': 'user', 'message': {'role': 'user', 'content': [
+            {'type': 'text', 'text': 'msg-four headless task prompt'}]}},
+        _human('msg-five run the rig'),
+    ])
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    payload = {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'},
+               'cwd': '/Users/dev/Dev/myapp', 'transcript_path': tpath}
+    _run_cfg(PRETOOL, payload, cp, llm={'safe': True}, requests_log=reqs)
+    sent = _requests(reqs)
+    user = sent[0]['messages'][1]['content'] if sent else ''
+    check('context: cwd included', 'Working directory: /Users/dev/Dev/myapp' in user, True)
+    for kept in ('msg-two', 'msg-three', 'keep this', 'msg-four', 'msg-five'):
+        check(f'context: keeps {kept}', kept in user, True)
+    for dropped in ('msg-oldest', 'ASSISTANT-TEXT', 'TOOL-RESULT-TEXT', 'TASK-NOTE',
+                    'META-TEXT', 'REMINDER-TEXT'):
+        check(f'context: drops {dropped}', dropped in user, False)
+    check('context: messages oldest first',
+          0 <= user.find('msg-two') < user.find('msg-five'), True)
+    check('context: tool call follows context',
+          user.find('msg-five') < user.find('Tool: Bash'), True)
+
+    # The learner sends the same context (a different call — the one above
+    # is now cached and would skip the LLM).
+    reqs2 = os.path.join(cfg, 'reqs2.jsonl')
+    _run_cfg(LEARNER, dict(payload, tool_input={'command': 'flyctl status'}), cp,
+             llm={'safe': True}, requests_log=reqs2)
+    sent = _requests(reqs2)
+    user = sent[0]['messages'][1]['content'] if sent else ''
+    check('learner context: includes messages', 'msg-five' in user, True)
+
+    # Missing/unreadable transcript → tool call alone, no crash.
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    check('missing transcript still evaluates',
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy'},
+                             'transcript_path': '/nonexistent/t.jsonl', 'cwd': 42},
+                   cp, llm={'safe': True}, requests_log=reqs), 'allow')
+    sent = _requests(reqs)
+    user = sent[0]['messages'][1]['content'] if sent else ''
+    check('no context → prompt starts with the tool call', user.startswith('Tool: Bash'), True)
+
+    # In-process: truncation and the partial first line of a tail read.
+    pretool = _pretool_module()
+    cfg, _ = _fresh_cfg()
+    tpath = os.path.join(cfg, 't.jsonl')
+    _transcript(tpath, [_human('x' * 5000)])
+    msgs = pretool.recent_user_messages(tpath)
+    check('long message truncated',
+          len(msgs) == 1 and len(msgs[0]) <= pretool.CONTEXT_MAX_MESSAGE_CHARS + 10, True)
+    _transcript(tpath, [_human('FIRST ' + 'y' * 300), _human('SECOND')])
+    orig = pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES
+    pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES = 150  # cuts into the first record
+    try:
+        msgs = pretool.recent_user_messages(tpath)
+    finally:
+        pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES = orig
+    check('tail read drops the partial first line', msgs, ['SECOND'])
+    check('non-string transcript path → []', pretool.recent_user_messages(None), [])
+
+
 # =====================================================================
 #  Run all tests
 # =====================================================================
+
+def test_protected_delete_guard():
+    print('\n--- Protected-delete guard: deny home folders, LLM reviews other recursive deletes ---')
+    home = tempfile.mkdtemp(prefix='sp-home-')
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    for sub in ('Dev/proj/build', 'Desktop', 'Documents', '.ssh'):
+        os.makedirs(os.path.join(home, sub))
+    open(os.path.join(home, 'notes.txt'), 'w').close()
+    cwd = os.path.join(home, 'Dev', 'proj')
+    env = {'HOME': home}
+
+    def fill(enc):
+        return d(enc).replace('{home}', home).replace('{parent}', os.path.dirname(home))
+
+    def run(script, cmd, cp, llm=None, reqs=None):
+        return _run_cfg(script, {'tool_name': 'Bash', 'tool_input': {'command': cmd}, 'cwd': cwd},
+                        cp, llm=llm, extra_env=env, requests_log=reqs, full=True)
+
+    # Dangerous vectors are base64 so this file never holds them in plain text.
+    deny_b64 = [
+        'cm0gLXJmIH4=',
+        'cm0gLXJmIH4v',
+        'cm0gLXJmIH4vRGV2',
+        'cm0gLXJmICIkSE9NRS9EZXNrdG9wIg==',
+        'cm0gLXJmICR7SE9NRX0vRG9jdW1lbnRzLw==',
+        'cm0gLXJmIH4vRGV2Lyo=',
+        'cm0gLXIgLWYgLS0gfi9Eb2N1bWVudHM=',
+        'cm0gLWZyIH4vLnNzaA==',
+        'Y2QgfiAmJiBybSAtcmYgRGV2',
+        'cm0gLXJmIC4uLy4u',
+        'VEFSR0VUPSIiOyBybSAtcmYgIiRUQVJHRVQie2hvbWV9Lyo=',
+        'WD1+L0RvY3VtZW50czsgcm0gLXJmICIkWCI=',
+        'ZigpIHsgcm0gLXJmIH4vRGV2OyB9OyBm',
+        'aWYgdHJ1ZTsgdGhlbiBybSAtcmYgIiRIT01FL0Rlc2t0b3AiOyBmaQ==',
+        'KGNkIH47IHJtIC1yZiBEb2N1bWVudHMp',
+        'cm0gLXJmIH4vRCo=',
+        'Y29tbWFuZCBybSAtcmYgfi9EZXNrdG9w',
+        'cm0gLXJmIHtwYXJlbnR9',
+    ]
+    llm_b64 = [
+        'cm0gLXJmIGJ1aWxk',
+        'cm0gLXJmIH4vRGV2L3Byb2ovYnVpbGQ=',
+        'Y2QgL3RtcCAmJiBybSAtcmYgRGV2',
+        'ZmluZCAuIC1uYW1lICcqLnB5YycgLWRlbGV0ZQ==',
+        'ZmluZCAuIC1uYW1lIG5vZGVfbW9kdWxlcyAtZXhlYyBybSAtcmYge30gKw==',
+        'bHMgfCB4YXJncyBybSAtcmY=',
+        'cm0gLXJmICIkQlVJTERfRElSIg==',
+    ]
+    allow_b64 = [
+        'cm0gLWYgfi9EZXY=',
+        'cm0gfi9ub3Rlcy50eHQ=',
+        'Z2l0IHJtIC1yIC0tY2FjaGVkIGZvbw==',
+        'Y2F0IDw8RU9GID4geC5tZApybSAtcmYgfi9EZXYKRU9G',
+        'Z2l0IGNvbW1pdCAtbSAibmV2ZXIgcm0gLXJmIH4vRGV2Ig==',
+    ]
+    if sys.platform in ('darwin', 'win32'):
+        deny_b64.append('cm0gLXJmIH4vZGV2')  # other-case spelling of Dev
+
+    for enc in deny_b64:
+        cmd = fill(enc)
+        _, cp = _fresh_cfg()
+        reqs = os.path.join(os.path.dirname(cp), 'reqs.jsonl')
+        check(f'guard pretool deny: {enc}', run(PRETOOL, cmd, cp, llm={'safe': True}, reqs=reqs),
+              ('deny', True))
+        check(f'guard pretool deny skips the LLM: {enc}', _requests(reqs), [])
+        check(f'guard learner deny: {enc}', run(LEARNER, cmd, cp)[0], 'deny')
+
+    for enc in llm_b64:
+        cmd = fill(enc)
+        _, cp = _fresh_cfg()
+        check(f'guard no-LLM falls through: {enc}', run(PRETOOL, cmd, cp), ('ask', False))
+        check(f'guard learner no-LLM asks: {enc}', run(LEARNER, cmd, cp)[0], 'ask')
+        reqs = os.path.join(os.path.dirname(cp), 'reqs.jsonl')
+        check(f'guard LLM approves: {enc}', run(PRETOOL, cmd, cp, llm={'safe': True}, reqs=reqs),
+              ('allow', True))
+        run(PRETOOL, cmd, cp, llm={'safe': True}, reqs=reqs)
+        check(f'guard LLM verdict not cached: {enc}', len(_requests(reqs)), 2)
+        check(f'guard learner LLM approve never learns: {enc}',
+              (run(LEARNER, cmd, cp, llm={'safe': True})[0], _read_json(cp, {}).get('safe_commands') or []),
+              ('allow', []))
+
+    for enc in allow_b64:
+        _, cp = _fresh_cfg()
+        check(f'guard leaves alone: {enc}', run(PRETOOL, d(enc), cp), ('allow', True))
+
+    # Config adds protected folders; a wrong-type value can't remove the defaults.
+    proj = d('cm0gLXJmIH4vRGV2L3Byb2o=')
+    _, cp = _fresh_cfg({'protected_delete_paths': ['~/Dev/*']})
+    check('guard config adds ~/Dev/*', run(PRETOOL, proj, cp)[0], 'deny')
+    _, cp = _fresh_cfg()
+    check('guard project root not protected by default', run(PRETOOL, proj, cp), ('ask', False))
+    _, cp = _fresh_cfg({'protected_delete_paths': {}})
+    check('guard wrong-type config keeps defaults',
+          run(PRETOOL, d('cm0gLXJmIH4vRGV2'), cp)[0], 'deny')
+
 
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
@@ -2683,6 +2991,9 @@ if __name__ == '__main__':
     test_fix1_nested_nonlist_exec_flags()
     test_fix2_restricted_base_case_insensitive()
     test_fix3_evaluate_nondict_tool_input()
+    test_llm_recheck_flow()
+    test_llm_context()
+    test_protected_delete_guard()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

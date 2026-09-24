@@ -31,18 +31,21 @@ LLM-consulting pass before Claude ever shows you a prompt:
 Tool call
   ┌─ PreToolUse ─────────────────────────────────────────────────────┐
   │  Dangerous pattern? (sudo, rm -rf /, curl|sh)   ──→  DENY          │
+  │  Recursive delete of a protected folder (~/Dev) ──→  DENY          │
+  │  Other recursive delete (rm -r, find -delete)   ──→  LLM (no cache)│
   │  Risky pattern? (rm *, find / -delete)          ──→  ASK (no cache)│
   │  Permission-config write? (settings, this cfg)  ──→  ASK (C9)      │
   │  Known-safe command/subcommand?                 ──→  ALLOW         │
   │  MCP tool in safe list? (glob patterns)         ──→  ALLOW         │
   │  Otherwise (unknown)                            ──→  LLM eval      │
   │                                                     (+ cache, opt) │
+  │  LLM flagged it and the recheck confirmed       ──→  ASK (human)   │
   └───────────────────────────────────────────────────────────────────┘
                           │ still undecided ("ask")
                           ▼
   ┌─ PermissionRequest (learner) ────────────────────────────────────┐
   │  Re-check dangerous/risky patterns              ──→  DENY / ASK    │
-  │  LLM configured?  ── yes ─→ LLM eval (+ cache)   ──→  ALLOW/DENY   │
+  │  LLM configured?  ── yes ─→ LLM eval (+ cache)   ──→  ALLOW / ASK  │
   │                   └─ no  ─→ unknown-but-safe cmd ──→  ALLOW + LEARN │
   │  Restricted family / MCP / config write         ──→  ASK           │
   └───────────────────────────────────────────────────────────────────┘
@@ -54,6 +57,53 @@ Tool call
 
 Every decision from both hooks is appended to a structured **decision log**
 (see [Decision log](#decision-log) below).
+
+### How the LLM judges a call
+
+The LLM approves by default and flags a call only with concrete evidence of
+one of five harms: irreversible destruction the task doesn't cover, making
+private things public, leaking secrets, running untrusted remote code, or
+lasting security weakening. The prompt borrows its risk categories from
+Codex's auto-review policy, without Codex's rule that any possibly-sensitive
+upload needs explicit authorization.
+
+- **Context.** Along with the tool call, the LLM sees the working directory and
+  the developer's last few messages from the session transcript. The messages
+  tell it what task is underway, so a raw socket to a projector during a
+  calibration session reads as normal work. Tool results, assistant text and
+  harness notices are never sent, so file or web content can't argue its way
+  past the judge.
+- **Second pass.** A flagged call is judged again at
+  `SAFETY_HOOK_RECHECK_REASONING_EFFORT` (default `high`), with the first
+  verdict attached. If the recheck clears it, the call runs (`source:
+  llm-recheck`; never cached or learned). If the recheck confirms it, the hook
+  emits an explicit `ask`, so you decide — even in auto mode, where a silent
+  fall-through would go to Claude's classifier instead. The PermissionRequest
+  hook that fires for that prompt leaves it to you rather than asking the LLM a
+  third time. If the recheck can't run in time, the call falls through to the
+  normal prompt path.
+- **No LLM hard denies.** Only the local rules deny outright: the
+  dangerous patterns and the protected-delete guard below.
+
+### Recursive deletes
+
+Deleting your home folder or anything at its top level (`~/Dev`, `~/Desktop`,
+`~/Documents`, `~/Library`, `~/.ssh`, ...) is denied locally, before the LLM is
+asked, so "never" doesn't depend on a model's judgment. The guard resolves the
+target first: `~`, `$HOME`, variables set earlier in the command, an empty
+variable (`"$X"/Users/you`), `cd` plus a relative path, `..`, globs (`~/D*`),
+trailing `/*`, and case (`~/dev` on macOS). It also blocks any folder above
+home. Add patterns to `protected_delete_paths`; `"~/Dev/*"` protects each
+project root too.
+
+Every other recursive or bulk delete (`rm -r`, `find -delete`, `find -exec rm`,
+`xargs rm`) goes to the LLM on every call. It is never auto-allowed by rule,
+never cached, and never learned. The LLM sees the working directory and your
+recent messages. It approves build output, caches and temp files, and flags a
+whole project or data the task doesn't cover. Without an LLM configured, these
+fall through to the normal prompt. The guard reads only the command text: a
+delete hidden in a script file or an inline interpreter (`python -c`) reaches
+the LLM through the other rules, not this one.
 
 ### What gets auto-allowed
 
@@ -70,6 +120,7 @@ Every decision from both hooks is appended to a structured **decision log**
 
 - `sudo` anything
 - `rm -rf /` (caught by both regex and token-based analysis for flag reordering)
+- Recursive deletes of home or its top-level folders (see [Recursive deletes](#recursive-deletes))
 - `curl | sh`, `wget | bash`, and other remote code execution chains
 - Writes to device files (`> /dev/sda`), fork bombs, `mkfs`, `dd` to devices
 - Reads/writes to sensitive paths (`~/.ssh/`, `~/.aws/`, `~/.env`)
@@ -120,6 +171,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
 | `never_learn_commands` | string array | Command first-words never persisted to the allowlist (still LLM-approvable per call) |
 | `dangerous_patterns` | string array | Regex patterns that always deny (full command match) |
+| `protected_delete_paths` | string array | Folders a recursive delete may never touch, nor anything above them (default `~`, `~/*`; globs expand on disk). **Not subtractable.** |
 | `risky_patterns` | string array | Regex patterns that prompt instead of auto-allowing |
 | `interpreter_exec_flags` | object | `{"interpreter": ["-flag"]}` — flag combos that trigger a prompt |
 | `remove_from_defaults` | object | Subtract shipped entries from allowlist keys (see [Subtracting defaults](#subtracting-defaults)) |
@@ -132,7 +184,7 @@ Positive allowlists (`safe_commands`, `safe_write_paths`, `safe_script_paths`, `
 
 ### Subtracting defaults
 
-Arrays only ever *add* to the defaults, so to remove a shipped entry use `remove_from_defaults`. It accepts the positive allowlist keys **only** — deny/prompt controls (`dangerous_patterns`, `risky_patterns`, `sensitive_paths`, `always_ask_write_paths`) can never be weakened this way.
+Arrays only ever *add* to the defaults, so to remove a shipped entry use `remove_from_defaults`. It accepts the positive allowlist keys **only** — deny/prompt controls (`dangerous_patterns`, `risky_patterns`, `sensitive_paths`, `always_ask_write_paths`, `protected_delete_paths`) can never be weakened this way.
 
 ```json
 {
@@ -147,7 +199,7 @@ Removal is applied last, after defaults + platform overlay + your additions. Rem
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `learner`), reason, timing, and anything learned. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, timing, and anything learned. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
 
@@ -310,6 +362,7 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 | `SAFETY_HOOK_API_KEY` | API key (LLM disabled if empty) |
 | `SAFETY_HOOK_MODEL` | Model name (e.g. `grok-4.3`, `gpt-5.4-mini`) |
 | `SAFETY_HOOK_REASONING_EFFORT` | Optional `reasoning_effort` value (e.g. `none`, `low`, `medium`, `high`). Only sent if set; otherwise the provider default applies. |
+| `SAFETY_HOOK_RECHECK_REASONING_EFFORT` | `reasoning_effort` for the second pass on a flagged call (default `high`; empty string = provider default) |
 | `SAFETY_HOOK_AUTO_LEARN` | Persist LLM-approved commands to config (`true` / `1` / `yes`) |
 
 ## Audit log

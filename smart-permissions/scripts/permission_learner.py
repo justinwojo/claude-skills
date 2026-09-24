@@ -11,8 +11,9 @@ prompt as the true last resort.
   1. Re-checks dangerous patterns as a safety net → deny.
   2. Classifies everything else as "consult":
      - LLM configured → call it (client timeout 15s, inside the hook budget).
-       allow → approve (+ learn only if SAFETY_HOOK_AUTO_LEARN); deny → deny;
-       error/unparseable → manual prompt (logged).
+       allow → approve (+ learn only if SAFETY_HOOK_AUTO_LEARN); a flag the
+       second pass confirms, error or unparseable → manual prompt (logged).
+       A call PreToolUse already flagged skips the LLM and prompts.
      - LLM NOT configured → keep the historical self-learning blanket-approve
        for unknown Bash / home-dir writes / WebFetch, EXCEPT restricted
        command families (C0) which now ask; MCP/other tools keep asking.
@@ -31,6 +32,7 @@ import time
 
 # Import shared logic from pretool-safety.py (same directory)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pretool_safety  # noqa: E402
 from pretool_safety import (  # noqa: E402
     DANGEROUS_PATTERNS,
     RISKY_PATTERNS,
@@ -50,12 +52,16 @@ from pretool_safety import (  # noqa: E402
     is_restricted_base,
     is_always_ask_write_path,
     bash_writes_to_config_path,
+    build_llm_context,
     llm_evaluate,
     llm_is_configured,
+    _flag_get,
     log_decision,
     _elapsed_ms,
     _reason_is_risky,
     _is_destructive_rm,
+    protected_delete_check,
+    set_hook_cwd,
     _auto_learn,
     _contains_case_start,
     _extract_function_body,
@@ -104,6 +110,7 @@ def main():
     if not isinstance(tool_input, dict):
         tool_input = {}
 
+    set_hook_cwd(input_data)
     verdict, fallback, reason = evaluate_for_learning(tool, tool_input)
 
     if verdict == "deny":
@@ -120,9 +127,17 @@ def main():
 
     # verdict == "consult": lean on the LLM, human as last resort.
     if llm_is_configured():
+        # PreToolUse already ran both LLM passes on this exact call and
+        # confirmed a flag — this prompt is the human decision it asked for.
+        flagged = _flag_get(tool, tool_input)
+        if flagged:
+            log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
+                         flagged, duration_ms=_elapsed_ms(start))
+            sys.exit(0)
         cacheable = not _reason_is_risky(reason)
         decision, llm_reason, info = llm_evaluate(
-            tool, tool_input, timeout=15, cacheable=cacheable)
+            tool, tool_input, timeout=15, cacheable=cacheable,
+            context=build_llm_context(input_data))
         source = info["source"]
         llm_ms = info.get("llm_ms")
         if decision == "allow":
@@ -136,13 +151,7 @@ def main():
                          llm_ms=llm_ms, learned=learned)
             _emit_allow()
             return
-        if decision == "deny":
-            log_decision("permission_request", tool, tool_input, "deny",
-                         source, llm_reason, duration_ms=_elapsed_ms(start),
-                         llm_ms=llm_ms)
-            _emit_deny()
-            return
-        # LLM error/unparseable → manual prompt.
+        # Confirmed flag, LLM error or unparseable → manual prompt.
         log_decision("permission_request", tool, tool_input, "ask", source,
                      llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms)
         sys.exit(0)
@@ -215,7 +224,22 @@ def evaluate_for_learning(tool, tool_input):
 
 
 def evaluate_bash_for_learning(command):
-    """Classify a bash command for the learner. See evaluate_for_learning."""
+    """Classify a bash command for the learner. See evaluate_for_learning.
+
+    A recursive delete of a protected folder is denied; any other recursive
+    delete consults the LLM with a manual-prompt fallback, never approve+learn.
+    """
+    guard = protected_delete_check(command, pretool_safety.HOOK_CWD)
+    if guard and guard[0] == "deny":
+        return ("deny", None, guard[1])
+    verdict, fallback, reason = _bash_learning_rules(command)
+    if guard and verdict == "consult":
+        return ("consult", "ask", guard[1])
+    return (verdict, fallback, reason)
+
+
+def _bash_learning_rules(command):
+    """The pattern and allowlist rules behind evaluate_bash_for_learning."""
     if not command or not command.strip():
         return ("ask", None, "Empty command")
 
