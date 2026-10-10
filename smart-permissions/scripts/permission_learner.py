@@ -57,6 +57,7 @@ from pretool_safety import (  # noqa: E402
     llm_is_configured,
     _flag_get,
     log_decision,
+    parse_hook_payload,
     _elapsed_ms,
     _reason_is_risky,
     _is_destructive_rm,
@@ -104,11 +105,8 @@ def main():
 
     if not isinstance(input_data, dict):
         input_data = {}
-    tool = input_data.get("tool_name", "")
-    # their-M2: a JSON null tool_input must not crash the hook — coerce to {}.
-    tool_input = input_data.get("tool_input")
-    if not isinstance(tool_input, dict):
-        tool_input = {}
+    # their-M2: a JSON null tool_input must not crash the hook — coerced to {}.
+    tool, tool_input = parse_hook_payload(input_data)
 
     set_hook_cwd(input_data)
     verdict, fallback, reason = evaluate_for_learning(tool, tool_input)
@@ -148,12 +146,14 @@ def main():
                 learned = _auto_learn(tool, tool_input)
             log_decision("permission_request", tool, tool_input, "allow",
                          source, llm_reason, duration_ms=_elapsed_ms(start),
-                         llm_ms=llm_ms, learned=learned)
+                         llm_ms=llm_ms, learned=learned,
+                         rule_reason=reason)
             _emit_allow()
             return
         # Confirmed flag, LLM error or unparseable → manual prompt.
         log_decision("permission_request", tool, tool_input, "ask", source,
-                     llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms)
+                     llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
+                     rule_reason=reason)
         sys.exit(0)
 
     # LLM not configured — historical self-learning fallback.

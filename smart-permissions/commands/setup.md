@@ -19,6 +19,8 @@ Also check which environment variables are set:
 ```bash
 echo "SAFETY_HOOK_API_URL=${SAFETY_HOOK_API_URL:-(not set)}"
 echo "SAFETY_HOOK_API_KEY=${SAFETY_HOOK_API_KEY:+(set)}"
+echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
+echo "SAFETY_HOOK_PROVIDER=${SAFETY_HOOK_PROVIDER:-(auto)}"
 echo "SAFETY_HOOK_MODEL=${SAFETY_HOOK_MODEL:-(not set)}"
 echo "SAFETY_HOOK_AUTO_LEARN=${SAFETY_HOOK_AUTO_LEARN:-(not set)}"
 ```
@@ -31,8 +33,12 @@ Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
 
 ```json
 {
-  "question": "Do you want to enable LLM safety evaluation for unknown commands? This uses any OpenAI-compatible chat completions API.",
+  "question": "Do you want to enable LLM safety evaluation for unknown commands? This works with Claude models (Anthropic Messages API) or any OpenAI-compatible chat completions API.",
   "options": [
+    {
+      "label": "Yes, using a Claude model (Anthropic API)",
+      "description": "Recommended: claude-haiku-5-5 — fast and cheap. Requires an Anthropic API key"
+    },
     {
       "label": "Yes, I have an OpenAI-compatible API I want to use",
       "description": "Requires API URL, key, and model name"
@@ -50,6 +56,21 @@ Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
 ```
 
 Based on their choice:
+
+**Claude model:** Show:
+
+```bash
+export SAFETY_HOOK_MODEL="claude-haiku-5-5"
+export SAFETY_HOOK_API_KEY="your-anthropic-api-key"  # or reuse ANTHROPIC_API_KEY
+export SAFETY_HOOK_REASONING_EFFORT="low"            # optional: low | medium | high
+# Leave SAFETY_HOOK_API_URL unset — a claude-* model defaults to
+# https://api.anthropic.com/v1/messages
+```
+
+A `claude-*` model name with no URL, or any `anthropic.com` URL, selects the Anthropic
+wire format automatically. `SAFETY_HOOK_PROVIDER=anthropic|openai` overrides detection
+(e.g. a Claude model behind an OpenAI-compatible proxy). If they previously set
+`SAFETY_HOOK_API_URL` for another provider, tell them to unset it.
 
 **OpenAI-compatible API:** Ask which provider they want to use and show the appropriate export lines. All three variables are required. Recommend these models by provider:
 

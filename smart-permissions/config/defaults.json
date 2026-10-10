@@ -94,6 +94,30 @@
     "gh search *", "gh browse *", "gh gist view *", "gh gist list *",
     "gh status", "gh label list *", "gh config *",
 
+    "__ GitLab CLI (read-only auto-allowed; glab api / mr create / merge prompt) __",
+    "glab ci list", "glab ci view", "glab ci trace", "glab ci status",
+    "glab ci get", "glab ci lint",
+    "glab mr list", "glab mr view", "glab mr diff", "glab mr checkout",
+    "glab issue list", "glab issue view",
+    "glab repo view", "glab repo clone", "glab release list", "glab release view",
+    "glab auth status", "glab version",
+
+    "__ Azure CLI — read-only verbs only. `*` in the middle matches exactly one __",
+    "__ word, and only before any flag (`az group delete -n show` ≠ `az * show`). __",
+    "__ Credential reads (keys, secrets, connection strings) prompt via risky_patterns. __",
+    "az * list", "az * * list", "az * show", "az * * show",
+    "az * list-instances", "az * list-usage", "az * list-skus", "az * list-sizes",
+    "az * list-locations", "az * * list-instances", "az * * list-usage",
+    "az account show", "az account list", "az version",
+    "az monitor log-analytics query", "az monitor metrics list",
+    "az monitor activity-log list", "az graph query",
+
+    "__ uv (project-local; `uv run` executes arbitrary code so only linters/tests) __",
+    "uv sync", "uv lock", "uv tree", "uv version", "uv --version",
+    "uv pip list", "uv pip show", "uv pip freeze",
+    "uv run pytest", "uv run ruff", "uv run black", "uv run mypy",
+    "uv run pyright", "uv run isort",
+
     "__ System utilities __",
     "tree", "ls", "pwd", "which", "export",
     "cd", "echo", "cat", "head", "tail", "wc", "tee", "file",
@@ -121,6 +145,7 @@
     "spctl --status", "spctl --assess *", "spctl --list-label",
     "spctl --test-devid",
     "mktemp", "gunzip", "gzip", "zcat", "bzcat", "xzcat",
+    "zgrep", "gzcat", "nproc", "shellcheck",
     "bc", "expr", "yes", "seq", "shuf", "rev", "fold", "fmt",
     "cmp", "comm", "join", "look", "tac", "nl",
     "base64", "uuencode", "uudecode",
@@ -201,7 +226,11 @@
     "EnterWorktree", "ExitWorktree",
     "LSP", "RemoteTrigger", "ShareOnboardingGuide",
     "ReportFindings", "Artifact", "Workflow",
-    "DesignSync", "EndConversation"
+    "DesignSync", "EndConversation",
+    "ReadNotifications", "ListAgents", "SubagentHandback", "ArtifactData",
+    "__ Grok CLI internal tools (its file/shell/web tools map onto the Claude __",
+    "__ tools — see _FOREIGN_TOOL_ALIASES in pretool_safety.py) __",
+    "todo_write", "kill_command_or_subagent", "get_command_or_subagent_output"
   ],
 
   "safe_write_paths": [
@@ -285,7 +314,10 @@
     "\\bfind\\s+/\\s.*-exec\\s+rm\\b",
     "\\b(tar|unzip|cpio)\\b.*(-C|--directory|-d)\\s+['\"]?/(?:usr|etc|bin|sbin|System|Library)?/?['\"]?(\\s|$)",
     "__ download-and-execute chain: curl/wget then run interpreter on a temp file __",
-    "\\b(curl|wget)\\b[^|&;]*[;&|]+[^|&;]*\\b(bash|sh|zsh|python[0-9.]*|node|ruby|perl|deno|osascript)\\s+(/private)?/(tmp|var/folders)/"
+    "\\b(curl|wget)\\b[^|&;]*[;&|]+[^|&;]*\\b(bash|sh|zsh|python[0-9.]*|node|ruby|perl|deno|osascript)\\s+(/private)?/(tmp|var/folders)/",
+    "__ Azure CLI reads that return credentials (the `az * show/list` safe entries would allow them) __",
+    "\\baz\\s+(\\S+\\s+){0,4}?(keys?|secrets?|credentials?|admin-key|query-key|api-key|list-keys|list-secrets|show-connection-string|connection-string|get-access-token|list-publishing-credentials|list-credentials)\\b",
+    "\\baz\\b[^|;&\\n]*--(show|include)-(secrets|values|keys)\\b"
   ],
 
   "interpreter_exec_flags": {

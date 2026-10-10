@@ -17,10 +17,12 @@ Decision flow:
 Configuration:
   - Defaults loaded from config/defaults.json (ships with plugin)
   - User overrides from ~/.claude/smart-permissions-config.json (optional)
-  - LLM fallback via env vars: SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY,
-    SAFETY_HOOK_MODEL (supports any OpenAI-compatible API).
+  - LLM fallback via env vars: SAFETY_HOOK_MODEL, SAFETY_HOOK_API_KEY,
+    SAFETY_HOOK_API_URL (Anthropic Messages API for Claude models, or any
+    OpenAI-compatible API; SAFETY_HOOK_PROVIDER overrides auto-detection).
     Optional: SAFETY_HOOK_REASONING_EFFORT (e.g. "none", "low") — only sent
-    if set; otherwise the provider default applies.
+    if set; otherwise the provider default applies. For Anthropic it maps
+    to output_config.effort ("none"/"minimal" → "low").
     SAFETY_HOOK_RECHECK_REASONING_EFFORT (default "high") — effort for the
     second pass that re-judges a call the first pass flagged.
 """
@@ -273,6 +275,18 @@ SAFE_COMMANDS = set(c for c in _ALL_SAFE_COMMANDS if " " not in c and "*" not in
 SAFE_COMMANDS_MULTI = set(c for c in _ALL_SAFE_COMMANDS if " " in c and "*" not in c and "?" not in c)
 # Wildcard entries (single or multi-word): "kubectl get*", "docker *" — fnmatch
 SAFE_COMMANDS_WILD = [c for c in _ALL_SAFE_COMMANDS if "*" in c or "?" in c]
+
+
+def _has_interior_wildcard(pattern):
+    """True for patterns like `az * list` whose wildcard is not in the last word."""
+    return any("*" in w or "?" in w for w in pattern.split()[:-1])
+
+
+# Interior-wildcard patterns (`az * show`, `az * * list`) match word by word —
+# one `*` is one word — and only on flag-free subcommand chains, so the `*`
+# can never swallow a verb (`az group delete -n show` is not `az * show`).
+SAFE_COMMANDS_WORDWISE = [c.split() for c in SAFE_COMMANDS_WILD if _has_interior_wildcard(c)]
+SAFE_COMMANDS_WILD = [c for c in SAFE_COMMANDS_WILD if not _has_interior_wildcard(c)]
 SAFE_WRITE_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_write_paths"))]
 SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_script_paths"))]
 ALLOWED_WEB_DOMAINS = _as_list(_CONFIG.get("allowed_web_domains"))
@@ -462,17 +476,49 @@ for _state_path in (USER_CONFIG_PATH, DECISION_LOG_PATH,
 # LLM SAFETY EVALUATION (optional fallback)
 # ============================================================
 
-# Supports any OpenAI-compatible chat completions API.
+# Two wire formats: the Anthropic Messages API (Claude models) and any
+# OpenAI-compatible chat completions API (OpenAI, xAI Grok, OpenRouter, …).
 # Set env vars to enable:
-#   SAFETY_HOOK_API_URL  - Chat completions endpoint (required)
-#   SAFETY_HOOK_API_KEY  - API key (required — LLM disabled if empty)
-#   SAFETY_HOOK_MODEL    - Model name (required)
-LLM_API_URL = os.environ.get("SAFETY_HOOK_API_URL", "")
-LLM_API_KEY = os.environ.get("SAFETY_HOOK_API_KEY", "")
+#   SAFETY_HOOK_MODEL     - Model name (required), e.g. claude-haiku-5-5, grok-4.3
+#   SAFETY_HOOK_API_KEY   - API key (required — LLM disabled if empty; for
+#                           Anthropic, ANTHROPIC_API_KEY is used if unset)
+#   SAFETY_HOOK_API_URL   - Endpoint (required for OpenAI-compatible; defaults
+#                           to https://api.anthropic.com/v1/messages for Anthropic)
+#   SAFETY_HOOK_PROVIDER  - "anthropic" | "openai" (optional; auto-detected:
+#                           anthropic when the URL is on anthropic.com, or no
+#                           URL is set and the model starts with "claude-")
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+LLM_API_URL = os.environ.get("SAFETY_HOOK_API_URL", "").strip()
 LLM_MODEL = os.environ.get(
     "SAFETY_HOOK_MODEL",
     ""
-)
+).strip()
+
+
+def _detect_llm_provider(explicit, url, model):
+    explicit = explicit.strip().lower()
+    if explicit in ("anthropic", "claude"):
+        return "anthropic"
+    if explicit in ("openai", "openai-compatible", "xai", "grok"):
+        return "openai"
+    if "anthropic.com" in url:
+        return "anthropic"
+    if not url and model.startswith("claude-"):
+        return "anthropic"
+    return "openai"
+
+
+LLM_PROVIDER = _detect_llm_provider(
+    os.environ.get("SAFETY_HOOK_PROVIDER", ""), LLM_API_URL, LLM_MODEL)
+if LLM_PROVIDER == "anthropic" and not LLM_API_URL:
+    LLM_API_URL = ANTHROPIC_MESSAGES_URL
+LLM_API_KEY = os.environ.get("SAFETY_HOOK_API_KEY", "").strip()
+if not LLM_API_KEY and LLM_PROVIDER == "anthropic":
+    LLM_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+# Anthropic: thinking tokens count toward max_tokens, so leave headroom for
+# a short JSON verdict after adaptive thinking.
+ANTHROPIC_MAX_TOKENS = 4096
+ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Optional reasoning_effort param (e.g. "none", "low", "medium", "high").
 # Only sent if set — otherwise the provider's default applies.
 LLM_REASONING_EFFORT = os.environ.get("SAFETY_HOOK_REASONING_EFFORT", "").strip()
@@ -597,18 +643,85 @@ def _reason_is_risky(reason):
     return bool(reason) and "Risky" in reason
 
 
+# ============================================================
+# HOOK PAYLOAD NORMALIZATION (other agent CLIs)
+# ============================================================
+# Other agent CLIs that load Claude Code hooks (e.g. the Grok CLI) send their
+# own tool names, and sometimes camelCase payload keys. Without a mapping
+# every one of their calls is an "Unknown tool" and goes to the LLM — which
+# was the bulk of LLM traffic. Map each to the Claude tool with the same
+# semantics so the same rules apply. Names that are purely agent-internal
+# (todo lists, polling a background task) live in safe_internal_tools.
+_FOREIGN_TOOL_ALIASES = {
+    "run_terminal_command": "Bash",
+    "run_command": "Bash",
+    "read_file": "Read",
+    "grep": "Grep",
+    "list_dir": "Glob",
+    "glob": "Glob",
+    "web_search": "WebSearch",
+    "web_fetch": "WebFetch",
+    "spawn_subagent": "Task",
+}
+# File-mutating aliases: Edit if the call carries old/new strings, else Write.
+_FOREIGN_FILE_TOOLS = frozenset({"search_replace", "write", "write_file",
+                                  "create_file", "edit_file", "str_replace"})
+
+# Set by parse_hook_payload when the client's tool name was mapped, so the
+# decision log keeps the original name.
+HOOK_CLIENT_TOOL = None
+
+
+def parse_hook_payload(input_data):
+    """Return (tool, tool_input) from a hook payload, normalized to Claude
+    Code tool names and input keys. Accepts snake_case or camelCase keys;
+    a non-dict tool_input (JSON null, etc.) is coerced to {}."""
+    global HOOK_CLIENT_TOOL
+    HOOK_CLIENT_TOOL = None
+    if not isinstance(input_data, dict):
+        return "", {}
+    tool = input_data.get("tool_name") or input_data.get("toolName") or ""
+    if not isinstance(tool, str):
+        tool = ""
+    tool_input = input_data.get("tool_input")
+    if tool_input is None:
+        tool_input = input_data.get("toolInput")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+
+    mapped = _FOREIGN_TOOL_ALIASES.get(tool)
+    if mapped is None and tool in _FOREIGN_FILE_TOOLS:
+        mapped = "Edit" if "old_string" in tool_input or "old_str" in tool_input else "Write"
+    if mapped is None:
+        return tool, tool_input
+
+    HOOK_CLIENT_TOOL = tool
+    tool_input = dict(tool_input)
+    if mapped in ("Edit", "Write", "Read") and not tool_input.get("file_path"):
+        for key in ("target_file", "path", "filePath", "file"):
+            if isinstance(tool_input.get(key), str) and tool_input[key]:
+                tool_input["file_path"] = tool_input[key]
+                break
+    if mapped == "Bash" and not isinstance(tool_input.get("command"), str):
+        tool_input["command"] = str(tool_input.get("cmd") or "")
+    return mapped, tool_input
+
+
 def _decision_log_input(tool, tool_input):
     """Extract the human-meaningful input string for a tool, truncated 500 chars.
 
-    Bash → command, file tools → path, WebFetch → url, else the tool name.
-    Only tool inputs are ever logged (never API keys).
+    Bash → command, file tools → path, WebFetch → url, search tools →
+    pattern, else the tool name. Only tool inputs are ever logged (never
+    API keys).
     """
     if tool == "Bash":
         val = tool_input.get("command", "")
-    elif tool in ("Write", "Edit", "NotebookEdit"):
-        val = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+    elif tool in ("Write", "Edit", "NotebookEdit", "Read"):
+        val = tool_input.get("file_path", "") or tool_input.get("notebook_path", "") or tool
     elif tool == "WebFetch":
         val = tool_input.get("url", "")
+    elif tool in ("Grep", "Glob"):
+        val = tool_input.get("pattern", "") or tool_input.get("target_directory", "") or tool
     else:
         val = tool
     if not isinstance(val, str):
@@ -617,7 +730,7 @@ def _decision_log_input(tool, tool_input):
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,
-                 duration_ms=None, llm_ms=None, learned=None):
+                 duration_ms=None, llm_ms=None, learned=None, rule_reason=None):
     """Append one JSONL record describing a permission decision.
 
     Best-effort: never raises, never blocks the hook (blanket guard like
@@ -644,6 +757,11 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
             record["llm_ms"] = llm_ms
         if learned:
             record["learned"] = learned
+        # Why the rules punted to the LLM — the LLM's own reason replaces it
+        if rule_reason and rule_reason != reason:
+            record["rule_reason"] = rule_reason
+        if HOOK_CLIENT_TOOL:
+            record["client_tool"] = HOOK_CLIENT_TOOL
         os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
         # Single-generation rotation before appending.
         try:
@@ -875,7 +993,7 @@ def build_llm_context(input_data):
 
 
 def llm_is_configured():
-    """True if all three LLM env vars are set (URL, key, model)."""
+    """True if the LLM is fully configured (URL — defaulted for Anthropic —, key, model)."""
     return bool(LLM_API_KEY and LLM_API_URL and LLM_MODEL)
 
 
@@ -1193,6 +1311,135 @@ def _has_interpreter_exec_flag(basename, cmd):
     return False
 
 
+# Inline `python -c` snippets that only transform data (the ubiquitous
+# `curl … | python3 -c "import json,sys; print(json.load(sys.stdin)[…])"`)
+# are allowed by rule instead of a round-trip to the LLM. The check is an
+# AST allowlist: pure-stdlib data modules, no dynamic code/attribute access,
+# no file writes, no dunder access. Anything else still goes to the LLM.
+_SAFE_PY_MODULES = frozenset({
+    "json", "sys", "re", "collections", "datetime", "math", "itertools",
+    "functools", "csv", "urllib.parse", "base64", "hashlib", "textwrap",
+    "statistics", "string", "time", "pprint", "decimal", "fractions",
+    "shlex", "difflib", "html", "unicodedata", "heapq", "bisect", "uuid",
+    "random", "calendar", "zoneinfo", "binascii", "zlib", "gzip",
+})
+_SAFE_PY_SYS_ATTRS = frozenset({
+    "stdin", "stdout", "stderr", "argv", "exit", "version", "version_info",
+    "maxsize", "platform", "byteorder",
+})
+_UNSAFE_PY_NAMES = frozenset({
+    "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr",
+    "globals", "locals", "vars", "breakpoint", "memoryview", "help",
+    "__builtins__", "__loader__", "__spec__",
+})
+# Interpreter flags allowed before -c (no -m, -W, -X: those load code/hooks)
+_SAFE_PY_FLAGS = frozenset({"-I", "-u", "-B", "-E", "-s", "-S", "-q", "-O", "-OO", "-b"})
+_PYTHON_BASENAME_RE = re.compile(r"^python(3(\.\d+)?)?$")
+_PY_SHELL_VAR_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
+_PY_SHELL_VAR_PLACEHOLDER = "zzshellvarzz"
+# Env overrides that change what `import json` loads or what runs at startup
+_PY_HIJACK_ENV_RE = re.compile(r"(^|\s)(PYTHON\w*|LD_\w+|DYLD_\w+)=")
+
+
+def _safe_python_code(code):
+    """True if `code` parses and only uses the data-transform allowlist."""
+    import ast
+    # Shell expansion changes the code we check. A plain `$var` / `${var}`
+    # is tolerated only where it lands inside a string literal (e.g.
+    # `open('$f')`): swap in a placeholder and reject it anywhere as code.
+    # `$(…)`, backticks and other `$` forms are rejected outright.
+    code = _PY_SHELL_VAR_RE.sub(_PY_SHELL_VAR_PLACEHOLDER, code)
+    if "$" in code or "`" in code:
+        return False
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            # Invalid escapes in the user's code would print to hook stderr
+            warnings.simplefilter("ignore")
+            tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    approved_open = set()  # `open` Names that are a checked read-only call
+    # ast.walk is breadth-first, so a Call is visited before its func Name
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "open" and id(node) not in approved_open:
+            return False  # bare `open` reference (partial(open, mode='w'), map(open, …))
+        if isinstance(node, ast.Import):
+            if any(a.name not in _SAFE_PY_MODULES for a in node.names):
+                return False
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or node.module not in _SAFE_PY_MODULES:
+                return False
+            if node.module == "sys" and any(a.name not in _SAFE_PY_SYS_ATTRS for a in node.names):
+                return False
+            if any(a.name == "*" for a in node.names):
+                return False
+        elif isinstance(node, ast.Name):
+            if node.id in _UNSAFE_PY_NAMES or node.id.startswith("__"):
+                return False
+            if _PY_SHELL_VAR_PLACEHOLDER in node.id:
+                return False  # a shell variable expands into code, not data
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                return False
+            if (isinstance(node.value, ast.Name) and node.value.id == "sys"
+                    and node.attr not in _SAFE_PY_SYS_ATTRS):
+                return False
+            if node.attr in ("open", "write_text", "write_bytes", "unlink",
+                             "rmdir", "rename", "replace", "system", "popen"):
+                return False
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "__" in node.value:
+                return False  # str.format / attrgetter-style dunder walks
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "open":
+            # Read-only open: no mode, or a literal mode without w/a/x/+
+            mode = node.args[1] if len(node.args) > 1 else None
+            for kw in node.keywords:
+                if kw.arg == "mode":
+                    mode = kw.value
+                elif kw.arg is None or kw.arg == "opener":
+                    return False
+            if mode is not None:
+                if not (isinstance(mode, ast.Constant) and isinstance(mode.value, str)
+                        and not set(mode.value) & set("wax+")):
+                    return False
+            if any(isinstance(a, ast.Starred) for a in node.args):
+                return False
+            approved_open.add(id(node.func))
+    return True
+
+
+def _is_safe_inline_python(basename, cmd, outer=None):
+    """True if `cmd` is `python[3] [safe flags] -c CODE [args…]` with CODE
+    passing _safe_python_code. Any other interpreter or form → False.
+
+    `outer` is the original command when `cmd` was peeled from a wrapper
+    (`env PYTHONPATH=… python -c …`); import-hijacking env vars there fail it.
+    """
+    if not _PYTHON_BASENAME_RE.match(basename):
+        return False
+    if outer is not None and _PY_HIJACK_ENV_RE.search(outer):
+        return False
+    try:
+        tokens = shlex.split(cmd, posix=True)
+    except ValueError:
+        return False
+    idx = 0
+    while idx < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[idx]):
+        if _PY_HIJACK_ENV_RE.search(tokens[idx]):
+            return False
+        idx += 1
+    if idx >= len(tokens) or os.path.basename(tokens[idx]) != basename:
+        return False
+    idx += 1
+    while idx < len(tokens) and tokens[idx] in _SAFE_PY_FLAGS:
+        idx += 1
+    if idx + 1 >= len(tokens) or tokens[idx] != "-c":
+        return False
+    return _safe_python_code(tokens[idx + 1])
+
+
 def _contains_inline_interpreter(command):
     """True if the command invokes an inline interpreter (bash -c, python -c).
 
@@ -1407,71 +1654,144 @@ def _llm_post_once(req, seconds):
     return box["result"]
 
 
+# Rate-limited / overloaded responses worth one quick retry
+_LLM_RETRY_HTTP_CODES = (429, 503, 529)
+
+
+def _retry_after_s(err):
+    """Seconds to wait before retrying an HTTPError (Retry-After, clamped 0.5–3s)."""
+    try:
+        value = float(err.headers.get("retry-after", "1"))
+    except (TypeError, ValueError, AttributeError):
+        value = 1.0
+    return min(max(value, 0.5), 3.0)
+
+
 def _llm_post_with_deadline(req, budget):
-    """POST within `budget` seconds total; one retry if the first attempt hangs.
+    """POST within `budget` seconds total, with at most one retry.
 
     Normal latency is a few seconds with rare hangs well past 30s, so for a
     budget >= 20s a hung first attempt (capped at ~60% of the budget) gets a
-    second try with the remainder. Only timeouts retry — HTTP errors don't.
+    second try with the remainder. A rate-limit/overload response (429, 503,
+    529) gets one retry after a short Retry-After wait if time remains.
+    Other HTTP errors don't retry.
     """
-    if budget < 20:
-        return _llm_post_once(req, budget)
-    first = round(budget * 0.6)
     start = time.monotonic()
+    first = budget if budget < 20 else round(budget * 0.6)
     try:
         return _llm_post_once(req, first)
     except TimeoutError:
-        remaining = budget - (time.monotonic() - start)
-        if remaining < 3:
+        if budget < 20:
             raise
-        return _llm_post_once(req, remaining)
+        wait = 0.0
+        error = sys.exc_info()[1]
+    except urllib.error.HTTPError as e:
+        if e.code not in _LLM_RETRY_HTTP_CODES:
+            raise
+        wait = _retry_after_s(e)
+        error = e
+    remaining = budget - (time.monotonic() - start) - wait
+    if remaining < 3:
+        raise error
+    time.sleep(wait)
+    return _llm_post_once(req, remaining)
+
+
+_SAFETY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "safe": {"type": "boolean"},
+        "category": {"type": "integer"},
+        "reason": {"type": "string"},
+    },
+    "required": ["safe"],
+    "additionalProperties": False,
+}
+
+
+def _anthropic_effort(reasoning_effort):
+    """Map an OpenAI-style reasoning effort onto Anthropic's effort levels."""
+    effort = (reasoning_effort or "").lower()
+    if effort in ("none", "minimal"):
+        return "low"
+    return effort if effort in ANTHROPIC_EFFORTS else None
+
+
+def _build_llm_http_request(user_prompt, reasoning_effort):
+    """The provider-specific POST for one safety evaluation."""
+    if LLM_PROVIDER == "anthropic":
+        output_config = {"format": {"type": "json_schema", "schema": _SAFETY_SCHEMA}}
+        effort = _anthropic_effort(reasoning_effort)
+        if effort:
+            output_config["effort"] = effort
+        # No temperature: non-default sampling params are rejected on
+        # current Claude models. Structured output guarantees the JSON shape.
+        payload = {
+            "model": LLM_MODEL,
+            "max_tokens": ANTHROPIC_MAX_TOKENS,
+            "system": LLM_SAFETY_PROMPT,
+            "messages": [{"role": "user", "content": user_prompt}],
+            "output_config": output_config,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "x-api-key": LLM_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "User-Agent": "ClaudeCode-SmartPermissions/1.0",
+        }
+    else:
+        payload = {
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "system", "content": LLM_SAFETY_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.0,
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
+            # Structured output — guarantees valid JSON matching this schema.
+            # Supported by xAI Grok and OpenAI GPT models.
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "safety_evaluation", "schema": _SAFETY_SCHEMA},
+            },
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {LLM_API_KEY}",
+            "User-Agent": "ClaudeCode-SmartPermissions/1.0",
+        }
+    return urllib.request.Request(
+        LLM_API_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
+
+
+def _llm_response_text(result):
+    """The model's text answer from a provider response, or None.
+
+    Anthropic returns a list of content blocks (thinking blocks may precede
+    the text); a refusal or a cut-off answer yields None (→ ask).
+    """
+    if LLM_PROVIDER == "anthropic":
+        if result.get("stop_reason") in ("refusal", "max_tokens"):
+            return None
+        texts = [b.get("text", "") for b in result.get("content") or []
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "".join(texts).strip() or None
+    return (result["choices"][0]["message"]["content"] or "").strip() or None
 
 
 def _llm_request(user_prompt, reasoning_effort, budget):
-    """One chat-completions call; returns the parsed decision dict.
+    """One safety-evaluation call; returns the parsed decision dict.
 
     Raises on transport errors and timeouts; returns None if the response
     can't be parsed as a decision.
     """
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": LLM_SAFETY_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.0,
-        **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
-        # Structured output — guarantees valid JSON matching this schema.
-        # Supported by xAI Grok and OpenAI GPT models.
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": {
-                "name": "safety_evaluation",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "safe": {"type": "boolean"},
-                        "category": {"type": "integer"},
-                        "reason": {"type": "string"},
-                    },
-                    "required": ["safe"],
-                    "additionalProperties": False,
-                },
-            },
-        },
-    }
-    req = urllib.request.Request(
-        LLM_API_URL,
-        data=json.dumps(payload).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "User-Agent": "ClaudeCode-SmartPermissions/1.0",
-        },
-        method="POST",
-    )
+    req = _build_llm_http_request(user_prompt, reasoning_effort)
     result = _llm_post_with_deadline(req, budget)
-    content = result["choices"][0]["message"]["content"].strip()
+    content = _llm_response_text(result)
+    if content is None:
+        print(f"LLM returned no answer (stop_reason={result.get('stop_reason')})",
+              file=sys.stderr)
+        return None
     # json_schema response_format guarantees valid JSON, but fall back to
     # _extract_json_decision for models that ignore it.
     try:
@@ -1526,7 +1846,7 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True,
     # escalation). With no LLM set we always ask — the cache is never read.
     if not llm_is_configured():
         return ("ask",
-                "LLM not configured — set SAFETY_HOOK_API_URL, SAFETY_HOOK_API_KEY, and SAFETY_HOOK_MODEL",
+                "LLM not configured — set SAFETY_HOOK_MODEL and SAFETY_HOOK_API_KEY (+ SAFETY_HOOK_API_URL for OpenAI-compatible APIs)",
                 {"source": "llm", "llm_ms": None, "flagged": False})
 
     # Exact-match cache: identical repeats stop paying the LLM (allow-only).
@@ -1599,18 +1919,18 @@ def main():
 
     if not isinstance(input_data, dict):
         input_data = {}
-    tool = input_data.get("tool_name", "")
     # their-M2: a JSON null tool_input ({"tool_input": null}) must not crash the
-    # hook with AttributeError — coerce any non-dict to an empty dict.
-    tool_input = input_data.get("tool_input")
-    if not isinstance(tool_input, dict):
-        tool_input = {}
+    # hook with AttributeError — parse_hook_payload coerces any non-dict to {}.
+    # It also maps other agent CLIs' tool names (Grok's run_terminal_command,
+    # read_file, …) onto the Claude tools with the same semantics.
+    tool, tool_input = parse_hook_payload(input_data)
 
     set_hook_cwd(input_data)
     decision, reason = evaluate(tool, tool_input)
     source = "rule"
     llm_ms = None
     learned = None
+    rule_reason = None
 
     # If local rules can't decide, hand off to LLM (if configured). Skip the
     # cache for risky-class asks — an LLM override there must not become sticky.
@@ -1630,6 +1950,7 @@ def main():
                          duration_ms=_elapsed_ms(start))
             sys.exit(0)
         cacheable = not _reason_is_risky(reason)
+        rule_reason = reason
         decision, reason, info = llm_evaluate(
             tool, tool_input, cacheable=cacheable,
             context=build_llm_context(input_data))
@@ -1644,7 +1965,8 @@ def main():
         if info.get("flagged"):
             _flag_put(tool, tool_input, reason)
             log_decision("pretool", tool, tool_input, "ask", source, reason,
-                         duration_ms=_elapsed_ms(start), llm_ms=llm_ms)
+                         duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
+                         rule_reason=rule_reason)
             output_decision("ask", reason)
             return
 
@@ -1654,11 +1976,13 @@ def main():
     # hook-specific Yes/No dialog instead.
     if decision == "ask":
         log_decision("pretool", tool, tool_input, "ask", source, reason,
-                     duration_ms=_elapsed_ms(start), llm_ms=llm_ms)
+                     duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
+                     rule_reason=rule_reason)
         sys.exit(0)
 
     log_decision("pretool", tool, tool_input, decision, source, reason,
-                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, learned=learned)
+                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, learned=learned,
+                 rule_reason=rule_reason)
     output_decision(decision, reason)
 
 
@@ -2220,7 +2544,10 @@ def evaluate_bash(command):
     return result
 
 
-def _evaluate_bash_rules(command):
+_MAX_SUBSTITUTION_DEPTH = 6
+
+
+def _evaluate_bash_rules(command, _depth=0):
     """The pattern and allowlist rules behind evaluate_bash."""
     if not command or not command.strip():
         return ("ask", "Empty command")
@@ -2245,6 +2572,22 @@ def _evaluate_bash_rules(command):
     if bash_writes_to_config_path(command):
         return ("ask", "Bash write to permission-config path")
 
+    # Command/process substitutions run too: `X=$(touch f)`, `echo \`id\``,
+    # `diff <(a) <(b)`. Judge each body as a full command of its own.
+    substitutions, sub_uncertain = extract_substitutions(command)
+    if sub_uncertain:
+        return ("ask", "Ambiguous parse — unclosed command substitution or heredoc")
+    for body in substitutions:
+        if not body.strip():
+            continue
+        if _depth >= _MAX_SUBSTITUTION_DEPTH:
+            return ("ask", "Command substitution nested too deeply")
+        decision, reason = _evaluate_bash_rules(body, _depth + 1)
+        if decision != "allow":
+            if reason.startswith("In command substitution: "):
+                return (decision, reason)
+            return (decision, f"In command substitution: {reason}")
+
     # Try to split into individual commands
     commands, parse_uncertain = split_compound_command(command)
     commands = merge_case_blocks(commands)
@@ -2267,6 +2610,9 @@ def _evaluate_bash_rules(command):
     # Check each sub-command
     unknown_words = []
     for cmd in commands:
+        cmd = _strip_leading_keywords(cmd)
+        if not cmd.strip():
+            continue
         # Re-check dangerous/risky patterns on ALL sub-commands, including
         # function definitions and merged case blocks — their bodies could
         # contain dangerous commands that the first-word check would miss
@@ -2317,9 +2663,11 @@ def _evaluate_bash_rules(command):
         inner_cmd = _resolve_through_wrappers(cmd)
         inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
         inner_basename = os.path.basename(inner_first) if inner_first else basename
-        if _has_interpreter_exec_flag(basename, cmd):
+        if (_has_interpreter_exec_flag(basename, cmd)
+                and not _is_safe_inline_python(basename, cmd)):
             return ("ask", f"Inline interpreter execution: {basename}")
-        if inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd):
+        if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
+                and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
             return ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
 
         # If a transparent wrapper was peeled, the inner command's safety
@@ -2395,6 +2743,9 @@ def _check_inner_commands(body_text, defined_functions):
         return None
 
     for cmd in inner_cmds:
+        cmd = _strip_leading_keywords(cmd)
+        if not cmd.strip():
+            continue
         # Dangerous/risky patterns
         for pattern in DANGEROUS_PATTERNS:
             if re.search(pattern, cmd):
@@ -2420,9 +2771,11 @@ def _check_inner_commands(body_text, defined_functions):
         inner_cmd = _resolve_through_wrappers(cmd)
         inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
         inner_basename = os.path.basename(inner_first) if inner_first else basename
-        if _has_interpreter_exec_flag(basename, cmd):
+        if (_has_interpreter_exec_flag(basename, cmd)
+                and not _is_safe_inline_python(basename, cmd)):
             return ("ask", f"Interpreter execution in compound block: {basename}")
-        if inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd):
+        if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
+                and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
             return ("ask", f"Interpreter execution via wrapper in compound block: {basename} … {inner_basename}")
 
         # Wrapper peel: delegate safety to the inner command (env / timeout /
@@ -2478,6 +2831,185 @@ def _in_arithmetic(command, pos):
     return depth > 0
 
 
+# Reserved words that may precede a command on the same line. They are not
+# commands themselves: `then X` / `do X` must be judged on X.
+_SHELL_PREFIX_KEYWORDS = ("do", "then", "else", "elif", "if", "while", "until", "!", "{")
+_PREFIX_KEYWORD_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(k) for k in _SHELL_PREFIX_KEYWORDS) + r")(?:\s+|$)")
+
+
+def _strip_leading_keywords(cmd):
+    """Drop leading reserved words: `then rm x` → `rm x`, `if ! grep q f` → `grep q f`."""
+    while True:
+        m = _PREFIX_KEYWORD_RE.match(cmd)
+        if not m:
+            return cmd
+        cmd = cmd[m.end():]
+
+
+def _is_word_end(s, j):
+    """True if position j ends a shell word (end of string or a metachar)."""
+    return j >= len(s) or s[j] in " \t\n;|&()<>"
+
+
+def _at_command_position(s, i):
+    """True if s[i] starts a command word: after an operator, an opening
+    paren/brace, start of input, or a prefix reserved word (do, then, …)."""
+    j = i - 1
+    while j >= 0 and s[j] in " \t":
+        j -= 1
+    if j < 0 or s[j] in ";|&(\n{":
+        return True
+    m = re.search(r"(\S+)$", s[:j + 1])
+    return bool(m) and m.group(1) in _SHELL_PREFIX_KEYWORDS
+
+
+def _parse_heredoc_marker(command, i):
+    """Parse the heredoc operator at command[i] (`<<`, `<<-`).
+
+    Returns (marker, strip_tabs, quoted, end) where `end` is the index just
+    past the marker word. `quoted` is True for `<<'EOF'` / `<<"EOF"` /
+    `<<\\EOF`, whose bodies the shell does NOT expand.
+    """
+    j = i + 2
+    strip_tabs = command[j:j+1] == "-"
+    if strip_tabs:
+        j += 1
+    while j < len(command) and command[j] in " \t":
+        j += 1
+    quoted = False
+    if j < len(command) and command[j] in "'\"":
+        quote_char = command[j]
+        quoted = True
+        start = j + 1
+        close = command.find(quote_char, start)
+        if close < 0:
+            return "", strip_tabs, quoted, len(command)
+        return command[start:close], strip_tabs, quoted, close + 1
+    start = j
+    while j < len(command) and command[j] not in " \t\n;|&()<>":
+        j += 1
+    marker = command[start:j]
+    if marker.startswith("\\"):
+        quoted = True
+        marker = marker[1:]
+    return marker, strip_tabs, quoted, j
+
+
+def _find_closing_paren(s, start):
+    """Index of the `)` that closes a `(` whose body begins at s[start].
+
+    Quote-aware; returns -1 if unbalanced.
+    """
+    depth = 1
+    i = start
+    sq = dq = False
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and not sq:
+            i += 2
+            continue
+        if c == "'" and not dq:
+            sq = not sq
+        elif c == '"' and not sq:
+            dq = not dq
+        elif not sq and not dq:
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def extract_substitutions(command, quotes=True):
+    """Bodies of every command/process substitution the shell would execute.
+
+    Finds `$(…)`, backticks, `<(…)` and `>(…)` outside single quotes
+    (double quotes still expand `$(…)` and backticks), including inside
+    unquoted heredoc bodies. Quoted heredocs (`<<'EOF'`) are literal and
+    skipped. `$((…))` arithmetic is scanned through, not extracted.
+
+    Only the outermost bodies are returned; callers evaluate each body as a
+    full command, which recurses into nested substitutions.
+
+    `quotes=False` scans text where quote characters are literal (an
+    unquoted heredoc body).
+
+    Returns (bodies, uncertain) — uncertain when a substitution is unclosed.
+    """
+    bodies = []
+    i = 0
+    n = len(command)
+    sq = dq = False
+    pending = []  # heredocs awaiting their body: (marker, strip_tabs, quoted)
+    while i < n:
+        c = command[i]
+        if c == "\\" and not sq:
+            i += 2
+            continue
+        if quotes and c == "'" and not dq:
+            sq = not sq
+            i += 1
+            continue
+        if sq:
+            i += 1
+            continue
+        if quotes and c == '"':
+            dq = not dq
+            i += 1
+            continue
+        if command.startswith("$((", i):
+            i += 3
+            continue
+        if command.startswith("$(", i) or (quotes and not dq and command[i:i+2] in ("<(", ">(")):
+            end = _find_closing_paren(command, i + 2)
+            if end < 0:
+                return bodies, True
+            bodies.append(command[i+2:end])
+            i = end + 1
+            continue
+        if c == "`":
+            end = i + 1
+            while end < n and command[end] != "`":
+                end += 2 if command[end] == "\\" else 1
+            if end >= n:
+                return bodies, True
+            bodies.append(command[i+1:end].replace("\\`", "`"))
+            i = end + 1
+            continue
+        if quotes and not dq:
+            if command.startswith("<<<", i):
+                i += 3
+                continue
+            if command.startswith("<<", i) and not _in_arithmetic(command, i):
+                marker, strip_tabs, quoted, i = _parse_heredoc_marker(command, i)
+                if not marker:
+                    return bodies, True
+                pending.append((marker, strip_tabs, quoted))
+                continue
+            if c == "\n" and pending:
+                i += 1
+                for marker, strip_tabs, quoted in pending:
+                    indent = r"\t*" if strip_tabs else ""
+                    end = re.compile(r"^" + indent + re.escape(marker) + r"$",
+                                     re.MULTILINE).search(command, i)
+                    if not end:
+                        return bodies, True
+                    if not quoted:
+                        sub, unc = extract_substitutions(command[i:end.start()], quotes=False)
+                        bodies.extend(sub)
+                        if unc:
+                            return bodies, True
+                    i = end.end()
+                pending = []
+                continue
+        i += 1
+    return bodies, bool(pending) and quotes
+
+
 def split_compound_command(command):
     """
     Split a compound command into individual commands.
@@ -2507,61 +3039,88 @@ def split_compound_command(command):
     in_single_quote = False
     in_double_quote = False
     in_heredoc = False
-    heredoc_marker = None
-    strip_tabs = False
+    pending_heredocs = []  # (marker, strip_tabs, quoted) awaiting their body
     paren_level = 0
     brace_level = 0
+    # case…esac tracking: one entry per open `case`, True while scanning an
+    # arm's PATTERN (between `in`/`;;` and `)`). Pattern alternation
+    # `a|b)` is not a pipe and the closing `)` is not a subshell close.
+    case_stack = []
 
     while i < len(command):
         c = command[i]
 
-        # Handle heredoc detection (simplified)
-        # Skip << inside arithmetic $((...)) to avoid misclassifying bit shifts
-        if not in_single_quote and not in_double_quote and not in_heredoc:
+        # Heredoc operator: record the marker and keep scanning the rest of
+        # the line as shell (`cat <<EOF > f; next_cmd` runs next_cmd). The
+        # body starts on the NEXT line and is consumed at the newline below.
+        # Skip << inside arithmetic $((...)) to avoid misclassifying bit shifts.
+        if not in_single_quote and not in_double_quote:
+            if command[i:i+3] == "<<<":
+                # Here-string, not a heredoc — the word after it is data
+                current.append("<<<")
+                i += 3
+                continue
             if command[i:i+2] == "<<" and not _in_arithmetic(command, i):
-                in_heredoc = True
-                j = i + 2
-                if j < len(command) and command[j] == "-":
-                    j += 1
-                while j < len(command) and command[j] in " \t":
-                    j += 1
-                marker_start = j
-                if j < len(command) and command[j] in "'\"":
-                    quote_char = command[j]
-                    j += 1
-                    marker_start = j
-                    while j < len(command) and command[j] != quote_char:
-                        j += 1
-                    heredoc_marker = command[marker_start:j]
+                marker, strip_tabs, quoted, j = _parse_heredoc_marker(command, i)
+                if marker:
+                    pending_heredocs.append((marker, strip_tabs, quoted))
                 else:
-                    while j < len(command) and command[j] not in " \t\n;|&)":
-                        j += 1
-                    heredoc_marker = command[marker_start:j]
-                strip_tabs = command[i+2:i+3] == "-"
-                current.append(command[i:j+1] if j < len(command) else command[i:])
-                i = j + 1 if j < len(command) else j
+                    in_heredoc = True  # `<<` with no marker — unparseable
+                current.append(command[i:j])
+                i = j
+                continue
+            if c == "\n" and pending_heredocs:
+                # Consume each pending heredoc body up to its terminator LINE.
+                # A bare substring search ended `<<'CS'` at the first
+                # "CSharpTypeName" in the body and parsed the rest as shell.
+                j = i + 1
+                for marker, strip_tabs, _quoted in pending_heredocs:
+                    indent = r"\t*" if strip_tabs else ""
+                    end = re.compile(r"^" + indent + re.escape(marker) + r"$",
+                                     re.MULTILINE).search(command, j)
+                    if not end:
+                        in_heredoc = True
+                        j = len(command)
+                        break
+                    j = end.end()
+                pending_heredocs = []
+                current.append(command[i:j])
+                i = j
                 continue
 
-        # Inside heredoc — consume until the terminator LINE. A bare substring
-        # search ended `<<'CS'` at the first "CSharpTypeName" in the body and
-        # parsed the rest of the body as shell commands.
-        if in_heredoc:
-            end = None
-            if heredoc_marker:
-                indent = r"\t*" if strip_tabs else ""
-                end = re.compile(r"^" + indent + re.escape(heredoc_marker) + r"$",
-                                 re.MULTILINE).search(command, i)
-            if end:
-                end_idx = end.end()
-                current.append(command[i:end_idx])
-                i = end_idx
-                in_heredoc = False
-                heredoc_marker = None
+        # Case keywords (only outside quotes, at a word boundary)
+        if not in_single_quote and not in_double_quote:
+            if (command.startswith("case", i) and _is_word_end(command, i + 4)
+                    and _at_command_position(command, i)):
+                case_stack.append(False)
+                current.append("case")
+                i += 4
                 continue
-            else:
-                current.append(command[i:])
-                i = len(command)
+            if case_stack and command.startswith("esac", i) and _is_word_end(command, i + 4) \
+                    and (i == 0 or command[i-1] in " \t\n;"):
+                case_stack.pop()
+                current.append("esac")
+                i += 4
                 continue
+            if (case_stack and not case_stack[-1] and command.startswith("in", i)
+                    and _is_word_end(command, i + 2) and i > 0 and command[i-1] in " \t\n"):
+                # `case WORD in` — the header's `in` starts the first pattern
+                header = "".join(current).split()
+                if len(header) >= 2 and header[-2] == "case":
+                    case_stack[-1] = True
+                    current.append("in")
+                    i += 2
+                    continue
+            if case_stack and case_stack[-1]:
+                if c == ")":
+                    case_stack[-1] = False  # pattern done, arm body follows
+                    current.append(c)
+                    i += 1
+                    continue
+                if c in "|(":
+                    current.append(c)  # alternation / optional leading paren
+                    i += 1
+                    continue
 
         # Quote tracking
         if c == "'" and not in_double_quote:
@@ -2611,12 +3170,15 @@ def split_compound_command(command):
                     current = []
                     i += 1
                     continue
-                if c == ";" and i + 1 < len(command) and command[i+1] == ";":
+                if c == ";" and i + 1 < len(command) and command[i+1] in ";&":
+                    # `;;` / `;&` / `;;&` end a case arm — the next pattern starts
+                    if case_stack:
+                        case_stack[-1] = True
                     part = "".join(current).strip()
                     if part:
                         parts.append(part)
                     current = []
-                    i += 2
+                    i += 3 if command[i:i+3] == ";;&" else 2
                     continue
                 if c in (";", "|"):
                     if c == ";" and current and current[-1] == "\\":
@@ -2638,6 +3200,7 @@ def split_compound_command(command):
         parts.append(part)
 
     uncertain = (in_single_quote or in_double_quote or in_heredoc
+                 or bool(pending_heredocs)
                  or paren_level != 0 or brace_level != 0)
 
     # Post-process: unwrap top-level subshells/groups
@@ -2659,18 +3222,14 @@ def split_compound_command(command):
 
 
 def _contains_case_start(part):
-    """Check if a part contains a case block start."""
-    tokens = part.split()
-    if not tokens:
-        return False
-    if tokens[0] == "case":
-        return True
-    for idx, token in enumerate(tokens):
-        if token == "case":
-            for j in range(idx + 2, len(tokens)):
-                if tokens[j] == "in":
-                    return True
-    return False
+    """Check if a part starts a case block (`case` in command position).
+
+    Only a leading `case` (after prefix keywords like `do`/`then`) counts:
+    `echo case x in` is an echo, and treating it as a case header would
+    let everything up to `)` in the following parts go unchecked.
+    """
+    tokens = _strip_leading_keywords(part).split()
+    return len(tokens) >= 3 and tokens[0] == "case" and "in" in tokens[2:]
 
 
 def merge_case_blocks(parts):
@@ -2927,6 +3486,9 @@ def _is_subcommand_token(w):
             and "/" not in w)
 
 
+_MAX_COMMAND_WORDS = 4  # `az monitor log-analytics query` needs four
+
+
 def _build_candidates(words, longest_only=False):
     """Build candidate multi-word strings from extracted command words.
 
@@ -2942,13 +3504,31 @@ def _build_candidates(words, longest_only=False):
     if longest_only:
         return [" ".join([os.path.basename(words[0])] + words[1:])]
     candidates = []
-    for n in range(min(len(words), 3), 1, -1):
+    for n in range(min(len(words), _MAX_COMMAND_WORDS), 1, -1):
         candidates.append(" ".join([os.path.basename(words[0])] + words[1:n]))
     return candidates
 
 
-def _check_candidates(basename, candidates):
-    """Check if any candidate matches SAFE_COMMANDS_MULTI or SAFE_COMMANDS_WILD."""
+def _wordwise_match(candidate, pattern_words):
+    """Match `candidate` against a split interior-wildcard pattern, one word
+    per pattern word (a trailing `*` word also allows the bare form)."""
+    words = candidate.split()
+    if pattern_words[-1] == "*" and len(words) == len(pattern_words) - 1:
+        pattern_words = pattern_words[:-1]
+    if len(words) != len(pattern_words):
+        return False
+    return all(fnmatch(w, p) for w, p in zip(words, pattern_words))
+
+
+def _check_candidates(basename, candidates, wordwise=False):
+    """Check if any candidate matches SAFE_COMMANDS_MULTI or SAFE_COMMANDS_WILD
+    (and SAFE_COMMANDS_WORDWISE when `wordwise`)."""
+    if wordwise and SAFE_COMMANDS_WORDWISE:
+        for candidate in candidates:
+            for pattern_words in SAFE_COMMANDS_WORDWISE:
+                if _wordwise_match(candidate, pattern_words):
+                    return True
+
     # Check exact multi-word entries first, longest match wins
     if SAFE_COMMANDS_MULTI:
         for candidate in candidates:
@@ -3003,13 +3583,13 @@ def matches_safe_command(first_word, cmd):
 
     # Try all four extraction strategies — accept if any matches
     for mode in ("stop", "skip", "skip_with_value", "include"):
-        words = get_command_words(cmd, max_words=3, flag_handling=mode)
+        words = get_command_words(cmd, max_words=_MAX_COMMAND_WORDS, flag_handling=mode)
         # In include mode the flag IS the subcommand identity. Match only the
         # full-length candidate so a later flag (which may change behavior)
         # cannot be silently dropped to hit a shorter exact entry. Example:
         # `spctl --status --master-disable` must not match `spctl --status`.
         candidates = _build_candidates(words, longest_only=(mode == "include"))
-        if _check_candidates(basename, candidates):
+        if _check_candidates(basename, candidates, wordwise=(mode == "stop")):
             return True
 
     # Fall back to single-word exact match

@@ -69,6 +69,8 @@ def run_hook(script, payload, env_overrides=None):
     # Disable LLM fallback in tests so we get pure local rule decisions
     env.pop('SAFETY_HOOK_API_KEY', None)
     env.pop('XAI_API_KEY', None)
+    env.pop('ANTHROPIC_API_KEY', None)  # would configure the Anthropic provider
+    env.pop('SAFETY_HOOK_PROVIDER', None)
     env.pop('SAFETY_HOOK_AUTO_LEARN', None)
     # Hermetic: point at a fresh empty config so we don't read the
     # developer's real ~/.claude/smart-permissions-config.json.
@@ -1011,8 +1013,8 @@ def test_python_interpreter_exec():
     print('\n--- Regression: python/perl/ruby/node interpreter exec ---')
     cases = [
         # Separate-token form (the obvious one)
-        ('python -c', 'python -c "import json; print(1)"'),
-        ('python3 -c', 'python3 -c "print(d.get(0))"'),
+        ('python -c', 'python -c "import os; print(1)"'),
+        ('python3 -c', 'python3 -c "print(eval(d.get(0)))"'),
         ('python3.11 -c', 'python3.11 -c "import os"'),
         ('perl -e', 'perl -e "print 1"'),
         ('ruby -e', 'ruby -e "puts 1"'),
@@ -1401,12 +1403,12 @@ def test_interpreter_wrapper_bypass_caught():
 
     blocked = [
         ('env python -c', 'env python -c "import os; os.system(\\"id\\")"'),
-        ('env KEY=v python -c', 'env TEST=1 python -c "import sys"'),
+        ('env KEY=v python -c', 'env TEST=1 python -c "import os"'),
         ('timeout 5 bash -c', 'timeout 5 bash -c "echo evil"'),
-        ('timeout 30s python -c', 'timeout 30s python -c "print(1)"'),
+        ('timeout 30s python -c', 'timeout 30s python -c "exec(1)"'),
         ('nohup bash -c', 'nohup bash -c "echo evil"'),
-        ('nohup python -c', 'nohup python -c "print(1)"'),
-        ('command python -c', 'command python -c "print(1)"'),
+        ('nohup python -c', 'nohup python -c "exec(1)"'),
+        ('command python -c', 'command python -c "exec(1)"'),
         ('nice -n 5 bash -c', 'nice -n 5 bash -c "echo"'),
         ('chained wrappers', 'env nohup timeout 5 bash -c "echo"'),
     ]
@@ -1496,14 +1498,14 @@ def test_wrapper_quoting_and_split_string_bypass():
     print('\n--- Regression: wrapper quoting + env -S + taskset/chrt MASK ---')
 
     blocked = [
-        ('env quoted value', 'env FOO="bar baz" python -c "print(1)"'),
-        ('env -S separate', 'env -S python -c "print(1)"'),
-        ('env --split-string separate', 'env --split-string python -c "print(1)"'),
-        ('env -S single-string', 'env -S "python -c print(1)"'),
-        ('env -S attached', 'env -S"python -c print(1)"'),
-        ('env --split-string=value', 'env --split-string="python -c print(1)"'),
-        ('taskset hex mask', 'taskset 0x1 python -c "print(1)"'),
-        ('chrt -f priority', 'chrt -f 10 python -c "print(1)"'),
+        ('env quoted value', 'env FOO="bar baz" python -c "exec(1)"'),
+        ('env -S separate', 'env -S python -c "exec(1)"'),
+        ('env --split-string separate', 'env --split-string python -c "exec(1)"'),
+        ('env -S single-string', 'env -S "python -c exec(1)"'),
+        ('env -S attached', 'env -S"python -c exec(1)"'),
+        ('env --split-string=value', 'env --split-string="python -c exec(1)"'),
+        ('taskset hex mask', 'taskset 0x1 python -c "exec(1)"'),
+        ('chrt -f priority', 'chrt -f 10 python -c "exec(1)"'),
         ('taskset range mask', 'taskset 0-3 bash -c "echo"'),
     ]
     for name, cmd in blocked:
@@ -1687,7 +1689,8 @@ def _run_cfg(script, payload, config_path, llm=None, auto_learn=False,
     env = os.environ.copy()
     for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'SAFETY_HOOK_API_URL',
               'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_AUTO_LEARN',
-              'SAFETY_HOOK_REASONING_EFFORT', 'SAFETY_HOOK_RECHECK_REASONING_EFFORT'):
+              'SAFETY_HOOK_REASONING_EFFORT', 'SAFETY_HOOK_RECHECK_REASONING_EFFORT',
+              'ANTHROPIC_API_KEY', 'SAFETY_HOOK_PROVIDER'):
         env.pop(k, None)
     env['SMART_PERMISSIONS_CONFIG'] = config_path
     if auto_learn:
@@ -2410,12 +2413,12 @@ def test_h6_type_confused_safety_keys():
     # An empty dict for interpreter_exec_flags must not erase `python -c`.
     cfg, cp = _fresh_cfg({'interpreter_exec_flags': {}})
     check('H6: interpreter_exec_flags:{} → python -c still ask',
-          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "exec(1)"'}}, cp),
           'ask')
     # A wrong type on interpreter_exec_flags (list) is ignored, defaults kept.
     cfg, cp = _fresh_cfg({'interpreter_exec_flags': ['nope']})
     check('H6: interpreter_exec_flags:[...] → python -c still ask',
-          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "exec(1)"'}}, cp),
           'ask')
     # bool for a list key: import OK + guard intact (old M4 crash + H6 wipe).
     cfg, cp = _fresh_cfg({'always_ask_write_paths': False})
@@ -2431,7 +2434,7 @@ def test_h6_type_confused_safety_keys():
     cfg, cp = _fresh_cfg({'interpreter_exec_flags': {'python': ['--zap']},
                           'safe_commands': ['python']})
     check('H6: dict-union keeps default python -c flag',
-          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "x"'}}, cp),
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "exec(x)"'}}, cp),
           'ask')
 
 
@@ -2550,13 +2553,13 @@ def test_fix1_nested_nonlist_exec_flags():
         cfg, cp = _fresh_cfg({'interpreter_exec_flags': bad})
         check(f'FIX1: python={bad["python"]!r} → python -c still ask',
               _run_cfg(PRETOOL, {'tool_name': 'Bash',
-                                 'tool_input': {'command': 'python -c "print(1)"'}}, cp),
+                                 'tool_input': {'command': 'python -c "exec(1)"'}}, cp),
               'ask')
     # A nested LIST still unions — adds a watched flag while keeping shipped -c.
     cfg, cp = _fresh_cfg({'interpreter_exec_flags': {'python': ['--zap']},
                           'safe_commands': ['python']})
     check('FIX1: nested list unions — python -c still ask',
-          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "x"'}}, cp),
+          _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python -c "exec(x)"'}}, cp),
           'ask')
     check('FIX1: nested list unions — added --zap now flagged too',
           _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'python --zap "x"'}}, cp),
@@ -2905,6 +2908,272 @@ def test_protected_delete_guard():
           run(PRETOOL, d('cm0gLXJmIH4vRGV2'), cp)[0], 'deny')
 
 
+# ---- LLM-volume fixes: rules that keep routine calls off the LLM ----------
+
+def _bash(cmd):
+    return run_hook(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': cmd}})
+
+
+def test_safe_inline_python_allowed():
+    """Data-only `python -c` snippets (json parsing in a pipe) are allowed by
+    rule; anything that can touch the system still prompts."""
+    print('\n--- Safe inline python -c (AST allowlist) ---')
+    allowed = [
+        ('json pipe', 'cat f.json | python3 -c "import json,sys; print(json.load(sys.stdin)[\'a\'])"'),
+        ('single-quoted code', "python3 -c 'import json,sys;d=json.load(sys.stdin);print(len(d))'"),
+        ('-I -u flags', 'python3 -I -u -c "import sys; print(sys.argv[1])" x'),
+        ('timeout wrapper', 'timeout 5 python3 -c "print(1)"'),
+        ('read-only open', 'python3 -c "print(open(\'f.txt\').read())"'),
+        ('$var in string literal', 'python3 -c "import json; print(json.load(open(\'$f\')))"'),
+    ]
+    for name, cmd in allowed:
+        check(f'safe python: {name} → allow', _bash(cmd), 'allow')
+    blocked = [
+        ('import os', 'python3 -c "import os; os.system(\'id\')"'),
+        ('subprocess', 'python3 -c "import subprocess; subprocess.run([\'id\'])"'),
+        ('open for write', 'python3 -c "open(\'x\',\'w\').write(\'1\')"'),
+        ('open variable mode', 'python3 -c "m=\'w\'; open(\'x\', m)"'),
+        ('partial(open)', 'python3 -c "from functools import partial; partial(open, mode=\'w\')(\'x\')"'),
+        ('dunder walk', 'python3 -c "print(().__class__.__base__)"'),
+        ('dunder via string', 'python3 -c "import operator; operator.attrgetter(\'__class__\')(1)"'),
+        ('exec', 'python3 -c "exec(\'1\')"'),
+        ('getattr', 'python3 -c "getattr(1, \'real\')"'),
+        ('sys.modules', 'python3 -c "import sys; print(sys.modules)"'),
+        ('$var as code', 'python3 -c "print($X)"'),
+        ('substitution in code', 'python3 -c "print(\'$(id)\')"'),
+        ('PYTHONPATH prefix', 'PYTHONPATH=/tmp/evil python3 -c "import json"'),
+        ('env PYTHONPATH', 'env PYTHONPATH=/tmp/evil python3 -c "import json"'),
+        ('-m flag', 'python3 -m json.tool -c "x"'),
+        ('syntax error', 'python3 -c "import json,"'),
+    ]
+    for name, cmd in blocked:
+        check(f'unsafe python: {name} → ask', _bash(cmd), 'ask')
+
+
+def test_command_substitution_bodies_checked():
+    """$(…), backticks and <(…) bodies run, so they get the same rules."""
+    print('\n--- Command substitution bodies are evaluated ---')
+    check('$(unknown) in echo → ask', _bash('echo $(frobnicate)'), 'ask')
+    check('$(unknown) in assignment → ask', _bash('X=$(frobnicate --x)'), 'ask')
+    check('backtick unknown → ask', _bash('echo `frobnicate`'), 'ask')
+    check('process substitution unknown → ask', _bash('diff <(frobnicate) f'), 'ask')
+    check('nested unknown → ask', _bash('echo "$(echo $(frobnicate))"'), 'ask')
+    check('$(unsafe python) → ask', _bash('X=$(python3 -c "import os")'), 'ask')
+    check('$(safe) → allow', _bash('X=$(git rev-parse HEAD); echo "$X"'), 'allow')
+    check('single-quoted $( ) is literal → allow', _bash("echo '$(frobnicate)'"), 'allow')
+    check('quoted heredoc body is literal → allow',
+          _bash("cat <<'EOF' > notes.md\n$(frobnicate)\nEOF"), 'allow')
+    check('unquoted heredoc body expands → ask',
+          _bash("cat <<EOF > notes.md\n$(frobnicate)\nEOF"), 'ask')
+    check('arithmetic $(( )) → allow', _bash('echo $((1 + 2))'), 'allow')
+    check('unclosed $( → ask', _bash('echo $(ls'), 'ask')
+
+
+def test_shell_keywords_do_not_hide_commands():
+    """`then X` / `do X` were matched on the keyword (safe-listed), so X
+    was never checked."""
+    print('\n--- Reserved words do not hide the command after them ---')
+    check('then unknown → ask', _bash('if true; then frobnicate; fi'), 'ask')
+    check('do unknown → ask', _bash('for i in 1 2; do frobnicate $i; done'), 'ask')
+    check('else unknown → ask', _bash('if false; then ls; else frobnicate; fi'), 'ask')
+    check('while unknown → ask', _bash('while frobnicate; do sleep 1; done'), 'ask')
+    check('if ! safe → allow', _bash('if ! grep -q x f; then echo no; fi'), 'allow')
+    check('safe loop → allow', _bash('for f in *.txt; do wc -l "$f"; done'), 'allow')
+
+
+def test_case_patterns_not_commands():
+    """`a|b)` case patterns inside loops were split on `|` and read as
+    commands ("Unknown command in compound block: pending")."""
+    print('\n--- case…esac patterns with alternation ---')
+    cmd = ("while :; do s=$(git status --porcelain | python3 -c 'import sys;print(len(sys.stdin.read()))'); "
+           "case $s in pending|running|created) sleep 15;; *) break;; esac; done; echo done=$s")
+    check('poll loop with case alternation → allow', _bash(cmd), 'allow')
+    check('unknown in case arm → ask',
+          _bash('for i in 1; do case $i in a|b) echo;; *) frobnicate;; esac; done'), 'ask')
+    check('case text in echo is not a case block → ask',
+          _bash('echo case x in; frobnicate) ls'), 'ask')
+    check('here-string → allow', _bash('grep -c x <<< "$var"'), 'allow')
+    check('command after heredoc operator → ask',
+          _bash("cat <<'EOF' > f.md; frobnicate\nbody\nEOF"), 'ask')
+
+
+def test_cli_readonly_defaults():
+    """az/glab/uv read-only defaults; mutations and credential reads still
+    go to the LLM/human."""
+    print('\n--- az / glab / uv read-only defaults ---')
+    allowed = [
+        "az monitor log-analytics query -w x --analytics-query 'T | take 5'",
+        'az vm list -g rg -o table', 'az vmss list-instances -g a -n b',
+        'az role assignment list --assignee x', 'az containerapp show -n a -g b',
+        'az account show', 'glab ci list', 'glab ci trace 123', 'glab mr view 12',
+        'uv run pytest -q tests', 'nproc', 'zgrep foo x.gz',
+    ]
+    for cmd in allowed:
+        check(f'{cmd} → allow', _bash(cmd), 'allow')
+    blocked = [
+        'az group delete -n show', 'az group delete --yes show', 'az vm delete -g a -n list',
+        'az keyvault secret show --name x', 'az cosmosdb keys list -n a',
+        'az signalr key list -n a', 'az storage account show-connection-string -n a',
+        'az containerapp secret list --show-values -n a', 'az account get-access-token',
+        'az vm run-command invoke -g a -n b --scripts x',
+        'glab mr create --fill', 'glab mr merge 3', 'glab api projects/1 -X DELETE',
+        'uv run python -c "import os"',
+    ]
+    for cmd in blocked:
+        check(f'{cmd} → ask', _bash(cmd), 'ask')
+
+
+def test_foreign_cli_tool_aliases():
+    """Grok CLI tool names (camelCase payload) map onto Claude tools."""
+    print('\n--- Foreign agent CLI tool names ---')
+    def grok(tool, tool_input, snake=False):
+        key = ('tool_name', 'tool_input') if snake else ('toolName', 'toolInput')
+        return run_hook(PRETOOL, {key[0]: tool, key[1]: tool_input, 'cwd': os.getcwd()})
+    check('read_file → allow', grok('read_file', {'target_file': 'README.md'}), 'allow')
+    check('grep (snake_case payload) → allow', grok('grep', {'pattern': 'x'}, snake=True), 'allow')
+    check('list_dir → allow', grok('list_dir', {'target_directory': '.'}), 'allow')
+    check('web_search → allow', grok('web_search', {'query': 'x'}), 'allow')
+    check('todo_write → allow', grok('todo_write', {'todos': []}), 'allow')
+    check('get_command_or_subagent_output → allow',
+          grok('get_command_or_subagent_output', {'task_ids': ['1']}), 'allow')
+    check('run_terminal_command safe → allow',
+          grok('run_terminal_command', {'command': 'git status', 'timeout': 1}), 'allow')
+    check('run_terminal_command unknown → ask',
+          grok('run_terminal_command', {'command': 'frobnicate'}), 'ask')
+    check('run_terminal_command dangerous → deny',
+          grok('run_terminal_command', {'command': d('c3VkbyBscw==')}), 'deny')
+    check('search_replace into ~/.ssh → not allow',
+          grok('search_replace', {'file_path': os.path.expanduser('~/.ssh/config'),
+                                  'old_string': 'a', 'new_string': 'b'}) == 'allow', False)
+    check('unmapped foreign tool → ask', grok('mystery_tool', {}), 'ask')
+
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'toolName': 'read_file', 'toolInput': {'target_file': 'a.txt'}}, cp)
+    recs = _decision_records(cfg)
+    check('log keeps the client tool name',
+          bool(recs) and recs[-1].get('tool') == 'Read' and recs[-1].get('client_tool') == 'read_file'
+          and recs[-1].get('input') == 'a.txt', True)
+    for name in ('ReadNotifications', 'ListAgents', 'SubagentHandback'):
+        check(f'{name} → allow', run_hook(PRETOOL, {'tool_name': name, 'tool_input': {}}), 'allow')
+
+
+def test_rule_reason_logged():
+    """When the LLM decides, the log keeps why the rules punted."""
+    print('\n--- rule_reason recorded on LLM decisions ---')
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate'}}, cp,
+             llm={'safe': True})
+    recs = _decision_records(cfg)
+    check('rule_reason on LLM allow',
+          bool(recs) and recs[-1].get('source') == 'llm'
+          and 'Unknown command' in recs[-1].get('rule_reason', ''), True)
+
+
+def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None):
+    """Run PreToolUse against a mocked Anthropic Messages API.
+
+    responses: list of response dicts, or ('http', code) to raise HTTPError.
+    Each request is logged as {"url", "headers", "body"}.
+    """
+    env = os.environ.copy()
+    for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'SAFETY_HOOK_API_URL',
+              'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_AUTO_LEARN', 'SAFETY_HOOK_PROVIDER',
+              'SAFETY_HOOK_REASONING_EFFORT', 'SAFETY_HOOK_RECHECK_REASONING_EFFORT',
+              'ANTHROPIC_API_KEY'):
+        env.pop(k, None)
+    env['SMART_PERMISSIONS_CONFIG'] = config_path
+    env['SAFETY_HOOK_MODEL'] = 'claude-haiku-5-5'
+    env['ANTHROPIC_API_KEY'] = 'test-anthropic-key'
+    if extra_env:
+        env.update(extra_env)
+    mock = (
+        "import urllib.error\n"
+        "_RESPS = %r\n"
+        "_LOG = %r\n"
+        "_N = [0]\n"
+        "class _R:\n"
+        "    def __init__(self, body): self.body = body\n"
+        "    def __enter__(self): return self\n"
+        "    def __exit__(self, *a): return False\n"
+        "    def read(self): return self.body.encode()\n"
+        "def _f(req, timeout=None):\n"
+        "    with open(_LOG, 'a') as fh:\n"
+        "        fh.write(json.dumps({'url': req.full_url, 'headers': dict(req.header_items()),\n"
+        "                             'body': json.loads(req.data.decode())}) + '\\n')\n"
+        "    r = _RESPS[min(_N[0], len(_RESPS) - 1)]\n"
+        "    _N[0] += 1\n"
+        "    if isinstance(r, list):\n"
+        "        raise urllib.error.HTTPError(req.full_url, r[1], 'err', {'retry-after': '0'}, None)\n"
+        "    return _R(json.dumps(r))\n"
+        "urllib.request.urlopen = _f\n" % (responses, requests_log))
+    wrapper = ("import sys, json\nsys.path.insert(0, %r)\nimport urllib.request\n%s"
+               "import pretool_safety as _m\n_m.main()\n") % (SCRIPT_DIR, mock)
+    r = subprocess.run([sys.executable, '-c', wrapper], input=json.dumps(payload),
+                       capture_output=True, text=True, env=env)
+    out = r.stdout.strip()
+    if out:
+        return json.loads(out).get('hookSpecificOutput', {}).get('permissionDecision', 'ask')
+    return 'ask'
+
+
+def _anthropic_reply(decision, stop_reason='end_turn'):
+    return {'type': 'message', 'role': 'assistant', 'stop_reason': stop_reason,
+            'content': [{'type': 'thinking', 'thinking': '...', 'signature': 'x'},
+                        {'type': 'text', 'text': json.dumps(decision)}]}
+
+
+def test_anthropic_provider():
+    """Claude models go through the Messages API with structured output."""
+    print('\n--- Anthropic Messages API provider ---')
+    payload = {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate'}}
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    result = _run_anthropic(payload, cp, [_anthropic_reply({'safe': True})], log,
+                            extra_env={'SAFETY_HOOK_REASONING_EFFORT': 'none'})
+    check('anthropic allow (thinking block before text) → allow', result, 'allow')
+    reqs = [json.loads(l) for l in open(log)] if os.path.exists(log) else []
+    req = reqs[0] if reqs else {'headers': {}, 'body': {}}
+    hdrs = {k.lower(): v for k, v in req['headers'].items()}
+    body = req['body']
+    check('default Messages API URL', req.get('url'), 'https://api.anthropic.com/v1/messages')
+    check('x-api-key from ANTHROPIC_API_KEY', hdrs.get('x-api-key'), 'test-anthropic-key')
+    check('anthropic-version header', hdrs.get('anthropic-version'), '2023-06-01')
+    check('no bearer auth', 'authorization' in hdrs, False)
+    check('no temperature', 'temperature' in body, False)
+    check('system prompt top-level', bool(body.get('system')) and body['messages'][0]['role'] == 'user', True)
+    check('json_schema output format',
+          body.get('output_config', {}).get('format', {}).get('type'), 'json_schema')
+    check('effort none → low', body.get('output_config', {}).get('effort'), 'low')
+    check('generous max_tokens', body.get('max_tokens', 0) >= 2048, True)
+
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    check('refusal → ask', _run_anthropic(
+        payload, cp, [_anthropic_reply({'safe': True}, stop_reason='refusal')], log), 'ask')
+
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    check('429 then success → allow (one retry)', _run_anthropic(
+        payload, cp, [['http', 429], _anthropic_reply({'safe': True})], log), 'allow')
+    check('429 retried exactly once', sum(1 for _ in open(log)), 2)
+
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    check('400 → ask, no retry', _run_anthropic(
+        payload, cp, [['http', 400], _anthropic_reply({'safe': True})], log), 'ask')
+    check('400 not retried', sum(1 for _ in open(log)), 1)
+
+    # An explicit OpenAI-compatible URL keeps the OpenAI wire format even
+    # for a claude-* model name (e.g. a proxy).
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    _run_anthropic(payload, cp, [{'choices': [{'message': {'content': '{"safe": true}'}}]}], log,
+                   extra_env={'SAFETY_HOOK_API_URL': 'https://proxy.invalid/v1/chat/completions',
+                              'SAFETY_HOOK_API_KEY': 'k'})
+    reqs = [json.loads(l) for l in open(log)] if os.path.exists(log) else []
+    check('proxy URL → OpenAI format', bool(reqs) and 'response_format' in reqs[0]['body'], True)
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -2994,6 +3263,16 @@ if __name__ == '__main__':
     test_llm_recheck_flow()
     test_llm_context()
     test_protected_delete_guard()
+
+    # LLM-volume fixes + Anthropic provider
+    test_safe_inline_python_allowed()
+    test_command_substitution_bodies_checked()
+    test_shell_keywords_do_not_hide_commands()
+    test_case_patterns_not_commands()
+    test_cli_readonly_defaults()
+    test_foreign_cli_tool_aliases()
+    test_rule_reason_logged()
+    test_anthropic_provider()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

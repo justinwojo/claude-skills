@@ -199,7 +199,7 @@ Removal is applied last, after defaults + platform overlay + your additions. Rem
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, timing, and anything learned. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, timing, and anything learned. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Calls from other agent CLIs (see below) also record the original `client_tool` name. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
 
@@ -249,6 +249,17 @@ The parser handles compound operators (`&&`, `||`, `;`, `|`), quoting, heredocs,
 
 If **any** sub-command in a compound command is unknown, the entire command falls through to the permission prompt.
 
+Code that runs as part of the command is checked too:
+
+- **Command substitution** — `$(…)`, backticks and `<(…)`/`>(…)` bodies are evaluated with the same rules (recursively), including inside double quotes and unquoted heredoc bodies. Single-quoted text and quoted heredocs (`<<'EOF'`) are literal and skipped.
+- **Reserved words** — `then X`, `do X`, `else X`, `! X` check `X`, not the keyword.
+- **`case` patterns** — `a|b)` alternations are patterns, not pipes.
+- **Inline Python** — `python3 -c CODE` is allowed by rule when the code is data-only: imports limited to stdlib data modules (`json`, `re`, `collections`, `csv`, …), no dunder access, no `exec`/`eval`/`getattr`, `open()` only read-only with a literal mode, and no `PYTHON*`/`LD_*`/`DYLD_*` env overrides. That covers the common `… | python3 -c "import json,sys; …"` pattern. Anything else still goes to the LLM.
+
+### Other agent CLIs
+
+The hooks accept camelCase payloads (`toolName`/`toolInput`) and map Grok CLI tool names onto their Claude equivalents — `read_file` → Read, `grep` → Grep, `list_dir` → Glob, `run_terminal_command` → Bash, `search_replace`/`write` → Edit/Write, `web_search`/`web_fetch` → WebSearch/WebFetch — so the same rules apply. Unmapped tool names are treated as unknown.
+
 > **Limitation:** commands executed indirectly through a **script file** (e.g. `bash /tmp/setup.sh`, where the dangerous command lives *inside* the file) are not statically inspected — the file's contents aren't visible to the parser. Defense for that path relies on the dangerous/risky pattern checks and, when configured, the LLM evaluation.
 
 ### Multi-word commands and wildcards
@@ -293,6 +304,9 @@ The built-in defaults use multi-word entries to restrict tools that have both sa
 | **npm** | `install`, `test`, `run *`, `list`, `audit`, `ci`, `init`, `pack`, `link`, `update`, etc. | `publish`, `unpublish` |
 | **cargo** | `build *`, `test *`, `check *`, `run *`, `clippy *`, `fmt *`, `doc *`, etc. | `publish` |
 | **pip** | `install *`, `list`, `show *`, `freeze`, `check`, etc. | `uninstall` |
+| **glab** | `ci list/view/trace/status/lint`, `mr list/view/diff/checkout`, `issue list/view`, `repo view/clone`, `release list/view` | `mr create/merge`, `api`, everything else |
+| **az** | any `list`/`show` subcommand (`az vm list`, `az role assignment list`), `list-instances/-usage/-skus`, `monitor log-analytics query`, `graph query`, `account show` | create/delete/update, and credential reads (`keys`, `secret`, `connection-string`, `get-access-token`, `--show-values`) |
+| **uv** | `sync`, `lock`, `tree`, `pip list/show/freeze`, `run pytest/ruff/mypy/…` | `run` of anything else, `pip install` |
 | **pnpm/yarn/poetry** | Common dev subcommands | `publish` |
 
 Tools like `git`, `dotnet`, `make`, and `brew` remain single-word (all subcommands allowed) since their operations are generally safe for local development.
@@ -358,10 +372,11 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 
 | Variable | Description |
 |----------|-------------|
-| `SAFETY_HOOK_API_URL` | Chat completions endpoint (e.g. `https://api.openai.com/v1/chat/completions`) |
-| `SAFETY_HOOK_API_KEY` | API key (LLM disabled if empty) |
-| `SAFETY_HOOK_MODEL` | Model name (e.g. `grok-4.3`, `gpt-5.4-mini`) |
-| `SAFETY_HOOK_REASONING_EFFORT` | Optional `reasoning_effort` value (e.g. `none`, `low`, `medium`, `high`). Only sent if set; otherwise the provider default applies. |
+| `SAFETY_HOOK_MODEL` | Model name (e.g. `claude-haiku-5-5`, `gpt-5.4-mini`, `grok-4.3`) |
+| `SAFETY_HOOK_API_KEY` | API key (LLM disabled if empty). For Claude models, falls back to `ANTHROPIC_API_KEY`. |
+| `SAFETY_HOOK_API_URL` | Endpoint. OpenAI-compatible chat completions (e.g. `https://api.openai.com/v1/chat/completions`) or the Anthropic Messages API. Optional for `claude-*` models (defaults to `https://api.anthropic.com/v1/messages`). |
+| `SAFETY_HOOK_PROVIDER` | Optional wire format override: `anthropic` or `openai`. Auto-detected otherwise: an `anthropic.com` URL, or a `claude-*` model with no URL, uses the Messages API; everything else uses chat completions. |
+| `SAFETY_HOOK_REASONING_EFFORT` | Optional effort (e.g. `none`, `low`, `medium`, `high`). OpenAI-compatible: sent as `reasoning_effort`. Anthropic: sent as `output_config.effort`, with `none`/`minimal` mapped to `low`. Only sent if set. |
 | `SAFETY_HOOK_RECHECK_REASONING_EFFORT` | `reasoning_effort` for the second pass on a flagged call (default `high`; empty string = provider default) |
 | `SAFETY_HOOK_AUTO_LEARN` | Persist LLM-approved commands to config (`true` / `1` / `yes`) |
 
