@@ -37,6 +37,7 @@ import threading
 import hashlib
 import shutil
 import glob
+import itertools
 from fnmatch import fnmatch
 from datetime import datetime
 import urllib.request
@@ -2135,6 +2136,48 @@ def _has_output_redirect(cmd):
     return False
 
 
+# Commands that only read their file arguments (none has a write flag such as
+# `sort -o`, `sed -i` or awk's `print > f`): with one of these, a config path
+# among the arguments is read, and only a redirect TO a config path writes it.
+_CONFIG_READERS = frozenset({"cat", "wc", "jq", "grep", "egrep", "fgrep", "rg",
+                             "head", "tail", "cut", "diff", "cmp", "stat", "ls",
+                             "file", "shasum", "md5", "md5sum", "sha256sum"})
+
+
+def _redirect_writes_config(cmd):
+    """For a command with an output redirect: False only when it provably reads
+    the config path and writes elsewhere — no redirect target is a config path,
+    and every config reference is a `<` input or an argument of a reader in
+    _CONFIG_READERS (`wc -l < ~/.claude/hooks/log > out.txt`). Fails closed."""
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True
+    rest, i = [], 0
+    while i < len(tokens):
+        tok = tokens[i]
+        target = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if tok in _REDIRECT_OPS or tok == "<>":
+            if _references_always_ask_path(target) or re.search(r"[$`*?\[{]|^~(?!/)", target) \
+                    or not target.startswith(("/", "~/")) and re.match(
+                        r"settings(\.local)?\.json$|keybindings\.json$|smart-permissions",
+                        os.path.basename(target)):
+                return True  # a config path, maybe one after a `cd`, or one only known at run time
+            i += 2
+        elif tok == "<":
+            i += 2
+        else:
+            rest.append(tok)
+            i += 1
+    if not any(_references_always_ask_path(t) for t in rest):
+        return False
+    first = get_first_command_word(_resolve_through_wrappers(cmd) or cmd)
+    return not (first and os.path.basename(first) in _CONFIG_READERS
+                and len(split_compound_command(cmd)[0] or []) <= 1)
+
+
 def bash_writes_to_config_path(command):
     """H1/C9: True if a Bash command shows WRITE intent toward a permission-
     config/state path (always_ask_write_paths).
@@ -2160,7 +2203,7 @@ def bash_writes_to_config_path(command):
     for cmd in (commands or [command]):
         if not _references_always_ask_path(cmd):
             continue
-        if _has_output_redirect(cmd):  # clearest write signal
+        if _has_output_redirect(cmd) and _redirect_writes_config(cmd):
             return True
         inner = _resolve_through_wrappers(cmd)
         first = get_first_command_word(inner) or get_first_command_word(cmd)
@@ -2288,14 +2331,69 @@ def _is_destructive_rm(command):
 HOOK_CWD = None
 
 _GLOB_CHARS_RE = re.compile(r"[*?\[]")
-_SHELL_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+# $X, ${X} and ${X<op>word} for the :? :- := :+ operators (colon optional);
+# a nested ${…} in the word is expanded first.
+_STACK_TILDE_RE = re.compile(r"~(?:[-+]\d*|\d+)(?=/|$)")  # zsh ~+ ~- ~1 ~+1 ~-1
+_SHELL_VAR_RE = re.compile(r"\$\{(\w+)(?:(::=|:?[-=?+])([^{}]*))?\}|\$(\w+)")
+# The value of ${X:?} when X is unknown: not empty, not knowable.
+_UNKNOWN_NONEMPTY = "/__smart_permissions_unknown__"
+# zsh's own previous directory (`~-`, `cd -`), apart from $OLDPWD, which a
+# command can assign: the protected-delete walker keeps it in `variables`.
+_OLDPWD_KEY = "__smart_permissions_oldpwd"
+_STACK_KEY = "__smart_permissions_stack"  # what `~1`, `~-1`, `~+1` in a value may be
+_TILDE_KEY = "__smart_permissions_tilde"  # what `~$U`, `~${N:?}` in a value may be
+_PWD_SUBSTITUTION_RE = re.compile(r"\$\(\s*pwd(?:\s+-[LP])?\s*\)|`\s*pwd(?:\s+-[LP])?\s*`")
+_DECLARATION_BUILTINS = frozenset({"export", "declare", "local", "readonly", "typeset"})
+# A command that redefines pwd makes $(pwd) print anything.
+_PWD_REDEFINED_RE = re.compile(
+    r"(?:^|[\s;&|({])(?:function\s+pwd\b|pwd\s*\(\s*\))|\b(?:alias|enable)\b[^;&|\n]*\bpwd\b")
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_]\w*=")
 _CASE_INSENSITIVE_FS = sys.platform in ("darwin", "win32")
 _SEGMENT_KEYWORDS = frozenset({
     "if", "then", "else", "elif", "do", "while", "until", "!", "{", "}",
 })
 _PASSTHROUGH_WRAPPERS = frozenset({"command", "builtin", "exec", "nohup", "time", "nice"})
+_ZSH_MODIFIERS = frozenset({"-", "noglob", "nocorrect"})  # zsh: `- rm …` runs rm
+# sudo/doas run their command too: the guard is about what goes, not who deletes it.
+_PRIVILEGE_WRAPPERS = frozenset({"sudo", "doas"})
+_PRIVILEGE_VALUE_FLAGS = frozenset({"-u", "-g", "-h", "-C", "-p", "-D", "-r", "-t", "-T", "-U",
+                                    "--user", "--group", "--host", "--close-from", "--prompt",
+                                    "--chdir", "--role", "--type", "--command-timeout",
+                                    "--other-user"})
 _RECURSIVE_DELETE_REASON = "Risky recursive or bulk delete — LLM review"
+
+
+def _unwrap_command(words):
+    """The words of the command that keywords and wrappers end up running.
+
+    `do rm …`, `env rm …`, `nice -n 5 rm …`, `time -p rm …`, `builtin rm …`
+    and `sudo -u me rm …` all run `rm …`. Wrapper flags are peeled the way
+    the allowlist peels them (_resolve_through_wrappers), so whatever inner
+    command the rules judge, the delete guards judge too. xargs is left on:
+    it adds arguments, so its callers handle it.
+    """
+    for _ in range(len(words) + 1):
+        if not words:
+            return words
+        first = os.path.basename(words[0])
+        if words[0] in _SEGMENT_KEYWORDS or first == "builtin" or words[0] in _ZSH_MODIFIERS:
+            words = words[1:]
+        elif words[0] == "repeat":  # zsh `repeat 3 rm …`
+            words = words[2:]
+        elif first in _PRIVILEGE_WRAPPERS:
+            i = 1
+            while i < len(words) and (words[i].startswith("-") or _ASSIGNMENT_RE.match(words[i])):
+                if words[i] == "--":
+                    i += 1
+                    break
+                i += 2 if words[i] in _PRIVILEGE_VALUE_FLAGS else 1
+            words = words[i:]
+        elif first in _INTERPRETER_WRAPPERS and first != "xargs" or first in _PASSTHROUGH_WRAPPERS:
+            inner = _shlex_split_safe(_resolve_through_wrappers(shlex.join(words)))
+            words = words[1:] if inner == words else inner
+        else:
+            return words
+    return words
 
 
 def set_hook_cwd(input_data):
@@ -2343,29 +2441,152 @@ def _protected_hit(path, protected):
     return None
 
 
-def _expand_shell_word(word, cwd, variables):
+# Variables an arithmetic expression assigns: X=1, X+=1, X<<=1, ++X, X--.
+_ARITH_ASSIGN_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)"
+                              r"|(?:\+\+|--)\s*([A-Za-z_]\w*)|([A-Za-z_]\w*)\s*(?:\+\+|--)")
+
+
+def _is_arithmetic(body):
+    """True when `$(BODY)` is `$((…))`: the inner `(` closes at the very end.
+
+    `$((:); cmd)` opens with a subshell and is a command substitution.
+    """
+    return body.startswith("(") and _matching_close(body, 0, "(", ")") == len(body) - 1
+
+
+def _substitute_commands(word, cwd, unknown, trust_pwd, variables=None, held=()):
+    """Replace each $(…), `…` and $((…)) in the word with a value.
+
+    `$(pwd)` is the cwd (`pwd -P` with symlinks resolved); arithmetic is a
+    number, and a variable it assigns becomes some number, beside its old
+    value (unless `held`: the caller already chose between them); anything
+    else is `unknown`. None when `$(pwd)` has no known cwd.
+    """
+    out, i = [], 0
+    while i < len(word):
+        c = word[i]
+        if c == "`" or word.startswith("$(", i):
+            if c == "`":
+                j = word.find("`", i + 1)
+                j = len(word) - 1 if j < 0 else j
+                body = word[i + 1:j]
+            else:
+                j = _matching_close(word, i + 1, "(", ")")
+                body = word[i + 2:j]
+            arithmetic = c != "`" and _is_arithmetic(body)
+            body = body.strip()
+            if arithmetic:
+                if variables is not None:
+                    # `0 && (X=1)` skips its assignment: some number, or as it was.
+                    for m in _ARITH_ASSIGN_RE.finditer(body):
+                        n = m.group(1) or m.group(2) or m.group(3)
+                        if n in held:
+                            continue
+                        old = variables.get(n, os.environ.get(n))
+                        values = list(old) if isinstance(old, _Choices) else [old]
+                        variables[n] = _Choices(dict.fromkeys(values + ["1"]))
+                out.append("0")
+            elif trust_pwd and body in _NONEMPTY_SUBSTITUTIONS:
+                if not cwd:
+                    return None
+                out.append(os.path.realpath(cwd) if body == "pwd -P" else cwd)
+            else:
+                out.append(unknown)
+            i = j + 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _expand_shell_word(word, cwd, variables, unknown=_UNKNOWN_NONEMPTY, trust_pwd=True,
+                       absolute=True, held=()):
     """Best-effort expansion of one (already unquoted) shell word to a path.
 
-    Expands ~, $HOME, $PWD and known variables; an unknown variable expands to
-    "" — the empty-variable case is exactly the one that wipes a home folder.
-    Returns None for command substitution or a relative path with no known cwd.
+    Expands ~, $HOME, $PWD, known variables and the ${X:-…} family; an unset
+    variable expands to "" — the empty-variable case is exactly the one that
+    wipes a home folder. `variables` maps a name to its value, to None once
+    the command unsets it, or to a (non-empty, empty) pair when the command
+    set it to something unknowable (`X=$(cmd)`). `unknown` picks which side
+    of each pair, and of each command substitution, this pass takes; callers
+    run both. `${X:?}` on an empty X can't be empty (the shell aborts) but its
+    value is unknown, so it becomes a placeholder top-level folder: a `..`
+    after it still climbs to `/`. `${X:=…}` records its assignment. Returns
+    None when a part can't be followed (`${X%…}`), or for an empty word or a
+    relative path with no known cwd; with `absolute` False (an assignment's
+    value) the expansion comes back as is, "" included.
     """
-    if not word or "`" in word or "$(" in word:
+    if not word:
         return None
-    if word == "~" or word.startswith("~/"):
-        word = HOME_DIR + word[1:]
-    elif word.startswith("~"):
-        word = os.path.expanduser(word)
+    if re.match(r"~[^/]*[$`]", word):
+        return None  # `~$U`, `~${N:?}`: a home or stack folder named at run time
+    word = _substitute_commands(word, cwd, unknown, trust_pwd, variables, held)
+    if word is None:
+        return None
+    side = 0 if unknown else 1
 
-    def _sub(m):
-        name = m.group(1) or m.group(2)
+    def _tilde(text):
+        # The default word of ${X:-~/D} gets tilde expansion too.
+        if text == "~" or text.startswith("~/"):
+            return HOME_DIR + text[1:]
+        stack = _STACK_TILDE_RE.match(text)
+        if stack:  # zsh `~+` is $PWD, `~-` $OLDPWD, `~N`/`~+N`/`~-N` the stack
+            return (cwd if stack.group(0) == "~+" and cwd else _UNKNOWN_NONEMPTY) \
+                + text[stack.end():]
+        return os.path.expanduser(text) if text.startswith("~") else text
+
+    word = _tilde(word)
+
+    def _is_set(name):
+        if name in variables:
+            return variables[name] is not None
+        return name in ("HOME", "PWD") or name in os.environ
+
+    def _value(name):
+        if name in variables:
+            v = variables[name]
+            if isinstance(v, _Choices) or v is _TOO_MANY:  # too many values to try each
+                v = (_UNKNOWN_NONEMPTY, "")
+            return v[side] if isinstance(v, tuple) else (v or "")
         if name == "HOME":
             return HOME_DIR
         if name == "PWD":
             return cwd or ""
-        return variables.get(name, os.environ.get(name, ""))
+        return os.environ.get(name, "")
 
-    word = _SHELL_VAR_RE.sub(_sub, word)
+    def _sub(m):
+        name = m.group(1) or m.group(4)
+        value = _value(name)
+        op, arg = m.group(2), m.group(3) or ""
+        if not op:
+            return value
+        if op == "::=":  # zsh: assign whatever the value was
+            variables[name] = _SHELL_VAR_RE.sub(_sub, _tilde(arg))
+            return variables[name]
+        # Without the colon the operators test "unset", not "empty".
+        present = bool(value) or (not op.startswith(":") and _is_set(name))
+        if op.endswith("?"):
+            return value if present else _UNKNOWN_NONEMPTY
+        if op.endswith("+"):
+            return _tilde(arg) if present else ""
+        if present:
+            return value
+        if op.endswith("="):
+            # Store the expanded default: `${X:=$HOME}` leaves X=/Users/you.
+            variables[name] = _SHELL_VAR_RE.sub(_sub, _tilde(arg))
+            return variables[name]
+        return _tilde(arg)
+
+    # Innermost first, so ${X:-${Y}} resolves ${Y} before its default is read.
+    for _ in range(len(word) + 1):
+        expanded = _SHELL_VAR_RE.sub(_sub, word)
+        if expanded == word:
+            break
+        word = expanded
+    if "${" in word:
+        return None  # an operator it doesn't follow (${X%…}, ${!X})
+    if not absolute:
+        return word
     if not word:
         return None
     if not os.path.isabs(word):
@@ -2375,11 +2596,357 @@ def _expand_shell_word(word, cwd, variables):
     return word
 
 
-def _delete_target_paths(word, cwd, variables):
-    """The absolute paths an rm target word may delete."""
-    path = _expand_shell_word(word, cwd, variables)
-    if path is None:
-        return []
+class _Choices(tuple):
+    """Each value a variable may hold: a loop's values, or what different
+    expansion passes left in it. Each one as `variables` holds a value."""
+
+
+_MISSING = object()
+# A loop over more values than can be checked (a variable holds it).
+_TOO_MANY = object()
+_MAX_BRACE_WORDS = 4096
+_MAX_PASSES = 8192  # per command, about a second of expanding
+_MAX_CWDS = 256  # directories one command may be in
+
+
+def _choice_combos(word, variables, unknowns=False):
+    """(substitution, emptied) for each mix of values the word's variables hold.
+
+    A substitution maps each name holding _Choices to one of them. With
+    `unknowns`, a value known only at run time (a pair, alone or among
+    _Choices) is also taken both as some folder and as empty, independently
+    of the others, and `emptied` marks a mix that took one as empty. A
+    single empty substitution when there is nothing to mix; None past
+    _MAX_PASSES mixes, or for a name holding _TOO_MANY.
+    """
+    names = sorted({n for n in re.findall(r"\$\{?[#!]?(\w+)", word)
+                    if isinstance(variables.get(n), _Choices) or variables.get(n) is _TOO_MANY
+                    or unknowns and isinstance(variables.get(n), tuple)})
+    combos = [({}, False)]
+    for n in names:
+        v = variables[n]
+        options = []
+        for x in v if isinstance(v, _Choices) else [v]:
+            if x is _TOO_MANY:
+                return None
+            options += [(x[0], False), (x[1], True)] if unknowns and type(x) is tuple \
+                else [(x, False)]
+        combos = [(dict(sub, **{n: x}), emptied or e)
+                  for sub, emptied in combos for x, e in options]
+        if len(combos) > _MAX_PASSES:
+            return None
+    return combos
+
+
+def _expand_passes(word, cwd, variables, trust_pwd=True, absolute=True, unknowns=False,
+                   empty_side=True):
+    """[(emptied, [non-empty-side, empty-side])]: the word expanded once per
+    mix from _choice_combos (see _expand_shell_word for the two sides).
+
+    Every pass runs on its own copy of `variables`. The ${X:=…} and
+    arithmetic assignments they make are folded back afterwards: a name
+    the passes leave different holds each value. Without `empty_side`,
+    only the passes with every unknown value non-empty count. None past
+    _MAX_PASSES mixes (see _choice_combos): too many to check.
+    """
+    if _OLDPWD_KEY in variables and "~-" in word:  # `T=~-`, `${X:-~-}`
+        word = re.sub(r"(^|\$\{\w+(?:::=|:?[-=?+]))~-(?=/|\}|$)", r"\1${%s}" % _OLDPWD_KEY, word)
+    if _STACK_KEY in variables and "~" in word:  # `T=~-1`, `${X:-~2}`
+        word = re.sub(r"(^|\$\{\w+(?:::=|:?[-=?+]))~(?:[-+]\d+|\d+)(?=/|\}|$)",
+                      r"\1${%s}" % _STACK_KEY, word)
+    if _TILDE_KEY in variables and "~" in word:  # `T=~$U`: home (U empty), a stack entry, …
+        word = re.sub(r"(^|\$\{\w+(?:::=|:?[-=?+]))~(?=[^/}]*[$`])"
+                      r"(?:\$\{[^{}/]*\}|`[^`/]*`|[^/}`])*(?=/|\}|$)",
+                      r"\1${%s}" % _TILDE_KEY, word)
+    # An arithmetic assignment may run (some number) or not, before the
+    # word reads the name again: each pass takes one, as a mix.
+    arith = {m.group(1) or m.group(2) or m.group(3)
+             for body in _arith_bodies(word)
+             for m in _ARITH_ASSIGN_RE.finditer(body)}
+    choices = dict(variables)
+    for n in arith:
+        old = variables.get(n, os.environ.get(n))
+        choices[n] = _Choices(dict.fromkeys((list(old) if isinstance(old, _Choices)
+                                             else [old]) + ["1"]))
+    combos = _choice_combos(word, choices, unknowns)
+    if combos is None:
+        return None
+    passes, copies = [], []
+    for sub, emptied in combos:
+        pair = [dict(variables, **sub), dict(variables, **sub)]
+        passes.append((emptied, [
+            _expand_shell_word(word, cwd, pair[0], _UNKNOWN_NONEMPTY, trust_pwd, absolute,
+                               arith),
+            _expand_shell_word(word, cwd, pair[1], "", trust_pwd, absolute, arith)]))
+        copies += [(sub, vs) for k, vs in enumerate(pair)
+                   if empty_side or (k == 0 and not emptied)]
+    # A pass that took X as empty can still write it: "${X:=…}".
+    written = {n for sub, vs in copies for n, v in vs.items()
+               if v is not (sub[n] if n in sub else variables.get(n, _MISSING))}
+    for n in written:
+        before = variables.get(n, os.environ.get(n))  # None: unset
+        values = []
+        for sub, vs in copies:
+            v = vs.get(n, before)
+            if n in sub and v is sub[n]:
+                v = before
+            values += list(v) if isinstance(v, _Choices) else [v]
+        values = list(dict.fromkeys(values))
+        variables[n] = values[0] if len(values) == 1 else _Choices(values)
+    for n in arith:  # as it was, or some number, or what a ${X:=…} stored
+        now = variables.get(n, os.environ.get(n))
+        variables[n] = _Choices(dict.fromkeys(
+            list(choices[n]) + (list(now) if isinstance(now, _Choices) else [now])))
+    return passes
+
+
+def _arith_bodies(word):
+    """The text inside each `$(( … ))` of word, nested parens included (an
+    unclosed one runs to the end)."""
+    bodies = []
+    for m in re.finditer(r"\$\(\(", word):
+        depth, i = 2, m.end()
+        while i < len(word) and depth:
+            depth += {"(": 1, ")": -1}.get(word[i], 0)
+            i += 1
+        bodies.append(word[m.end():i])
+    return bodies
+
+
+def _unfollowed_defaults(words, variables):
+    """A `${N:=…}` in words too big to follow may have set N to anything:
+    _TOO_MANY, so a delete that reads N is denied."""
+    for w in words:
+        for n in re.findall(r"\$\{(\w+):{0,2}=", w):
+            variables[n] = _TOO_MANY
+
+
+def _loop_values(args, cwd, variables, trust_pwd, empty_side=True, ifs=None, split=None):
+    """What `for NAME in WORDS` sets NAME to, one value per pass.
+
+    Each word's value, brace-expanded, split on the spaces an expansion
+    brings in (with bash's `ifs`, only a word in `split`, its unquoted
+    expansions, at those), and with its glob matched (`.*` also gives `.` and `..`, as
+    in bash 3.2). A word it can't follow adds the unknown pair (anything,
+    or empty) beside the values it can; _TOO_MANY past _MAX_PASSES values.
+    Each unknown value in a word is tried as some folder and as empty, alone
+    or mixed; without `empty_side`, only as some folder.
+    """
+    unknown = (_UNKNOWN_NONEMPTY, "")
+    if len(args) < 3 or args[1] != "in":
+        return unknown
+    values = {}
+    for w in args[2:]:
+        words = _brace_expand(w)
+        if words is None:
+            return _TOO_MANY
+        for bw in words:
+            # literal spaces were quoted
+            splits = ("$" in bw or "`" in bw) and (split is None or w in split)
+            passes = _expand_passes(bw, cwd, variables, trust_pwd, absolute=False,
+                                    unknowns=empty_side, empty_side=empty_side)
+            if passes is None:
+                return _TOO_MANY
+            for emptied, sides in passes:
+                if emptied and not empty_side:
+                    continue
+                for side in sides:
+                    if side is None or _UNKNOWN_NONEMPTY in side:
+                        values[unknown] = None
+                        continue
+                    pieces = [] if not splits else side.split() if ifs is None \
+                        else _split_fields(side, ifs)
+                    for piece in dict.fromkeys([side] + pieces):
+                        if not _GLOB_CHARS_RE.search(piece):
+                            values[piece] = None
+                            continue
+                        if not os.path.isabs(piece) and not cwd:
+                            values[unknown] = None
+                            continue
+                        head, tail = os.path.split(piece)
+                        values.update((os.path.join(head, dot), None) for dot in (".", "..")
+                                      if tail.startswith(".") and fnmatch(dot, tail))
+                        pattern = piece if os.path.isabs(piece) else os.path.join(cwd, piece)
+                        matches = list(itertools.islice(glob.iglob(pattern), _MAX_PASSES + 1))
+                        if not os.path.isabs(piece):
+                            matches = [os.path.relpath(m, cwd) for m in matches]
+                        values.update((m, None) for m in matches or [piece])
+                    if len(values) > _MAX_PASSES:
+                        return _TOO_MANY
+    return _Choices(values) if values else unknown
+
+
+def _brace_expand(word, start=0):
+    """The words bash brace expansion makes of one word (`a/{b,c}`, `{1..3}`).
+
+    `${…}` is not a brace, though zsh expands one inside its default word
+    (`${X:-~/{a,b}}`), so those words come back too, beside bash's. Quoting
+    is gone by now, so a quoted `{a,b}` expands here too: that only
+    over-checks. None past _MAX_BRACE_WORDS words: too many to check.
+    Expansion starts at `start`; braces before it are done.
+    """
+    i = start
+    while True:
+        i = word.find("{", i)
+        if i < 0:
+            return [word]
+        j = _matching_close(word, i, "{", "}")
+        if i > 0 and word[i - 1] == "$":
+            inner = _brace_expand(word[i + 1:j])
+            if inner is None:
+                return None
+            if len(inner) == 1:
+                i = j + 1
+                continue
+            out = _brace_expand(word, j + 1)  # bash: the braces stay literal
+            for v in inner:
+                more = _brace_expand(word[:i + 1] + v + word[j:], i + len(v) + 2)
+                if out is None or more is None or len(out) + len(more) > _MAX_BRACE_WORDS:
+                    return None
+                out += more
+            return out
+        if word[j] != "}" or j == i:
+            i += 1
+            continue
+        body = word[i + 1:j]
+        parts, depth, start = [], 0, 0
+        for k, c in enumerate(body):
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            elif c == "," and depth == 0:
+                parts.append(body[start:k])
+                start = k + 1
+        parts.append(body[start:])
+        if len(parts) == 1:
+            seq = re.fullmatch(r"(-?\d+)\.\.(-?\d+)|([A-Za-z])\.\.([A-Za-z])", body)
+            if not seq:
+                i += 1
+                continue
+            lo, hi = (int(seq.group(1)), int(seq.group(2))) if seq.group(1) else \
+                (ord(seq.group(3)), ord(seq.group(4)))
+            if abs(hi - lo) >= _MAX_BRACE_WORDS:
+                return None
+            step = 1 if hi >= lo else -1
+            parts = [str(n) if seq.group(1) else chr(n) for n in range(lo, hi + step, step)]
+        out = []
+        for p in parts:
+            more = _brace_expand(word[:i] + p + word[j + 1:], i)
+            if more is None:
+                return None
+            out += more
+            if len(out) > _MAX_BRACE_WORDS:
+                return None
+        return out
+
+
+def _unquoted_expansions(marks):
+    """The words (marks gone) of `marks` with an unquoted `$…` or backtick:
+    those bash splits."""
+    return {m.translate(_NO_FIELD_MARKS) for m in marks
+            if re.search(_PARAM_MARK + "|" + _FIELDS_MARK + "[$`]", m)}
+
+
+_HELD_BASE = 0xF0000  # private-use stand-ins for a separator that can't split
+_MAX_ANY_IFS = 256  # longest value split every way an unknown IFS can
+
+
+def _split_fields(value, ifs):
+    """The words bash makes of an unquoted expansion: the value (kept too)
+    split at the IFS characters, empty pieces dropped. With _ANY_IFS (IFS
+    set to a value not known) any character may split: a piece is any
+    stretch whose bounding characters (or ends) aren't in it (`x/a/by`
+    gives `/a/` for IFS=xy). Past _MAX_ANY_IFS characters, split at each
+    character in turn and at all punctuation at once. A held separator
+    never splits."""
+    if ifs is _ANY_IFS and len(value) <= _MAX_ANY_IFS:
+        pieces = [value]
+        for a in range(len(value)):
+            if a and ord(value[a - 1]) >= _HELD_BASE:
+                continue
+            inside = set()
+            for b in range(a, len(value)):
+                inside.add(value[b])
+                if a and value[a - 1] in inside:
+                    break
+                if b + 1 == len(value) or ord(value[b + 1]) < _HELD_BASE \
+                        and value[b + 1] not in inside:
+                    pieces.append(value[a:b + 1])
+        return [p for p in dict.fromkeys(pieces) if p]
+    if ifs is _ANY_IFS:
+        chars = [c for c in dict.fromkeys(value) if ord(c) < _HELD_BASE]
+        seps = chars + [_DEFAULT_IFS, "".join(c for c in chars
+                                              if not (c.isalnum() or c in "/._~-"))]
+    else:
+        seps = [ifs] if ifs else []
+    pieces = [value]
+    for s in seps:
+        if s:
+            pieces += re.split("[%s]" % re.escape(s), value)
+    return [p for p in dict.fromkeys(pieces) if p]
+
+
+def _hold_separators(word, ifs):
+    """(word, back): the word with each separator in its literal text (what
+    was quoted or escaped, outside any expansion) swapped for a stand-in
+    that _split_fields won't split at, and the table that swaps them back.
+    bash splits only what an expansion gives: `"a b"$X` keeps `a b`."""
+    seps = set(_DEFAULT_IFS) | (set() if ifs is _ANY_IFS else set(ifs))
+    if ifs is _ANY_IFS:
+        seps |= {c for c in word if not (c.isalnum() or c in "/._~-")}
+    seps = {c for c in seps if ord(c) < 0x10000}
+    out, last = [], 0
+    for start, end, _kind, _body in list(_scan_expansions(word)) + [(len(word), len(word), "", "")]:
+        out.append("".join(chr(_HELD_BASE + ord(c)) if c in seps else c for c in word[last:start]))
+        out.append(word[start:end])
+        last = end
+    return "".join(out), {_HELD_BASE + ord(c): c for c in seps}
+
+
+def _delete_target_paths(word, cwd, variables, trust_pwd=True, empty_side=True, budget=None,
+                         ifs=None):
+    """The absolute paths an rm target word may delete; None when there are
+    too many to check (its brace words times its mixes of values run past
+    _MAX_PASSES per word, or past what is left in the one-item `budget`).
+
+    Every unknown value is tried as some folder and as empty, alone or
+    mixed. Without `empty_side`, only what it deletes when every unknown
+    value is non-empty. With `ifs` (an unquoted expansion, as bash reads
+    it), each word the value splits into is a target too.
+    """
+    words = _brace_expand(word)
+    if words is None:
+        return None
+    out = []
+    for w in words:
+        back = None
+        if ifs is not None:
+            w, back = _hold_separators(w, ifs)
+        combos = _choice_combos(w, variables, empty_side)
+        if combos is None:
+            return None
+        if budget is not None:
+            budget[0] -= len(combos)
+            if budget[0] < 0:
+                return None
+        for _emptied, sides in _expand_passes(w, cwd, variables, trust_pwd,
+                                              absolute=ifs is None,
+                                              unknowns=empty_side, empty_side=empty_side):
+            for path in sides if empty_side else sides[:1]:
+                for piece in [path] if ifs is None or path is None else _split_fields(path, ifs):
+                    if piece is not None and back:
+                        piece = piece.translate(back)
+                    if piece is not None and not os.path.isabs(piece):
+                        piece = os.path.join(cwd, piece) if cwd else None
+                    if piece is not None:
+                        out.extend(_delete_paths_for(piece))
+    return out
+
+
+def _delete_paths_for(path):
+    """The paths deleting one expanded target may destroy."""
+    path = path.split("\0", 1)[0]  # rm's argument stops at a NUL
     # "dir/", "dir/." and "dir/*" all destroy the folder's contents — treat
     # them as deleting the folder itself.
     contents = False
@@ -2406,36 +2973,264 @@ def _delete_target_paths(word, cwd, variables):
     return out
 
 
-def _shell_words(segment):
+_ANSI_C_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f",
+                   "v": "\v", "e": "\x1b", "E": "\x1b"}
+
+
+def _plain_dollar_quotes(segment, bash=False):
+    """The segment with zsh's `$'…'` written as a plain quoted string (its
+    escapes decoded: `$'\\x7e'` is a quoted `~`), so `$''~/x` reads as the
+    `~/x` it is. A NUL stays in the text, as in a zsh variable; a path is cut
+    at it where it reaches the system (`cd $'/tmp\\0x'` is `cd /tmp`). zsh's
+    `$"…"` is a `$` and a quoted string. With `bash`, as bash reads them: the
+    string ends at a NUL (`$'\\0'` is empty), and `$"…"` is a plain "…"."""
+    out, i, single, double = [], 0, False, False
+    while i < len(segment):
+        c = segment[i]
+        if single:
+            single = c != "'"
+        elif c == "\\":
+            out.append(segment[i:i + 2])
+            i += 2
+            continue
+        elif c == "$" and not double and segment[i + 1:i + 2] == "'":
+            end = i + 2  # the closing quote: a backslash pair never closes
+            while end < len(segment) and segment[end] != "'":
+                end += 2 if segment[end] == "\\" else 1
+            body, j, text = segment[i + 2:end], 0, []
+            while j < len(body):
+                m = re.match(r"\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})"
+                             r"|([0-7]{1,3})|(.))", body[j:], re.S)
+                ctrl = bash and re.match(r"\\c(.)", body[j:], re.S)
+                if ctrl:  # bash `\cX`: a control character, `\c@` the NUL
+                    text.append(chr(ord(ctrl.group(1)) & 0x1F))
+                    j += ctrl.end()
+                elif bash and body[j:] == "\\c":
+                    text.append("\\")  # a closing `\c` is a backslash
+                    j += 2
+                elif m:
+                    hx, uni, wide, octal, other = m.groups()
+                    code = int(hx or uni or wide, 16) if hx or uni or wide else \
+                        int(octal, 8) & (0xFF if bash else 0x1FF) if octal else None  # bash: a byte
+                    if code is not None and (code > 0x10FFFF or 0xD800 <= code <= 0xDFFF):
+                        code = 0xFFFD  # no such character; nothing a path can name
+                    text.append(chr(code) if code is not None
+                                else _ANSI_C_ESCAPES.get(other, other))
+                    j += m.end()
+                else:
+                    text.append(body[j])
+                    j += 1
+            text = "".join(text)
+            if bash:
+                text = text.split("\0", 1)[0]
+            out.append("'" + text.replace("'", "'\\''") + "'")
+            i = end + 1
+            continue
+        elif c == "$" and not double and segment[i + 1:i + 2] == '"':
+            out.append("" if bash else "\\$")
+            i += 1
+            continue
+        elif c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _drop_fd_numbers(segment, bash=False):
+    """The segment without the descriptor before a redirection (`2>&1`,
+    `{fd}>f`): it is part of the redirection, not a word of the command.
+    `$'…'` is made a plain quoted string first (as bash reads it, with `bash`)."""
+    segment = _plain_dollar_quotes(segment, bash)
+    out, i, single, double = [], 0, False, False
+    while i < len(segment):
+        c = segment[i]
+        if single:
+            single = c != "'"
+        elif c == "\\":
+            out.append(segment[i:i + 2])
+            i += 2
+            continue
+        elif c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif not double and (i == 0 or segment[i - 1] in " \t\n;&|()"):
+            m = re.match(r"(?:\d+|\{[A-Za-z_]\w*\})(?=[<>])", segment[i:])
+            if m:
+                i += m.end()
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+# What _field_marks puts in front of the parts that decide how many words a
+# shell word becomes: a quote (the word stays even when empty), an unquoted
+# `$` (the word is gone when it all expands to nothing: `cd $X` goes home),
+# and anything that may make several words or none ($(cmd), `{a,b}`, a glob,
+# "$@", ${=X}, an array); and before an unquoted `~` (`''~/x` is still home).
+_QUOTED_MARK, _PARAM_MARK, _FIELDS_MARK, _TILDE_MARK = "\x0f", "\x0e", "\x10", "\x11"
+_NO_FIELD_MARKS = str.maketrans("", "", _QUOTED_MARK + _PARAM_MARK + _FIELDS_MARK + _TILDE_MARK)
+_ZSH_ARRAYS = frozenset("argv path fpath cdpath manpath mailpath module_path pipestatus psvar "
+                        "watch fignore reply match mbegin mend dirstack funcstack".split())
+
+
+def _field_marks(segment, bash=False):
+    """The segment with _field_marks's markers in front of each such part."""
+    segment = _drop_fd_numbers(segment, bash)
+    out, i, single, double = [], 0, False, False
+    # Inside an unquoted `${…}` a quote is the expansion's, not the word's
+    # (`${X:+"x"}` is gone when unused); a glob or `{a,b}` there still works.
+    depth = 0
+    quoted = lambda: _QUOTED_MARK if not depth else ""
+    while i < len(segment):
+        c, rest = segment[i], segment[i:]
+        if single:
+            single = c != "'"
+        elif c == "\\" and i + 1 < len(segment):
+            out.append(quoted() + segment[i:i + 2])
+            i += 2
+            continue
+        elif c == "'" and not double or c == "$" and not double and rest[1:2] in ("'", '"'):
+            out.append(quoted())
+            single = c == "'"
+        elif c == '"':
+            out.append(quoted() if not double else "")
+            double = not double
+        elif double:
+            if re.match(r"\$(?:@|\{(?:\(|[^}]*@))", rest):  # "$@", "${X[@]}", "${(@)X}"
+                out.append(_FIELDS_MARK)
+        elif c == "$":
+            name = re.match(r"\$\{?#?([A-Za-z_]\w*)", rest)
+            simple = re.match(r"\$(?:[A-Za-z_]\w*|[0-9#?$!-]|\{#?[A-Za-z_]\w*(?![\w\[])|\(\()", rest)
+            out.append(_PARAM_MARK if simple and not (name and name.group(1) in _ZSH_ARRAYS)
+                       else _FIELDS_MARK)
+            if rest[1:2] == "{":
+                out.append("${")
+                depth += 1
+                i += 2
+                continue
+        elif c == "}" and depth:
+            depth -= 1
+        elif c == "~":
+            out.append(_TILDE_MARK)
+        elif c == "`" or c == "*" or c == "?" and not (
+                depth and re.search(r"\$\{#?\w+:?$", segment[:i])) \
+                or c == "[" and rest[1:2] not in ("[", "", " ", "\t", "\n") \
+                and segment[i - 1:i] != "[" \
+                or c == "{" and segment[i - 1:i] != "$" and rest[1:2] not in ("", " ", "\t", "\n", "}"):
+            out.append(_FIELDS_MARK)  # `${D:?}`'s `?` is the operator
+            depth += depth and c == "{"
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _shell_words(segment, bash=False):
     """Unquoted words of one command segment; shell operators become their own words."""
     if "<<" in segment:
         segment = segment.split("\n", 1)[0]  # heredoc body is data, not commands
+    segment = _drop_fd_numbers(segment, bash)
+    # shlex would split `$(pwd)` at its parentheses: hold each one aside whole.
+    # (Not when the text already holds the marker character.)
+    held, parts, i = [], [], 0
+    while "\x05" not in segment:
+        j = segment.find("$(", i)
+        if j < 0:
+            parts.append(segment[i:])
+            segment = "".join(parts)
+            break
+        k = _matching_close(segment, j + 1, "(", ")")
+        parts += [segment[i:j], "\x05%d\x05" % len(held)]
+        held.append(segment[j:k + 1])
+        i = k + 1
     try:
         lex = shlex.shlex(segment, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
-        return list(lex)
+        words = list(lex)
     except ValueError:
-        return [w.strip("'\"") for w in segment.split()]
+        words = [w.strip("'\"") for w in segment.split()]
+    if not held:
+        return words
+    return [re.sub("\x05(\\d+)\x05", lambda m: held[int(m.group(1))], w) for w in words]
+
+
+def _prefix_length(words):
+    """How many leading words only prefix the command that follows: shell
+    keywords, `{`, `!`, zsh's `-`/`noglob`/`nocorrect`, `time [-p]` and zsh's
+    `repeat N`."""
+    k = 0
+    while k < len(words):
+        w = words[k]
+        if w in _SHELL_PREFIX_KEYWORDS or w in _ZSH_MODIFIERS:
+            k += 1
+        elif w == "time":
+            k += 1
+            while k < len(words) and words[k] == "-p":
+                k += 1
+        elif w == "repeat" and k + 1 < len(words):
+            k += 2
+        else:
+            break
+    return k
 
 
 def _simple_commands(words):
-    """Split a word list on shell operators, dropping redirections."""
+    """Split a word list on shell operators, dropping redirections.
+
+    A function body is its own command, opened with `{` so callers see a
+    block that may not run: `function f { rm …; }`, and zsh's `f() rm …`.
+    zsh's `for f g (a b) …` and `foreach f (a b)` come out as `for f g in a b`.
+    """
     cmd = []
     skip_next = False
+    body = False  # the next command is a function body
+    loop_list = False  # inside a zsh `for NAME… ( … )` list
+
+    def emit(cmd):
+        if cmd and cmd[0] == "function" and len(cmd) > 1:
+            cmd = cmd[2:]  # `function f [()] {` — the `()` is an operator word
+            if not cmd:
+                return None
+            return cmd if cmd[0] == "{" else ["{"] + cmd
+        return ["{"] + cmd if body and cmd[0] not in ("{", "(") else cmd
+
     for w in words:
         if skip_next:
             skip_next = False
             continue
+        if loop_list:
+            if w == ")":  # the body follows
+                loop_list = False
+                yield cmd
+                cmd = []
+            else:
+                cmd.append(w)
+            continue
+        p = _prefix_length(cmd)
+        if w == "(" and len(cmd) > p + 1 and cmd[p] in ("for", "foreach", "select") and all(
+                re.fullmatch(r"[A-Za-z_]\w*", n) for n in cmd[p + 1:]):
+            cmd = cmd[:p] + ["for"] + cmd[p + 1:] + ["in"]
+            loop_list = True
+            continue
         if w and set(w) <= set("();|&"):
             if cmd:
-                yield cmd
+                out = emit(cmd)
+                if out:
+                    yield out
+            body = w == "()"
             cmd = []
         elif w and set(w) <= set("<>&"):
             skip_next = True  # the redirection's file operand
         else:
             cmd.append(w)
     if cmd:
-        yield cmd
+        out = emit(cmd)
+        if out:
+            yield out
 
 
 def _rm_parts(args):
@@ -2455,66 +3250,773 @@ def _rm_parts(args):
     return recursive, targets
 
 
-def protected_delete_check(command, cwd=None):
+def protected_delete_check(command, cwd=None, empty_side=True):
     """Classify recursive deletes in a Bash command.
 
     Returns ("deny", reason) when a recursive rm targets a protected folder or
     an ancestor of one, ("ask", reason) for any other recursive delete (so the
     LLM judges it), or None when the command deletes nothing recursively.
-    `cd` is followed through the command so relative targets resolve.
+    `cd` is followed through the command so relative targets resolve. A value
+    known only at run time (`X=$(cmd)`, a loop or `read` variable) is checked
+    both as some folder and as empty; `empty_side=False` skips the empty case.
+    The command is read as zsh runs it (macOS) and as bash does (Linux, Git
+    Bash on Windows, zsh's SH_WORD_SPLIT): a deny from either reading wins.
     """
     if not command or ("rm" not in command and "-delete" not in command):
         return None
+    results = []
+    for bash in (False, True):
+        result = _protected_delete_check(command, cwd, empty_side, bash)
+        if result and result[0] == "deny":
+            return result
+        results.append(result)
+    return next((r for r in results if r), None)
+
+
+_DEFAULT_IFS = " \t\n"
+_ANY_IFS = object()  # IFS set to a value not known
+
+
+def _ifs_of(command):
+    """The characters bash may split an unquoted expansion at: the default
+    whitespace, and those of each literal `IFS=…` in the command; _ANY_IFS
+    when IFS is touched any other way (`IFS=$X`, `read IFS`). `unset IFS`
+    (the default again) and reads (`$IFS`, `${#IFS}`, `${IFS:-x}`, not
+    the assigning `${IFS:=x}`) don't count, nor names like MYIFS."""
+    if "IFS" not in command:
+        return _DEFAULT_IFS
+    text = _plain_dollar_quotes(command, bash=True)
+    found = re.findall(r"(?<![\w$])IFS=('[^']*'|\"[^\"$`\\]*\"|[^\s;&|()<>$`'\"\\]*)"
+                       r"(?=[\s;&|()]|$)", text)
+    harmless = re.findall(r"\bunset\s+(?:-v\s+)?IFS(?=[\s;&|)]|$)|\$IFS(?!\w)"
+                          r"|\$\{(?:#IFS\}|IFS(?:\}|:?[-+?]))", text)
+    if len(found) + len(harmless) != len(re.findall(r"(?<!\w)IFS(?!\w)", text)):
+        return _ANY_IFS
+    return _DEFAULT_IFS + "".join(v.strip("'\"") if v[:1] in "'\"" else v for v in found)
+
+
+def _bash_bad_option(word, name):
+    """True when bash's cd/pushd/popd fails on `word` as an option: `-x`,
+    `-1` for cd (pushd and popd take `-N` as a stack index), not `-`."""
+    return word.startswith("-") and word != "-" and not (
+        name != "cd" and re.fullmatch(r"-\d+", word))
+
+
+def _protected_delete_check(command, cwd, empty_side, bash):
+    """protected_delete_check as one shell reads the command: zsh, or bash
+    (its word splitting, `$"…"`, a NUL in `$'…'`, and `cd`'s flags and
+    operands)."""
     segments, uncertain = split_compound_command(command)
     if uncertain or not segments:
         segments = [command]
     protected = None
     variables = {}
-    cwd = cwd if cwd and os.path.isabs(cwd) else None
+    # Every directory the command may be in by now; None is one it can't know.
+    cwds = [cwd if cwd and os.path.isabs(cwd) else None]
+    seen = list(cwds)  # every directory it may have been in
+    stack, oldpwd = [], [None]  # pushd's stack (None: lost track), and `cd -`
+    options_set = re.search(r"\b(?:setopt|unsetopt|emulate|shopt)\b|\bset\s+[-+]o\s+(?!errexit\b)"
+                            r"|\boptions\[", command)
+    ifs = _ifs_of(command) if bash else None
+    cdpath = re.search(r"\b(?:CDPATH|cdpath)\b", command) or os.environ.get("CDPATH")
+    # A command that names the walker's key could write it: `~-` stays unknown.
+    oldpwd_key_used = "__smart_permissions_" in command
+    # `|| exit` stops the command only while exit/return are the builtins.
+    # Read with the quotes gone: `function "exit"`, `e"x"it() …` define it too.
+    # zsh's `disable exit` and bash's `enable -n exit` turn the builtin off.
+    exit_trusted = not re.search(r"\b(?:exit|return)\s*\(\s*\)|\bfunctions?\b|\baliases\["
+                                 r"|\b(?:disable|eval|source|alias|autoload)\b|\benable\s+-"
+                                 r"|(?:^|[;&|\n({]\s*)\.\s",
+                                 re.sub(r"[\"'\\]", "", _plain_dollar_quotes(command, bash)))
+
+    def computed_name(words):
+        """A command whose name is expanded (`$a$b exit`, `$name() …`) may be
+        `disable`, `eval` or a new `exit`."""
+        while words and (words[0] in _SEGMENT_KEYWORDS or words[0] in _ZSH_MODIFIERS
+                         or words[0] in ("repeat", "time", "-p")
+                         or re.match(r"[A-Za-z_]\w*(?:\[[^]]*\])?\+?=", words[0])):
+            words = words[2:] if words[0] == "repeat" else words[1:]
+        words = _unwrap_command(words) if words else words
+        return bool(words) and bool(re.search(r"[$`]", words[0]))
+    exit_trusted = exit_trusted and not any(
+        computed_name(words) for segment in segments
+        for words in _simple_commands(_shell_words(segment, bash)))
+    cd_may_fail = cd_may_go_home = False
+    # A cd that may fail before `&&`: the directories it would stay in, and
+    # the `cd -` ones, for when the and-chain ends and the next command runs.
+    pending = []
+    cwds_overflow = False
+    trust_pwd = not _PWD_REDEFINED_RE.search(command)
     recursive_delete = False
+    budget = [_MAX_PASSES]
+    too_many = ("deny", "Blocked recursive delete: `{}` expands to too many paths (brace "
+                "groups, loop values, directories, values known only at run time) to check "
+                "against the protected folders. List the targets.")
+
+    def fold(copies):
+        """Set each name a copy of `variables` changed to every value the copies hold."""
+        written = {n for vs in copies for n, v in vs.items() if v is not variables.get(n, _MISSING)}
+        for n in written:
+            before = variables.get(n, os.environ.get(n))  # None: unset
+            values = []
+            for vs in copies:
+                v = vs.get(n, before)
+                values += list(v) if isinstance(v, _Choices) else [v]
+            values = list(dict.fromkeys(values))
+            variables[n] = values[0] if len(values) == 1 else _Choices(values)
+
+    def run(step, maybe):
+        """step(where, vs) once per directory the command may be in, each on its
+        own copy of `variables`; what they assign is folded back, beside the old
+        values when the command `maybe` doesn't run. The first deny, else None."""
+        copies, denied = [dict(variables)] if maybe else [], None
+        for where in cwds:
+            vs = dict(variables)
+            denied = step(where, vs)
+            copies.append(vs)
+            if denied:
+                break
+        fold(copies)
+        return denied
+
+    def sides_of(passes):
+        """The values from _expand_passes this check counts (see empty_side)."""
+        for emptied, sides in passes or []:
+            yield from sides if empty_side else ([] if emptied else sides[:1])
+
+    def assignment_values(value, where, vs):
+        """What `NAME=value` may store; a value it can't follow is anything."""
+        if value == "":
+            return [""]  # `X=` (or `X=""`): empty
+        passes = _expand_passes(value, where, vs, trust_pwd, absolute=False,
+                                unknowns=empty_side, empty_side=empty_side)
+        if passes is None:
+            return [_TOO_MANY]
+        results = []
+        for emptied, sides in passes:
+            if emptied and not empty_side:
+                continue
+            sides = [_UNKNOWN_NONEMPTY if s is None else s for s in sides[:1]] + \
+                    ["" if s is None else s for s in sides[1:]]
+            results.append(sides[0] if sides[0] == sides[1] else tuple(sides))
+        return results or [(_UNKNOWN_NONEMPTY, "")]
+
+    def stack_dirs(word, where):
+        """What zsh's `~+`, `~-`, `~N` at the start of word name, joined to the
+        rest: the cwd, the previous one, or any directory seen (None: unknown)."""
+        m = _STACK_TILDE_RE.match(word)
+        if not m:
+            return None
+        bases = [where] if m.group(0) == "~+" else oldpwd if m.group(0) == "~-" else seen + [None]
+        return [b and b + word[m.end():] for b in bases]
+
+    def operand_shapes(operands, marks, flags, letters, name):
+        """Each operand list a cd/pushd/popd may get once its words are
+        expanded (None: some list not known): an unquoted `$X` that's empty
+        is gone, an expanded `-q`/`--` (`-` and the command's `letters`)
+        before any operand is a flag (`-s` may make the cd fail: "error"),
+        and $(cmd), a brace group, a glob or "$@" may make any number of
+        words. In bash an unquoted `$X` holding a space is several words,
+        and any other expanded `-x` there is an option it fails on."""
+        if [m.translate(_NO_FIELD_MARKS) for m in marks] != operands:
+            marks = [(_FIELDS_MARK if re.search(r"[$`{*?\[]", w) else "") + w for w in operands]
+        # An unquoted brace group is its words (`cd {A,B}` is `cd A B`).
+        operands, marks = [], [m for mark in marks for m in (
+            _brace_expand(mark.replace(_FIELDS_MARK + "{", "{")) or [mark]
+            if re.search(r"(?<![$\x10]){", mark) is None and _FIELDS_MARK + "{" in mark
+            and "${" not in mark else [mark])]
+        operands = [m.translate(_NO_FIELD_MARKS) for m in marks]
+        # (operands so far, flags ended by `--`); None: unknown; "error": fails
+        states = [((), "--" in flags)]
+
+        def feed(ops, ended, side, word):
+            """The states after one more word, `side` once expanded."""
+            if side and not ops and not ended and re.fullmatch(r"-[%s]+|--" % letters, side):
+                if "P" in side:
+                    return [None]  # an expanded -P: the physical path isn't followed
+                if bash and name != "cd" and side != "--":
+                    return ["stay"]  # `pushd -n`/`popd -n`: the stack only
+                # a flag; `cd -s` fails on a symlinked path
+                return [(ops, side == "--")] + ["error"] * ("s" in side)
+            if side and bash and not ops and not ended and _bash_bad_option(side, name):
+                return ["error"]
+            return [(ops + (word,), ended)]
+
+        done = (None, "error", "stay")  # unknown, fails, succeeds staying put
+
+        for word, mark in zip(operands, marks):
+            fields = _FIELDS_MARK in mark  # a brace group or glob: one word or more
+            sides, gone = [word], False
+            if not fields and re.search(r"[$`]", word):
+                sides = []
+                for where in cwds:
+                    passes = _expand_passes(word, where, dict(variables), trust_pwd,
+                                            absolute=False, unknowns=empty_side,
+                                            empty_side=empty_side)
+                    sides += list(sides_of(passes)) if passes is not None else [None]
+                sides = [None if s is None or _UNKNOWN_NONEMPTY in s else s for s in sides]
+                gone = _PARAM_MARK in mark and _QUOTED_MARK not in mark
+            new_states = []
+            for state in states:
+                if state in done:
+                    new_states.append(state)
+                    continue
+                ops, ended = state
+                if fields:
+                    new_states += [(ops, ended)] * bool(empty_side and re.search(r"[$`]", word)) \
+                        + [(ops + (word,), ended), None]
+                    continue
+                for side in sides:
+                    if side == "" and gone or side and gone and ifs \
+                            and not side.strip(" \t\n"):  # bash: no words at all
+                        new_states.append(state)
+                    elif side and ifs and _PARAM_MARK in mark \
+                            and set(_split_fields(side, ifs)) - {side}:
+                        # bash: split into words, known when IFS is the default
+                        pieces = [p for p in re.split("[ \t\n]+", side) if p] \
+                            if ifs == _DEFAULT_IFS else None
+                        if pieces is None or any(re.search(r"^~|[$`*?\[{]", p) for p in pieces):
+                            new_states.append(None)
+                            continue
+                        now = [state]
+                        for p in pieces:
+                            now = [s for n in now for s in ([n] if n in done else feed(*n, p, p))]
+                        new_states += now
+                    else:
+                        new_states += feed(ops, ended, side, word)
+            states = list(dict.fromkeys(new_states))
+            if len(states) > _MAX_CWDS:
+                return [None]
+        return list(dict.fromkeys(s if s in done else s[0] for s in states))
+
+    def as_value(dirs):
+        values = list(dict.fromkeys(_UNKNOWN_NONEMPTY if d is None else d for d in dirs))
+        return values[0] if len(values) == 1 else _Choices(values)
+
+    def track_oldpwd(came_from, olds=()):
+        """After a cd: `~-` (zsh's own copy) is oldpwd; `$OLDPWD` is where the
+        cd came from, or (when it may not run or may fail) one of `olds`, the
+        values it held before."""
+        if not oldpwd_key_used:
+            variables[_OLDPWD_KEY] = as_value(oldpwd)
+        if came_from is not None:
+            variables["OLDPWD"] = as_value(came_from)
+        if olds:
+            fold([dict(variables)] + [dict(variables, OLDPWD=v) for v in olds])
+
+    def check_rm(args, marks, bulk=False):
+        """The deny for an rm (or `xargs rm`) whose targets reach a protected folder.
+        `marks`: the command's words with _field_marks's markers."""
+        nonlocal protected, recursive_delete
+        # A `~` quoted (`'~$USER'`, `\~\$U`) is a literal name, not a home;
+        # in zsh `''~/x` is not (in bash it is). Every spelling must agree.
+        literal = lambda m: m.startswith(_QUOTED_MARK) and (bash or not m.replace(
+            _QUOTED_MARK, "").startswith(_TILDE_MARK))
+        quoted_tilde = {w for m in marks if literal(m)
+                        for w in [m.translate(_NO_FIELD_MARKS)] if w.startswith("~")} \
+            - {m.translate(_NO_FIELD_MARKS) for m in marks if not literal(m)}
+        # bash splits what an unquoted expansion gives: `rm -rf $X` with
+        # X="a $HOME/Dev" deletes two folders. Any spelling unquoted splits.
+        split = _unquoted_expansions(marks) if ifs else set()
+        recursive, targets = _rm_parts(args)
+        # An expanded word may be rm's flags: `F=-rf; rm $F ~/Dev`, and in
+        # bash `X="-rf ~/Dev"; rm $X`. Only a value it can work out counts.
+        # Past `--` it is a name. bash's `rm -$F` (F="r ~/Dev") splits into a
+        # flag and a target, so that word is checked as a target too.
+        options = args[:args.index("--")] if "--" in args else args
+        flag_words = [] if recursive else [a for a in options if re.search(r"[$`]", a)]
+        targets += [a for a in options if a.startswith("-") and a in split]
+        if not (recursive or bulk or flag_words):
+            return None
+        if recursive or bulk:
+            recursive_delete = True
+        if not (recursive or flag_words):
+            return None
+        if protected is None:
+            protected = _protected_delete_dirs()
+
+        def expands_to_flag(t, where, vs):
+            passes = _expand_passes(t, where, dict(vs), trust_pwd, absolute=False,
+                                    unknowns=empty_side, empty_side=empty_side)
+            if passes is None:
+                return True
+            for side in sides_of(passes):
+                if side is None or _UNKNOWN_NONEMPTY in side:
+                    continue
+                pieces = _split_fields(side, ifs) if t in split else [side]
+                if any(re.fullmatch(r"-\w*[rR]\w*|--recursive", p) for p in pieces):
+                    return True
+            return False
+
+        def step(where, vs):
+            nonlocal recursive_delete
+            if flag_words and not any(expands_to_flag(t, where, vs) for t in flag_words):
+                return None
+            recursive_delete = True
+            for t in targets:
+                if cwds_overflow:
+                    return (too_many[0], too_many[1].format(t))
+                if re.match(r"~[^/]*[$`]", t) and t not in quoted_tilde:
+                    return ("deny", f"Blocked recursive delete: `{t}` may be a protected folder,"
+                            " a home or stack folder (`~$U`, `~$N`) named only at run time."
+                            " Write the path out.")
+                paths = []
+                for word in [f"./{t}"] if t in quoted_tilde else stack_dirs(t, where) or [t]:
+                    more = word and _delete_target_paths(word, where, vs, trust_pwd,
+                                                         empty_side, budget,
+                                                         ifs if t in split else None)
+                    if more is None:
+                        return (too_many[0], too_many[1].format(t))
+                    paths += more or []
+                for path in paths:
+                    hit = _protected_hit(path, protected)
+                    if hit:
+                        shown = "~" + hit[len(HOME_DIR):] if (
+                            hit == HOME_DIR or hit.startswith(HOME_DIR + os.sep)) else hit
+                        return ("deny", f"Blocked recursive delete of protected folder {shown}"
+                                + (" (a `cd` before it may fail and leave the shell where it"
+                                   " was: chain it with `cd DIR && rm …`)" if cd_may_fail else "")
+                                + (" (an unquoted `$…` that expands to nothing makes `cd` go"
+                                   " home: quote it, `cd \"$D\" && rm …`)" if cd_may_go_home else ""))
+            return None
+        return step
+
+    # A command may not run, or runs in a subshell, inside an if/while/until/
+    # for/case or { } body, after && or ||, in ( ), or in a pipeline or & job:
+    # what it assigns or cd's to is then one possibility beside the old one.
+    text = command.replace("\\\n", "")  # the splitter joins continued lines
+    block_depth = paren_depth = loop_depth = 0
+    pos = 0
     for segment in segments:
-        for words in _simple_commands(_shell_words(segment)):
+        start = text.find(segment, pos)
+        found = start >= 0
+        start = start if found else pos
+        before, after = text[pos:start], text[start + len(segment):].lstrip()
+        pos = start + len(segment) if found else pos
+        paren_depth = max(0, paren_depth + before.count("(") - before.count(")"))
+        segment_maybe = uncertain or not found or paren_depth > 0 \
+            or any(op in before for op in "&|(") \
+            or re.match(r"(?:\|(?!\|)|&(?!&)|\))", after) is not None
+        if pending and not re.fullmatch(r"\s*&&[\s(]*", before):
+            # The and-chain after a cd that may have failed is over: what
+            # follows runs either way, maybe where that cd left the shell.
+            for stay, old, _var in pending:
+                cwds = list(dict.fromkeys(cwds + stay))
+                oldpwd = list(dict.fromkeys(oldpwd + old))
+            track_oldpwd(None, [var for _s, _o, var in pending])
+            pending, cd_may_fail = [], True
+            seen = list(dict.fromkeys(seen + cwds))
+            if len(cwds) > _MAX_CWDS or len(seen) > _MAX_CWDS:
+                cwds_overflow, cwds = True, [None]
+        plain = list(_simple_commands(_shell_words(segment, bash)))
+        marked = list(_simple_commands(_shell_words(_field_marks(segment, bash))))
+        if [[w.translate(_NO_FIELD_MARKS) for w in ws] for ws in marked] != plain:
+            marked = [[(_FIELDS_MARK if re.search(r"[$`{*?\[]", w) else "") + w for w in ws]
+                      for ws in plain]  # can't line them up: any expansion may be anything
+        for words, marked_words in zip(plain, marked):
+            if not oldpwd_key_used:  # a stack entry is somewhere it has been, or unknown
+                variables[_STACK_KEY] = as_value(seen + [None])
+                variables[_TILDE_KEY] = as_value(seen + [HOME_DIR, None])
+            repeated = False  # zsh `repeat N cmd`: cmd runs N times, maybe none
+            negated = False  # `! cd …` makes a failed cd succeed
+            while words and (words[0] in _SEGMENT_KEYWORDS or words[0] in _ZSH_MODIFIERS
+                             or words[0] in ("repeat", "time")):
+                negated = negated or words[0] == "!"
+                if words[0] == "time":  # `time for …` opens the loop all the same
+                    words = words[1:]
+                    while words and words[0] == "-p":
+                        words = words[1:]
+                    continue
+                if words[0] == "repeat":
+                    words = words[2:]
+                    if words and words[0] == "do":  # `repeat N do …; done`
+                        block_depth += 1
+                        loop_depth += 1
+                    else:
+                        repeated = True
+                    continue
+                if words[0] in ("if", "while", "until", "{"):
+                    block_depth += 1
+                    loop_depth += words[0] in ("while", "until")
+                elif words[0] == "}":
+                    block_depth = max(0, block_depth - 1)
+                words = words[1:]  # `do X=~/Dev` assigns like `X=~/Dev`, maybe
+            if words and words[0] in ("for", "select", "case"):
+                block_depth += 1
+                loop_depth += words[0] != "case"
+            elif words and (words[0] in ("fi", "done", "esac")
+                            or words == ["end"] and loop_depth):  # zsh foreach … end
+                block_depth = max(0, block_depth - 1)
+                loop_depth = max(0, loop_depth - (words[0] in ("done", "end")))
+            maybe = segment_maybe or block_depth > 0 or repeated
+            # In a loop a command may run again on what it changed (`cd ..`,
+            # X=$X/..): a relative cd or a value read from variables can end
+            # up anywhere.
+            looped = repeated or loop_depth > 0
             # Leading assignments: persistent when alone (X=~/Dev; rm -rf "$X").
             i = 0
             while i < len(words) and _ASSIGNMENT_RE.match(words[i]):
                 i += 1
-            if i == len(words):
-                for w in words:
-                    name, _, value = w.partition("=")
-                    expanded = _expand_shell_word(value, cwd, variables)
-                    variables[name] = expanded if expanded is not None else value
+            j = i  # `builtin export`, `command -p export`, `builtin -- export`
+            while j < len(words) and (words[j] in ("builtin", "command")
+                                      or j > i and words[j].startswith("-")):
+                j += 1
+            declaration = j < len(words) and words[j] in _DECLARATION_BUILTINS
+            if i == len(words) or declaration:
+                if declaration and any(re.fullmatch(r"[-+]\w*[pfF]\w*", w) for w in words[j + 1:]):
+                    continue  # declare -p / -f only print or name functions
+                pairs = [w.partition("=")[::2] for w in (words[j + 1:] if declaration else words)
+                         if _ASSIGNMENT_RE.match(w)]  # skips a flag, or `export X`
+
+                def assign_step(where, vs, pairs=pairs, looped=looped):
+                    for name, value in pairs:
+                        values = assignment_values(value, where, vs)
+                        if _TOO_MANY in values:
+                            _unfollowed_defaults([value], vs)
+                        if looped and re.search(r"[$`]", value):
+                            values.append((_UNKNOWN_NONEMPTY, ""))
+                        values = list(dict.fromkeys(values))
+                        vs[name] = values[0] if len(values) == 1 else _Choices(values)
+                run(assign_step, maybe)
                 continue
-            words = words[i:]
-            while words and (words[0] in _SEGMENT_KEYWORDS
-                             or os.path.basename(words[0]) in _PASSTHROUGH_WRAPPERS):
-                words = words[1:]
+            words = _unwrap_command(words[i:])
             if not words:
                 continue
             name = os.path.basename(words[0])
             args = words[1:]
-            if name in ("cd", "pushd"):
-                dest = args[0] if args else "~"
-                if dest == "-":
-                    cwd = None
+            cd_like = name in ("cd", "pushd", "popd")
+            if cd_like:
+                # zsh takes only its own letters as flags: `cd -bad`, `popd -s`
+                # are operands, and an operand ends the flags. bash fails on
+                # any other `-x` there (`cd -s /tmp`: invalid option).
+                letters = ("n" if name != "cd" else "LPe@") if bash else \
+                    "q" if name == "popd" else "qsLP"
+                flags, operands = [], []
+                for a in args:
+                    if operands or "--" in flags or not re.fullmatch(r"-[%s]+|--" % letters, a):
+                        operands.append(a)
+                    else:
+                        flags.append(a)
+                shapes = operand_shapes(operands, marked_words[len(marked_words) - len(operands):],
+                                        flags, letters, name)
+                # `cd -s` fails when the path has a symlink in it (`/tmp`).
+                no_symlinks = any("s" in f for f in flags if f != "--")
+                # `cd -P` (it wins over -L) ends in the physical folder, its
+                # `..` taken after the link before it (`link/..`).
+                physical = any("P" in f for f in flags if f != "--")
+
+                def resolved(where, side):
+                    side = side.split("\0", 1)[0]  # a syscall stops at a NUL
+                    path = os.path.join(where or "", side)
+                    return os.path.realpath(path) if physical else os.path.normpath(path)
+
+                def symlinked(where, side):
+                    """`cd -s` fails when a folder the operand names is a
+                    symlink; the cwd it starts from isn't checked (`cd -s .`).
+                    Without -P, `..` is taken first (`/tmp/..` is `/`)."""
+                    side = side.split("\0", 1)[0]
+                    base = os.path.realpath(where) if where and not os.path.isabs(side) else "/"
+                    if not physical:
+                        base, side = "/", os.path.normpath(os.path.join(base, side))
+                    for part in side.split("/"):
+                        if part in ("", "."):
+                            continue
+                        if part == "..":
+                            base = os.path.dirname(base)
+                            continue
+                        base = os.path.join(base, part)
+                        if os.path.islink(base):
+                            return True
+                    return False
+                certain = shapes == [tuple(operands)] and not (
+                    name == "popd" and operands and re.search(r"[$`]", operands[0]))
+                dest = operands[0] if operands else "~" if name == "cd" else None
+                rotate = certain and dest is not None and re.fullmatch(r"[+-]\d+", dest) \
+                    and not (bash and name == "cd")
+                # zsh: `too many arguments` (and popd takes only +N/-N): an
+                # error that changes nothing, and the next command runs. bash:
+                # an invalid option, or `pushd -n`/`popd -n` (the stack only).
+                stuck = certain and (len(operands) > 2 and not bash
+                                     or name == "popd" and operands and not rotate
+                                     or bash and (name != "cd" and any(f != "--" for f in flags)
+                                                  or bool(operands) and "--" not in flags
+                                                  and _bash_bad_option(dest, name)))
+                # bash 5 fails on a second operand (`too many arguments`); bash
+                # 3.2 ignores it and goes to the first.
+                first_only = certain and not stuck and bash and len(operands) > 1
+                # The operands the directory step expands itself, as zsh does once.
+                own = len(operands) if not certain else 0 if stuck else 1 if first_only \
+                    else 2 if len(operands) > 1 \
+                    else 1 if operands and name != "popd" and not rotate and dest != "-" else 0
+                if not certain and any(re.search(r"\$\{\w+:{0,2}=|\$\(\(", o) for o in operands):
+                    cwds_overflow = True  # assigns, but which operands the cd takes isn't known
+                rest = args[:len(args) - len(operands)] + operands[own:]
+            if name not in ("for", "select", "rm"):  # cd: `cd /tmp ${Z:=…}` too
+                def expand_step(where, vs, args=rest if cd_like else args):
+                    for a in args:  # `: ${X:=$HOME}`, `echo $((X=1))` assign too
+                        if re.search(r"\$\{\w+:{0,2}=|\$\(\(", a) and _expand_passes(
+                                a, where, vs, trust_pwd, absolute=False,
+                                unknowns=empty_side, empty_side=empty_side) is None:
+                            _unfollowed_defaults([a], vs)
+                run(expand_step, maybe)
+            if cd_like and bash and name == "pushd" and operands and not (
+                    "--" not in flags and not re.search(r"[$`]", dest)
+                    and _bash_bad_option(dest, name)) and (
+                    any(re.fullmatch(r"-n+", f) for f in flags)
+                    and all(re.fullmatch(r"-n+|--", f) for f in flags)
+                    or not certain and "stay" in shapes):
+                # `pushd -n DIR` pushes without going there, so a popd may go
+                # there; an expanded `-n`, or a split DIR (`D=" ~"`), too. An
+                # invalid option pushes nothing.
+                unquoted = _unquoted_expansions(marked_words)
+                for where in cwds:
+                    for word in operands:
+                        passes = _expand_passes(word, where, dict(variables), trust_pwd,
+                                                absolute=False, unknowns=empty_side,
+                                                empty_side=empty_side)
+                        for side in sides_of(passes) if passes is not None else [None]:
+                            known = side and _UNKNOWN_NONEMPTY not in side
+                            for piece in _split_fields(side, ifs) if known and word in unquoted \
+                                    else [side]:
+                                seen.append(os.path.normpath(os.path.join(where or "", piece))
+                                            if known and (where or os.path.isabs(piece))
+                                            else None)
+                seen = list(dict.fromkeys(seen))
+            if cd_like and stuck:
+                if bash:
+                    stack = None
+                continue
+            if cd_like:
+                new = []
+                lost = []  # an operand that expands to a stack index or `-`
+                # A cd that fails leaves the shell where it was. What runs next
+                # there: nothing after `|| exit [N]` (a number or `$?`: `{1,2}`
+                # or "$@" can be too many arguments) ending the command, not in
+                # a pipeline; the command after the and-chain that `&&` starts;
+                # else the next. `set -e` isn't counted: too many ways undo it.
+                may_fail, stay = [], []
+                if not negated and exit_trusted and re.match(
+                        r"\|\|\s*(?:exit|return)(?:[ \t]+(?:(['\"]?)(?:\d+|\$\?)\1))?"
+                                            r"[ \t]*(?:$|[;\n)}]|&&|\|\|)", after):
+                    on_fail = "exit"
+                elif not negated and re.match(r"&&", after):
+                    on_fail = "chain"
                 else:
-                    resolved = _expand_shell_word(dest, cwd, variables)
-                    cwd = os.path.normpath(resolved) if resolved else None
+                    on_fail = "stay"
+
+                def failed(where, path):
+                    may_fail.append(path)
+                    if on_fail != "exit":
+                        (new if on_fail == "stay" else stay).append(where)
+
+                def operand_values(word, where, vs):
+                    """What a cd operand expands to (None: unknown), `~-/sub` too."""
+                    nonlocal cwds_overflow
+                    values = []
+                    for w in stack_dirs(word, where) or [word]:
+                        if not w:
+                            values.append(w)  # None, or a literal ""
+                            continue
+                        passes = _expand_passes(w, where, vs, trust_pwd, absolute=False,
+                                                unknowns=empty_side, empty_side=empty_side)
+                        if passes is None:
+                            cwds_overflow = True
+                        values += [None if side is None or _UNKNOWN_NONEMPTY in side else side
+                                   for side in sides_of(passes)]
+                    return values
+
+                def cd_step(where, vs, dest=dest):
+                    sides = operand_values(dest, where, vs)
+                    if options_set:  # CDABLE_VARS / cdable_vars: `cd D` with no ./D goes to $D
+                        sides += [v for s in sides if s and re.fullmatch(r"[A-Za-z_]\w*", s)
+                                  and not (where and os.path.isdir(os.path.join(where, s)))
+                                  for v in operand_values("${%s}" % s, where, vs) if v]
+                    alt = {}  # `cd NAME` may go to a $CDPATH folder's NAME instead
+                    if cdpath:
+                        for s in [s for s in sides if s and not re.match(r"/|\.\.?(?:/|$)", s)]:
+                            dirs = alt.setdefault(s, [None] if "cdpath" in command else [])
+                            for entries in operand_values("${CDPATH}", where, vs):
+                                dirs += [None] if entries is None else [
+                                    resolved(where, os.path.join(e, s))
+                                    if os.path.isabs(e) or where else None
+                                    for e in entries.split(":") if e]
+                            new.extend(dirs)  # zsh's `cdpath` array isn't followed: None
+                    # With no ./NAME, the cd fails only if no known $CDPATH NAME is a folder.
+                    for side in sides:
+                        if side is None:
+                            new.append(None)
+                        elif re.fullmatch(r"-|[+-]\d+", side):
+                            new.extend(seen + [None])  # `D=+1; cd "$D"`: the stack
+                            lost.append(side)
+                        elif not side:
+                            new.append(where)  # `cd ""` stays put
+                        elif os.path.isabs(side) or where:
+                            path = resolved(where, side)
+                            new.append(path)
+                            elsewhere = any(d and os.path.isdir(d) for d in alt.get(side, ()))
+                            if (not os.path.isdir(path) and not elsewhere
+                                    or no_symlinks and symlinked(where, side)):
+                                failed(where, path)
+                            if looped and not os.path.isabs(side):
+                                new.append(None)
+                        else:
+                            new.append(None)
+                    return None
+
+                def swap_step(where, vs, operands=operands):
+                    olds, news = (operand_values(w, where, vs) for w in operands)
+                    for old in olds or [None]:
+                        for to in news or [None]:
+                            if where is None or old is None or to is None:
+                                new.append(None)
+                            elif old in where:  # `cd /Dev ""` removes it; `cd "" X` prepends
+                                swapped = where.replace(old, to, 1)
+                                path = resolved(where, swapped)
+                                new.append(path)
+                                if not os.path.isdir(path) or no_symlinks and symlinked(where, swapped):
+                                    failed(where, path)
+                            else:
+                                failed(where, old)  # not in $PWD: cd fails
+                    return None
+
+                # The directory stack pushd/popd keep, followed while every step
+                # surely ran once; past what it knows (an inherited entry, `+1`),
+                # anywhere it has been so far, or unknown. zsh options can move
+                # it too: AUTO_PUSHD pushes on every cd, PUSHD_IGNORE_DUPS drops
+                # an older copy, PUSHD_TO_HOME sends a bare pushd home.
+                anywhere = seen + [None]
+                if rotate or maybe or looped or options_set or name == "cd" and stack:
+                    stack = None
+                tilde = dest is not None and _STACK_TILDE_RE.match(dest)
+                if tilde or len(operands) > 1 or not certain:
+                    stack = None
+                if not certain:  # each operand list it may get, in turn
+                    cd_may_go_home = cd_may_go_home or name == "cd" and () in shapes
+                    for ops in shapes:
+                        if ops == "error":  # fails: stays put
+                            run(lambda where, vs: failed(where, where), maybe)
+                        elif ops == "stay":  # bash `pushd $F DIR` with F=-n
+                            new.extend(cwds)
+                        elif ops is None:  # fails, or goes somewhere not known
+                            run(lambda where, vs: failed(where, where), maybe)
+                            new.append(None)
+                        elif len(ops) > 2 and not bash:
+                            new.extend(cwds)
+                        elif bash and name != "cd" and any(re.fullmatch(r"-n+", f) for f in flags) \
+                                and all(re.fullmatch(r"-n+|--", f) for f in flags) \
+                                and not (ops and "--" not in flags and _bash_bad_option(ops[0], name)):
+                            new.extend(cwds)  # `pushd -n`: the stack only
+                        elif bash and (name != "cd" and any(f != "--" for f in flags)
+                                       or ops and "--" not in flags
+                                       and _bash_bad_option(ops[0], name)):
+                            run(lambda where, vs: failed(where, where), maybe)  # a bad option
+                        elif bash and len(ops) > 1:  # fails (bash 5) or goes to the first
+                            run(lambda where, vs: failed(where, where), maybe)
+                            run(lambda where, vs, ops=ops: cd_step(where, vs, ops[0]), maybe)
+                        elif name == "popd" and ops:  # pops for +N/-N, else an error
+                            run(lambda where, vs, w=ops[0]: new.extend(
+                                [where] if all(s is not None and not re.fullmatch(r"[+-]\d+", s)
+                                               for s in operand_values(w, where, vs))
+                                else anywhere + [where]), maybe)
+                        elif name == "popd" or name == "pushd" and not ops:
+                            new.extend(anywhere + [HOME_DIR])  # a +N/-N, a bad operand
+                        elif len(ops) == 2:
+                            run(lambda where, vs, ops=ops: swap_step(where, vs, ops), maybe)
+                        elif ops and re.fullmatch(r"-|[+-]\d+", ops[0]):
+                            new.extend(oldpwd if ops[0] == "-" else anywhere)
+                            if ops[0] == "-" and no_symlinks:
+                                run(lambda where, vs: failed(where, where), maybe)
+                        else:
+                            run(lambda where, vs, ops=ops: cd_step(where, vs, (ops or ("~",))[0]),
+                                maybe)
+                elif rotate:
+                    new = anywhere
+                elif first_only:  # bash 3.2: the first operand; bash 5: fails
+                    run(lambda where, vs: failed(where, where), maybe)
+                    run(cd_step, maybe)
+                elif len(operands) > 1:  # zsh `cd OLD NEW`: OLD in $PWD replaced
+                    run(swap_step, maybe)
+                elif name == "popd" or name == "pushd" and dest is None:
+                    new = stack.pop() if stack else anywhere
+                    if name == "pushd":
+                        new = new + [HOME_DIR]
+                        stack = None
+                elif dest == "-":
+                    new = list(oldpwd)
+                    if no_symlinks and any(o is None or symlinked(None, o) for o in oldpwd):
+                        run(lambda where, vs: failed(where, where), maybe)
+                else:
+                    run(cd_step, maybe)
+                if options_set:  # setopt cdablevars, posixcd, …: anywhere
+                    new = new + [None]
+                # PUSHD_IGNORE_DUPS drops a copy of what's pushed: the cwd included.
+                if lost or may_fail and name == "pushd" or stack is not None and any(
+                        set(entry) & set(new) for entry in stack + [cwds]):
+                    stack = None
+                if may_fail and on_fail == "stay":
+                    cd_may_fail = True
+                if stack is not None and name == "pushd":
+                    stack.append(list(cwds))
+                before_var = variables.get("OLDPWD", os.environ.get("OLDPWD"))
+                if stay:
+                    pending.append((stay, list(oldpwd), before_var))
+                kept = maybe or may_fail and on_fail == "stay"
+                oldpwd = list(dict.fromkeys((oldpwd if kept else []) + cwds))
+                track_oldpwd(cwds, [before_var] if kept else [])
+                cwds = list(dict.fromkeys((cwds if maybe else []) + new)) or [None]
+                seen = list(dict.fromkeys(seen + cwds))
+                if len(cwds) > _MAX_CWDS or len(seen) > _MAX_CWDS:
+                    cwds_overflow, cwds = True, [None]
+                if "PWD" in variables:  # cd resets $PWD to the new cwd
+                    if maybe:
+                        fold([dict(variables), dict(variables, PWD=_Choices(
+                            [(_UNKNOWN_NONEMPTY, "") if c is None else c for c in cwds]))])
+                    else:
+                        del variables["PWD"]
+            elif name in ("for", "select") and args:
+                # zsh's `for f g in …` takes the values in turns: each name may get any.
+                names = list(itertools.takewhile(
+                    lambda a: a not in ("in", "do") and re.fullmatch(r"[A-Za-z_]\w*", a), args))
+
+                def loop_step(where, vs, args=args, names=names, marks=marked_words):
+                    values = _loop_values(args[len(names) - 1:] if names else args, where, vs,
+                                          trust_pwd, empty_side, ifs,
+                                          _unquoted_expansions(marks) if ifs else None)
+                    for n in names or args[:1]:
+                        vs[n] = values
+                    if values is _TOO_MANY:  # the list's ${Z:=…} words went unread
+                        _unfollowed_defaults(args, vs)
+                run(loop_step, maybe)
+            elif name == "read":
+                def read_step(where, vs, args=args):
+                    for a in args:
+                        if re.fullmatch(r"[A-Za-z_]\w*", a):
+                            vs[a] = (_UNKNOWN_NONEMPTY, "")
+                run(read_step, maybe)
+            elif name == "unset":
+                if any(a.startswith("-") and "f" in a for a in args):
+                    continue  # unset -f removes functions, not variables
+
+                def unset_step(where, vs, args=args):
+                    for a in args:
+                        if not a.startswith("-"):
+                            vs[a] = None
+                run(unset_step, maybe)
             elif name == "rm":
-                recursive, targets = _rm_parts(args)
-                if not recursive:
-                    continue
-                recursive_delete = True
-                if protected is None:
-                    protected = _protected_delete_dirs()
-                for t in targets:
-                    for path in _delete_target_paths(t, cwd, variables):
-                        hit = _protected_hit(path, protected)
-                        if hit:
-                            shown = "~" + hit[len(HOME_DIR):] if (
-                                hit == HOME_DIR or hit.startswith(HOME_DIR + os.sep)) else hit
-                            return ("deny", f"Blocked recursive delete of protected folder {shown}")
+                step = check_rm(args, marked_words)
+                denied = step and run(step, maybe)
+                if denied:
+                    return denied
             elif name == "xargs":
-                if any(os.path.basename(a) == "rm" for a in args):
+                # xargs adds its input to the rm's own arguments.
+                inner = _unwrap_command(_shlex_split_safe(_resolve_through_wrappers(
+                    shlex.join(words))))
+                if inner and os.path.basename(inner[0]) == "rm":
+                    step = check_rm(inner[1:], marked_words, bulk=True)
+                    denied = step and run(step, maybe)
+                    if denied:
+                        return denied
+                elif any(os.path.basename(a) == "rm" for a in args):
                     recursive_delete = True
             elif name == "find":
                 if "-delete" in args:
@@ -2528,13 +4030,494 @@ def protected_delete_check(command, cwd=None):
     return None
 
 
+# ── Unguarded-variable delete steer ────────────────────────────────────────
+# `rm -rf "$T/$k"` turns into `rm -rf /` when $T and $k are empty. Claude Code
+# stops for a manual approval on that shape, and no hook or mode can clear
+# that prompt. `"${T:?}/${k:?}"` makes the shell abort instead of deleting
+# when a value is empty, which proves the empty case away at run time, and
+# Claude Code runs it without asking. So instead of letting the LLM vouch for
+# the unguarded form, deny it with the guarded rewrite: the agent re-runs it
+# and nobody is asked. Deliberately stricter than Claude Code's own check: it
+# also covers `"$D"/*` and `/tmp/$k`, which it lets through.
+
+_STEER_PREFIX = "Rewrite needed (smart-permissions, not a refusal): "
+# Stand-ins for characters the shell takes literally (quoted or escaped).
+# shlex drops the quotes, so these are the only record of which were.
+_LITERAL_CHARS = {"$": "\x00", "*": "\x01", "?": "\x02", "[": "\x03", "~": "\x04",
+                  "{": "\x06", "}": "\x07"}
+_LITERAL_DOLLAR = _LITERAL_CHARS["$"]
+_UNMASK = str.maketrans({v: k for k, v in _LITERAL_CHARS.items()})
+_BRACED_PARTS_RE = re.compile(r"^(?P<len>#?)(?P<name>[A-Za-z_]\w*|[0-9]+|[@*!])(?P<op>.*)$", re.S)
+# Never empty: $$, $?, $#, $-, $0. ($! is empty in bash before any `&` job.)
+_NONEMPTY_SPECIAL = frozenset("$?#-0")
+# Command substitutions that never print an empty line.
+_NONEMPTY_SUBSTITUTIONS = frozenset({"pwd", "pwd -P", "pwd -L"})
+_LS_ALL_RE = re.compile(r"\bls\b[^;&|\n]*?\s(?:-[A-Za-z]*a|--all\b)")
+_FOR_LIST_RE = re.compile(r"\b(?:for|select)((?:\s+[A-Za-z_]\w*)+?)\s+in\s+(.*?)(?:;|\n)\s*do\b",
+                          re.S)
+_FOR_PAREN_RE = re.compile(r"\b(?:for|foreach|select)((?:\s+[A-Za-z_]\w*)+)\s*\(")
+_DOT_GLOB_RE = re.compile(r"(?:^|[\s/\"'(=])\.\*(?:[\s/\"')]|$)")
+_ASSIGN_NAME_RE = re.compile(r"(?:^|[\s;&|(`{])(?:(?:export|local|declare|readonly|typeset)\s+(?:-\w+\s+)*)?"
+                             r"([A-Za-z_]\w*)\+?=")
+
+
+def _mask_literals(text):
+    """Swap each `$`, glob character or `~` the shell takes literally for its
+    _LITERAL_CHARS stand-in: single-quoted, double-quoted (except `$`), or
+    escaped with a backslash. `${…}` and `$(…)` inside double quotes are kept.
+    """
+    out = []
+    i, single, double = 0, False, False
+    while i < len(text):
+        c = text[i]
+        if single:
+            single = c != "'"
+            out.append(_LITERAL_CHARS.get(c, c))
+        elif c == "\\" and i + 1 < len(text):
+            out.append(_LITERAL_CHARS.get(text[i + 1], text[i:i + 2]))
+            i += 2
+            continue
+        elif double and c == "$" and text[i + 1:i + 2] in ("{", "("):
+            j = _matching_close(text, i + 1, text[i + 1], "}" if text[i + 1] == "{" else ")")
+            out.append(text[i:j + 1])
+            i = j + 1
+            continue
+        elif double and c in _LITERAL_CHARS and c != "$":
+            out.append(_LITERAL_CHARS[c])
+        elif c == "'" and not double:
+            single = True
+            out.append(c)
+        else:
+            double = double != (c == '"')
+            out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _matching_close(word, i, open_ch, close_ch):
+    """Index of the bracket closing the one at word[i], or len(word) - 1."""
+    depth = 0
+    for j in range(i, len(word)):
+        if word[j] == open_ch:
+            depth += 1
+        elif word[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(word) - 1
+
+
+def _scan_expansions(word):
+    """(start, end, kind, body) for each expansion in an unquoted word.
+
+    kind is "name" ($X, $1, $@), "braced" (${…}, nesting allowed), "subst"
+    ($(…) or `…`) or "arith" ($((…))).
+    """
+    i = 0
+    while i < len(word):
+        c = word[i]
+        if c == "`":
+            j = word.find("`", i + 1)
+            j = len(word) - 1 if j < 0 else j
+            yield i, j + 1, "subst", word[i + 1:j]
+            i = j + 1
+            continue
+        if c != "$" or i + 1 >= len(word):
+            i += 1
+            continue
+        nxt = word[i + 1]
+        if nxt == "{":
+            j = _matching_close(word, i + 1, "{", "}")
+            yield i, j + 1, "braced", word[i + 2:j]
+            i = j + 1
+        elif nxt == "(":
+            j = _matching_close(word, i + 1, "(", ")")
+            body = word[i + 2:j]
+            yield i, j + 1, "arith" if _is_arithmetic(body) else "subst", body
+            i = j + 1
+        else:
+            m = re.match(r"[A-Za-z_]\w*|[0-9]|[@*#?$!-]", word[i + 1:])
+            if m:
+                yield i, i + 1 + m.end(), "name", m.group(0)
+                i += 1 + m.end()
+            else:
+                i += 1
+
+
+def _bound_names(command):
+    """Variables the command itself sets or unsets (=, for, read, select, unset).
+
+    Over-inclusive on purpose: a name counted here only means its expansion
+    needs a guard.
+    """
+    names = set(re.findall(r"(?:^|[\s;&|(`{])(?:export\s+|local\s+|declare\s+(?:-\w+\s+)*|readonly\s+)?"
+                           r"([A-Za-z_]\w*)\+?=", command))
+    for head in re.findall(r"\b(?:for|foreach|select)((?:\s+[A-Za-z_]\w*)+)", command):
+        names.update(itertools.takewhile(lambda n: n != "in", head.split()))  # for f g in …
+    for args in re.findall(r"\b(?:read|unset)\b([^;&|\n]*)", command):
+        names.update(w for w in args.split() if re.fullmatch(r"[A-Za-z_]\w*", w))
+    names.update(re.findall(r"\$\{([A-Za-z_]\w*)(?:::|:)?=", command))  # ${X::=}, ${X:=}
+    return names
+
+
+def _assignments(command):
+    """(name, value text) for each NAME=value in the command.
+
+    The value runs to the first unquoted space or operator outside `$(…)`,
+    so `g=$(echo "$f" | tr a b)` keeps its `$f`. Rough on purpose: a value
+    read too long only marks more names.
+    """
+    out = []
+    for m in _ASSIGN_NAME_RE.finditer(command):
+        i, depth, quote = m.end(), 0, None
+        while i < len(command):
+            c = command[i]
+            if quote:
+                if c == quote:
+                    quote = None
+                elif c == "\\" and quote == '"':
+                    i += 1
+            elif c in "'\"":
+                quote = c
+            elif c == "\\":
+                i += 1
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif depth == 0 and (c.isspace() or c in ";&|"):
+                break
+            i += 1
+        out.append((m.group(1), command[m.end():i]))
+    return out
+
+
+def _dot_entry_vars(command):
+    """Variables that can hold `.` or `..`.
+
+    `ls -a` lists both, and bash 3.2's `.*` glob matches both, so a
+    `rm -rf "$D/$f"` over that list deletes $D's parent. Counts loop
+    variables over such a list (or over a variable holding one), any `read`
+    variable once one appears, values taken from one (`g=$(echo "$f")`),
+    and $1… once `set --` is given one.
+    """
+    assignments = _assignments(command)
+    all_flag = r"[\"']?(?:-[A-Za-z]*a|--all\b)"
+
+    def reads(text, names):
+        return any(re.search(r"\$\{?%s(?!\w)" % re.escape(n), text) for n in names)
+
+    # flags=-a, an inherited one, and copies of either (b=$flags)
+    flag_vars = {n for n, v in assignments if re.match(all_flag, v)} | {
+        n for n, v in os.environ.items() if re.match(all_flag, v)
+        and re.search(r"\$\{?%s(?!\w)" % re.escape(n), command)}
+    while True:
+        more = {n for n, v in assignments if reads(v, flag_vars)} - flag_vars
+        if not more:
+            break
+        flag_vars |= more
+
+    def lists_dots(text):
+        if _LS_ALL_RE.search(text) or _DOT_GLOB_RE.search(text):
+            return True
+        return any(reads(args, flag_vars)  # flags=-a; ls $flags
+                   for args in re.findall(r"\bls\b([^;&|\n]*)", text))
+
+    # `for g; do` and `for g do` loop over "$@".
+    loops = [(n, items) for names, items in _FOR_LIST_RE.findall(command)
+             for n in names.split()] + [
+        (n, '"$@"') for n in re.findall(r"\bfor\s+([A-Za-z_]\w*)(?:\s*[;\n]\s*|\s+)do\b", command)]
+    for m in _FOR_PAREN_RE.finditer(command):  # zsh `for f g (…)`, `foreach f (…)`
+        depth, i = 1, m.end()
+        while i < len(command) and depth:
+            depth += {"(": 1, ")": -1}.get(command[i], 0)
+            i += 1
+        loops += [(n, command[m.end():i]) for n in m.group(1).split()]
+
+    out = {n for n, v in assignments if lists_dots(v)}  # L=$(ls -a)
+    if lists_dots(command):
+        # A pipe, `< <(ls -a …)` or `<<< "$(ls -a …)"` can feed any `read`.
+        for args in re.findall(r"\bread\b([^;&|\n]*)", command):
+            out.update(w for w in args.split() if re.fullmatch(r"[A-Za-z_]\w*", w))
+    while True:
+        new = {n for n, items in loops if lists_dots(items) or reads(items, out)}
+        new |= {n for n, v in assignments if reads(v, out)}  # g=$f, g="$D/$f"
+        if any(reads(args, out) for args in re.findall(r"\bset\b([^;&|\n]*)", command)):
+            new |= {str(k) for k in range(1, 100)} | {"@", "*"}
+        if new <= out:
+            return out
+        out |= new
+
+
+def _classify_target(word, bound, trust_pwd=True):
+    """Classify the expansions in one rm target word, left to right.
+
+    Returns (unguarded, unguardable, components):
+      unguarded   — [(start, end, name)] that may be empty and take a
+                    `${NAME:?}` guard in place;
+      unguardable — [(start, end)] that may be empty and can't ($@, $!,
+                    ${X%…}, ${X:+…}, a command substitution other than pwd);
+      components  — names whose expansion is a whole path component (or
+                    feeds one, as in ${g:-$f}).
+    A guard anywhere earlier in the word covers later uses of the same name:
+    the shell aborts on the first.
+    """
+    unguarded, unguardable, components = [], [], set()
+    guarded = set()
+
+    def may_be_empty(name):
+        if name in guarded:
+            return False
+        if name.isdigit() or name in ("@", "*", "!", "_"):
+            return True
+        return name in bound or not os.environ.get(name)
+
+    def nonempty_word(text):
+        if not text:
+            return False
+        inner_unguarded, inner_unguardable, _ = _classify_target(text, bound, trust_pwd)
+        return not inner_unguarded and not inner_unguardable
+
+    for start, end, kind, body in _scan_expansions(word):
+        whole = ((start == 0 or word[start - 1] == "/")
+                 and (end == len(word) or word[end] == "/"))
+        if kind == "arith":
+            continue
+        if kind == "subst":
+            if not (trust_pwd and body.strip() in _NONEMPTY_SUBSTITUTIONS):
+                unguardable.append((start, end))
+            continue
+        if kind == "name":
+            name = body
+            if whole:
+                components.add(name)
+            if name in _NONEMPTY_SPECIAL or not may_be_empty(name):
+                continue
+            if name in ("@", "*", "!"):
+                unguardable.append((start, end))
+            else:
+                unguarded.append((start, end, name))
+            continue
+        parts = _BRACED_PARTS_RE.match(body)
+        if not parts:
+            unguardable.append((start, end))  # ${!X} indirection and the like
+            continue
+        name, op = parts.group("name"), parts.group("op")
+        if whole:
+            components.add(name)
+            components.update(re.findall(r"\$\{?[#!]?([A-Za-z_]\w*)", op))
+        if parts.group("len"):
+            continue  # ${#X} is a number
+        if op.startswith("::="):  # zsh: always the word
+            if not nonempty_word(op[3:]):
+                unguardable.append((start, end))
+            continue
+        if op in (":-", ":=", "-", "="):
+            op = ""  # an empty default is the plain value
+        if op.startswith(":?"):
+            guarded.add(name)
+            continue
+        if op[:2] in (":-", ":=") and (not may_be_empty(name) or nonempty_word(op[2:])):
+            continue
+        if op == "" or op.startswith("?"):
+            # ${X?} only catches unset, not empty; it takes the same rewrite.
+            if may_be_empty(name):
+                if name in ("@", "*", "!"):
+                    unguardable.append((start, end))
+                else:
+                    unguarded.append((start, end, name))
+            continue
+        if op[:1] in ("-", "=") and not may_be_empty(name):
+            continue  # set and non-empty, so the default is never used
+        unguardable.append((start, end))  # ${X%…}, ${X:+…}, ${X/…}, …
+    return unguarded, unguardable, components
+
+
+def _opaque(expansion, trust_pwd=True):
+    """True when the protected-folder guard can't work out this expansion.
+
+    It follows $X, ${X:-…}, ${X:=…}, ${X:+…} (colon optional) and $(pwd);
+    not ${X%…} and other transforms, ${!X}, $! or any other substitution.
+    """
+    if expansion in ("$@", "$*", "${@}", "${*}"):
+        return False
+    for _s, _e, kind, body in _scan_expansions(expansion):
+        if kind == "subst":
+            return not (trust_pwd and body.strip() in _NONEMPTY_SUBSTITUTIONS)
+        if kind == "name":
+            return body == "!"
+        if kind == "braced":
+            m = re.match(r"([A-Za-z_]\w*|[0-9]+)(?:(?:::=|:?[-=+?])(.*))?$", body, re.S)
+            if not m:
+                return True
+            return any(_opaque(word[s:e], trust_pwd) for word in [m.group(2) or ""]
+                       for s, e, _k, _b in _scan_expansions(word))
+    return False
+
+
+def _guarded_rewrite(word, unguarded):
+    """The target with each unguarded expansion written as ${NAME:?}, quoted.
+
+    Everything goes in double quotes except what only works unquoted: real
+    glob characters, brace expansion and a leading `~/`.
+    """
+    pieces, last = [], 0
+    for start, end, name in unguarded:
+        pieces.append(word[last:start])
+        pieces.append("${%s:?}" % name)
+        last = end
+    pieces.append(word[last:])
+    rewritten = "".join(pieces)
+    runs = []  # [text, quoted]
+
+    def add(text, quoted):
+        if runs and runs[-1][1] == quoted:
+            runs[-1][0] += text
+        else:
+            runs.append([text, quoted])
+
+    braces = 0  # inside a real {a,b}, plain names stay unquoted too
+
+    def add_literal(text):
+        nonlocal braces
+        for ch in text:
+            braces += (ch == "{") - (ch == "}" and braces > 0)
+            if ch in "*?[]{}" or (braces and (ch.isalnum() or ch in "._-,")):
+                add(ch, False)
+            elif ch == _LITERAL_DOLLAR or ch in '"\\`$':
+                add("\\" + ch.translate(_UNMASK), True)
+            else:
+                add(ch.translate(_UNMASK), True)
+
+    last = 0
+    if rewritten.startswith("~"):
+        last = rewritten.find("/") + 1 or len(rewritten)
+        add(rewritten[:last], False)
+    for start, end, _kind, _body in _scan_expansions(rewritten):
+        if start < last:
+            continue
+        add_literal(rewritten[last:start])
+        add(rewritten[start:end], True)
+        last = end
+    add_literal(rewritten[last:])
+    return "".join('"%s"' % text if quoted else text for text, quoted in runs)
+
+
+def unguarded_delete_check(command):
+    """Steer recursive deletes whose target may collapse when a variable is empty.
+
+    Returns ("deny", rewrite-instructions) or None. Applies to a recursive rm
+    target that can land outside the working directory, meaning it starts
+    with `/`, `~`, `$VAR` or `$(…)`. Every expansion in it that may be empty
+    (a variable the command sets or unsets, or one unset or empty in the
+    environment; a command substitution) must carry a `${VAR:?}` guard, unless
+    dropping them all leaves nothing (a bare `rm -rf "$X"` on an empty X
+    deletes nothing). A whole target the hook can't work out (`${X%/}`,
+    `$(cmd)`) asks for a literal path, and so does a `..` after an expansion:
+    neither can be checked against the protected folders. A loop variable fed
+    by `ls -a` or a `.*` glob is refused as a whole path component even when
+    guarded: `..` is not empty.
+    """
+    if not command or "rm" not in command or ("$" not in command and "`" not in command):
+        return None
+    segments, uncertain = split_compound_command(command)
+    if uncertain or not segments:
+        segments = [command]
+    bound = None
+    dot_vars = None
+    trust_pwd = not _PWD_REDEFINED_RE.search(command)
+    for segment in segments:
+        for words in _simple_commands(_shell_words(_mask_literals(segment))):
+            while words and words[0] in _SEGMENT_KEYWORDS:
+                words = words[1:]
+            i = 0
+            while i < len(words) and _ASSIGNMENT_RE.match(words[i]):
+                i += 1
+            words = _unwrap_command(words[i:])
+            if not words or os.path.basename(words[0]) != "rm":
+                continue
+            recursive, targets = _rm_parts(words[1:])
+            if not recursive:
+                continue
+            for t in targets:
+                if not t.startswith(("/", "~", "$", "`")):
+                    continue
+                if bound is None:
+                    bound = _bound_names(command)
+                    dot_vars = _dot_entry_vars(command)
+                unguarded, unguardable, components = _classify_target(t, bound, trust_pwd)
+                shown_t = t.translate(_UNMASK)
+                dotted = sorted(components & dot_vars)
+                if dotted:
+                    shown = ", ".join("$" + n for n in dotted)
+                    return ("deny", _STEER_PREFIX + (
+                        f"`rm` target `{shown_t}` uses {shown}, which comes from a list that can "
+                        "include `.` or `..` (`ls -a`, or a `.*` glob), so this delete could "
+                        "remove the parent folder. List entries with `ls -A`, or delete with "
+                        "`find DIR -mindepth 1 -maxdepth 1 … -exec rm -rf {} +`, then run it again."))
+                expansions = list(_scan_expansions(t))
+                # `$D/../x`, or a `..` glued on (`"$D"../*`: a $D ending in / climbs)
+                if expansions and (re.search(r"(?:^|/)\.\.(?:/|$)", t[expansions[0][0]:]) or any(
+                        t.startswith("..", e) and t[e + 2:e + 3] in ("", "/")
+                        for _s, e, _k, _b in expansions)):
+                    return ("deny", _STEER_PREFIX + (
+                        f"`rm` target `{shown_t}` climbs with `..` after a variable or command "
+                        "substitution, so where it lands can't be checked before it runs. Write "
+                        "the target as the resolved absolute path, without `..`, then run it again."))
+                spans = sorted([(s, e) for s, e, _ in unguarded] + unguardable)
+                if not spans:
+                    continue
+                collapsed, last = [], 0
+                for s, e in spans:
+                    collapsed.append(t[last:s])
+                    last = e
+                collapsed.append(t[last:])
+                collapsed = re.sub(r"/{2,}", "/", "".join(collapsed)).translate(_UNMASK)
+                shown = ", ".join(dict.fromkeys(t[s:e] for s, e in spans)).translate(_UNMASK)
+                if not collapsed:
+                    # `rm -rf ""` deletes nothing, and the protected guard
+                    # follows a plain or defaulted value; not an opaque one.
+                    if not any(_opaque(t[s:e], trust_pwd) for s, e in unguardable):
+                        continue
+                    return ("deny", _STEER_PREFIX + (
+                        f"`rm` target `{shown_t}` is {shown}, whose value can't be checked "
+                        "against the protected folders before it runs. Use a literal absolute "
+                        "path, then run it again."))
+                if unguardable:
+                    return ("deny", _STEER_PREFIX + (
+                        f"`rm` target `{shown_t}` uses {shown}, which may be empty and cannot "
+                        f"take an empty-value guard in place, so the target could become "
+                        f"`{collapsed}`. Use a literal absolute path, or assign the value to a "
+                        "variable first and write it as \"${VAR:?}\", then run it again."))
+                return ("deny", _STEER_PREFIX + (
+                    f"`rm` target `{shown_t}` uses {shown} with no empty-value check, so an "
+                    f"empty or unset value would make it `{collapsed}`. Write the target as "
+                    f"{_guarded_rewrite(t, unguarded)} (the shell then aborts instead of "
+                    "deleting when a value is empty) or use a literal absolute path, then run "
+                    "the command again."))
+    return None
+
+
 def evaluate_bash(command):
     """Evaluate Bash commands, including compound/piped commands.
 
     The protected-delete guard runs first: a recursive delete of a protected
     folder is denied outright, and any other recursive delete is held back
     from a rules allow so the LLM judges it (the "Risky" reason skips the cache).
+    A recursive delete whose target leans on a possibly-empty variable is
+    denied with a guarded rewrite for the agent to run instead.
     """
+    # A protected folder hit even with every unknown value non-empty is a
+    # plain deny. One only an empty value reaches gets the rewrite first: the
+    # agent can act on it, and the rewritten command comes back through here.
+    guard = protected_delete_check(command, HOOK_CWD, empty_side=False)
+    if guard and guard[0] == "deny":
+        return guard
+    steer = unguarded_delete_check(command)
+    if steer:
+        return steer
     guard = protected_delete_check(command, HOOK_CWD)
     if guard and guard[0] == "deny":
         return guard
@@ -2836,12 +4819,14 @@ def _in_arithmetic(command, pos):
 _SHELL_PREFIX_KEYWORDS = ("do", "then", "else", "elif", "if", "while", "until", "!", "{")
 _PREFIX_KEYWORD_RE = re.compile(
     r"^\s*(?:" + "|".join(re.escape(k) for k in _SHELL_PREFIX_KEYWORDS) + r")(?:\s+|$)")
+_ZSH_MODIFIER_RE = re.compile(r"^\s*(?:-|noglob|nocorrect|repeat\s+\S+)(?:\s+|$)")
 
 
 def _strip_leading_keywords(cmd):
-    """Drop leading reserved words: `then rm x` → `rm x`, `if ! grep q f` → `grep q f`."""
+    """Drop leading reserved words: `then rm x` → `rm x`, `if ! grep q f` → `grep q f`.
+    zsh's precommand modifiers go too: `- rm x` and `noglob rm x` run `rm x`."""
     while True:
-        m = _PREFIX_KEYWORD_RE.match(cmd)
+        m = _PREFIX_KEYWORD_RE.match(cmd) or _ZSH_MODIFIER_RE.match(cmd)
         if not m:
             return cmd
         cmd = cmd[m.end():]
@@ -2861,7 +4846,20 @@ def _at_command_position(s, i):
     if j < 0 or s[j] in ";|&(\n{":
         return True
     m = re.search(r"(\S+)$", s[:j + 1])
-    return bool(m) and m.group(1) in _SHELL_PREFIX_KEYWORDS
+    if not m:
+        return False
+    w, start = m.group(1), m.start(1)
+    if w in _SHELL_PREFIX_KEYWORDS:
+        return True
+    # `time`, zsh's `-`/`noglob`/`nocorrect`, `f()`: a prefix of the command
+    # after it, when it stands at command position itself
+    if w in _ZSH_MODIFIERS or w == "time" or re.fullmatch(r"[^\s()]+\(\)", w):
+        return _at_command_position(s, start)
+    prev = re.search(r"(\S+)[ \t]+$", s[:start])
+    if prev and (w == "()" or prev.group(1) == "function"
+                 or (prev.group(1), w == "-p") == ("time", True) or prev.group(1) == "repeat"):
+        return _at_command_position(s, prev.start(1))  # `f ()`, `function f`, `time -p`, `repeat N`
+    return False
 
 
 def _parse_heredoc_marker(command, i):
@@ -3046,6 +5044,7 @@ def split_compound_command(command):
     # arm's PATTERN (between `in`/`;;` and `)`). Pattern alternation
     # `a|b)` is not a pipe and the closing `)` is not a subshell close.
     case_stack = []
+    test_depth = 0  # inside `[[ … ]]`, where && || | are part of the test
 
     while i < len(command):
         c = command[i]
@@ -3090,6 +5089,18 @@ def split_compound_command(command):
 
         # Case keywords (only outside quotes, at a word boundary)
         if not in_single_quote and not in_double_quote:
+            if (command.startswith("[[", i) and _is_word_end(command, i + 2)
+                    and _at_command_position(command, i)):
+                test_depth += 1
+                current.append("[[")
+                i += 2
+                continue
+            if (test_depth and command.startswith("]]", i) and _is_word_end(command, i + 2)
+                    and i > 0 and command[i - 1] in " \t\n"):
+                test_depth -= 1
+                current.append("]]")
+                i += 2
+                continue
             if (command.startswith("case", i) and _is_word_end(command, i + 4)
                     and _at_command_position(command, i)):
                 case_stack.append(False)
@@ -3151,7 +5162,7 @@ def split_compound_command(command):
                 brace_level = max(0, brace_level - 1)
 
             # Only split on operators at top level
-            if paren_level == 0 and brace_level == 0:
+            if paren_level == 0 and brace_level == 0 and not test_depth:
                 if command[i:i+2] in ("&&", "||"):
                     part = "".join(current).strip()
                     if part:
@@ -3201,7 +5212,9 @@ def split_compound_command(command):
 
     uncertain = (in_single_quote or in_double_quote or in_heredoc
                  or bool(pending_heredocs)
-                 or paren_level != 0 or brace_level != 0)
+                 or paren_level != 0 or brace_level != 0 or test_depth != 0)
+
+    parts = [piece for p in parts for piece in _split_short_bodies(p)]
 
     # Post-process: unwrap top-level subshells/groups
     final_parts = []
@@ -3219,6 +5232,76 @@ def split_compound_command(command):
             final_parts.append(p)
 
     return final_parts, uncertain
+
+
+def _word_starts(text):
+    """(offset, word) for each word of `text`, with quotes, $( ), ${ },
+    `( )` and backticks kept inside one word."""
+    words, i, n = [], 0, len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        start, closers, quote = i, [], None
+        while i < n:
+            c = text[i]
+            if quote:
+                if c == "\\" and quote == '"':
+                    i += 1
+                elif c == quote:
+                    quote = None
+            elif c == "\\":
+                i += 1
+            elif c in "'\"`":
+                quote = c
+            elif c == "(" or c == "{" and i > 0 and text[i - 1] == "$":
+                closers.append(")" if c == "(" else "}")
+            elif closers and c == closers[-1]:
+                closers.pop()
+            elif not closers and c.isspace():
+                break
+            i += 1
+        words.append((start, text[start:i]))
+    return words
+
+
+def _split_short_bodies(part):
+    """The commands in a loop or test header whose body needs no `;` first:
+    `for g do rm …` (POSIX), and zsh's `if [[ -d x ]] rm …`,
+    `while (( n )) { rm …; }` and `for f (a b) rm …`. The header and the
+    body come out apart."""
+    words = _word_starts(part)
+    k = 0
+    while True:  # prefixes, and a function head: `f()`, `f ()`, `function f [()]`
+        k += _prefix_length([w for _, w in words[k:]])
+        if k < len(words) and words[k][1] == "function" and k + 1 < len(words):
+            k += 2 + (k + 2 < len(words) and words[k + 2][1] == "()")
+        elif k < len(words) and re.fullmatch(r"[^\s()]+\(\)", words[k][1]):
+            k += 1
+        elif k + 1 < len(words) and words[k + 1][1] == "()":
+            k += 2
+        else:
+            break
+    rest = None
+    names = k + 1
+    while names < len(words) and re.fullmatch(r"[A-Za-z_]\w*", words[names][1]) \
+            and words[names][1] not in ("do", "in"):
+        names += 1
+    if (k < len(words) and words[k][1] in ("for", "select") and names > k + 1
+            and names < len(words) and words[names][1] == "do"):
+        rest = words[names][0]  # `for g do …`, `for f g do …`
+    elif (words[k:] and words[k][1] in ("for", "foreach", "select") and names > k + 1
+          and names + 1 < len(words) and words[names][1].startswith("(")):
+        rest = words[names + 1][0]  # zsh `for f (a b) rm …`
+    elif k < len(words) and words[k][1] == "[[":
+        ends = [j for j in range(k + 1, len(words)) if words[j][1] == "]]"]
+        if ends and ends[0] + 1 < len(words):
+            rest = words[ends[0] + 1][0]
+    elif k + 1 < len(words) and words[k][1].startswith("((") and words[k][1].endswith("))"):
+        rest = words[k + 1][0]
+    if rest is None:
+        return [part]
+    return [part[:rest].strip()] + _split_short_bodies(part[rest:].strip())
 
 
 def _contains_case_start(part):

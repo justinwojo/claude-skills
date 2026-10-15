@@ -2276,6 +2276,21 @@ def test_h1_bash_config_write_guard():
                 f'echo "unterminated > {cfgfile}'):
         check(f'H1 real redirect still flagged: {cmd[:40]}',
               pretool.bash_writes_to_config_path(cmd), True)
+    # Reading a config path while redirecting elsewhere is not a write to it
+    # (observed false positive: `wc -l < <decision log> > log-before.txt`).
+    for cmd in (f'wc -l < {log} > log-before.txt', f'cd /tmp && wc -l < {log} > /tmp/n.txt',
+                f'cat {log} > /tmp/o', f'jq -c . {cfgfile} > /tmp/c.json',
+                f'tail -5 {log} > ~/notes.txt'):
+        check(f'H1 read-then-redirect elsewhere not a config write: {cmd[:50]}',
+              pretool.bash_writes_to_config_path(cmd), False)
+    # ...but a redirect to a config path, one known only at run time, a
+    # relative config-named file, or a non-reader command still is.
+    for cmd in (f'cat > {cfgfile} < /tmp/o', f'cat {log} > "$F"', f'cat {log} > ~+/x',
+                f'cat {cfgfile} > settings.json', f'cat {log} > smart-permissions-llm-flags.json',
+                f'sort -o {cfgfile} x > /tmp/o', f'awk 1 {cfgfile} > /tmp/o',
+                f'tee {cache} < /tmp/o > /dev/null', f'cat {log} > /tmp/o*'):
+        check(f'H1 redirect with a config write flagged: {cmd[:50]}',
+              pretool.bash_writes_to_config_path(cmd), True)
 
 
 def test_llm_wall_clock_deadline():
@@ -2908,6 +2923,691 @@ def test_protected_delete_guard():
           run(PRETOOL, d('cm0gLXJmIH4vRGV2'), cp)[0], 'deny')
 
 
+def test_unguarded_delete_steer():
+    print('\n--- Unguarded-variable deletes: deny with a guarded rewrite, never ask ---')
+    home = tempfile.mkdtemp(prefix='sp-home-')
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    for sub in ('Dev', 'Desktop', 'Documents'):
+        os.makedirs(os.path.join(home, sub))
+    env = {'HOME': home, 'TMPDIR': '/tmp/sp-test-tmpdir/'}
+    os.environ.pop('SP_TEST_UNSET_VAR', None)
+
+    def hook(script, cmd, llm=None, reqs=None, extra=None):
+        """(decision, message) — the deny reason/message the agent sees."""
+        _, cp = _fresh_cfg()
+        e = os.environ.copy()
+        for k in ('SAFETY_HOOK_API_KEY', 'XAI_API_KEY', 'ANTHROPIC_API_KEY', 'SAFETY_HOOK_PROVIDER', 'X'):
+            e.pop(k, None)
+        e.update(env, SMART_PERMISSIONS_CONFIG=cp)
+        e.update(extra or {})
+        if llm is not None:
+            return _run_cfg(script, {'tool_name': 'Bash', 'tool_input': {'command': cmd},
+                                     'cwd': os.path.join(home, 'Dev')},
+                            cp, llm=llm, extra_env=env, requests_log=reqs), None
+        r = subprocess.run([sys.executable, script], capture_output=True, text=True, env=e,
+                           input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': cmd},
+                                             'cwd': os.path.join(home, 'Dev')}))
+        if not r.stdout.strip():
+            return 'ask', None
+        out = json.loads(r.stdout)['hookSpecificOutput']
+        if 'permissionDecision' in out:
+            return out['permissionDecision'], out.get('permissionDecisionReason')
+        return out['decision']['behavior'], out['decision'].get('message')
+
+    # Dangerous vectors are base64 so this file never holds them in plain text.
+    # (vector, the guarded target the agent is told to write)
+    steer = [
+        ('Zm9yIGYgUEFUSCBpbiBhICIiOyBkbyAvYmluL3JtIC1yZiAiL3RtcC8kUEFUSCI7IGRvbmU=', '"/tmp/${PATH:?}"'),  # a later name of `for f PATH in`
+        ('OiAiJHtQQVRIOjo9fSIKL2Jpbi9ybSAtcmYgIi90bXAvJFBBVEgi', '"/tmp/${PATH:?}"'),  # emptied by ${PATH::=}
+        ('VD0kKGdldGNvbmYgREFSV0lOX1VTRVJfVEVNUF9ESVIpOyBmb3IgayBpbiAkKGNvbW0gLTEzIDwoZWNobyAi'
+         'JGEiKSA8KGVjaG8gIiRiIikpOyBkbyBybSAtcmYgIiRULyRrIjsgZG9uZQ==', '"${T:?}/${k:?}"'),
+        ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJEQiLyo=', '"${D:?}/"*'),  # the glob stays unquoted
+        ('WD14OyBybSAtcmYgfi9jYWNoZS8kWA==', '~/"cache/${X:?}"'),  # so does the ~
+        ('WD14OyBybSAtcmYgIi90bXAvYSBiLyRYIi8q', '"/tmp/a b/${X:?}/"*'),  # the space stays quoted
+        ('RD0vdG1wL3g7IHJtIC1yZiAiJEQiL3thLGJ9', '"${D:?}/"{a,b}'),  # brace expansion stays unquoted
+        ('RD0vdG1wL3g7IHJtIC1yZiAiJEQve2EsYn0i', '"${D:?}/{a,b}"'),
+        ('WD14OyBYWT15OyBybSAtcmYgIi90bXAvJFgvJFhZIg==', '"/tmp/${X:?}/${XY:?}"'),  # $X vs $XY
+        ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJEQvKiI=', '"${D:?}/*"'),  # a quoted * stays literal
+        ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJHtEOi19L2xlYWYi', '"${D:?}/leaf"'),  # ${D:-}
+        ('az14OyBybSAtcmYgL3RtcC8kaw==', '"/tmp/${k:?}"'),
+        ('cm0gLXJmICIkU1BfVEVTVF9VTlNFVF9WQVIvZm9vIg==', '"${SP_TEST_UNSET_VAR:?}/foo"'),
+        ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJHtEOj99LyRrIg==', '"${D:?}/${k:?}"'),
+        ('WD0iIjsgcm0gLXJmICIke1g/fS95Ig==', '"${X:?}/y"'),
+        ('Y2QgL3RtcCAmJiBybSAtciAtLSAiJChwd2QpLyRrIg==', '"$(pwd)/${k:?}"'),
+    ]
+    literal = ['cm0gLXJmICIke0QlL30veCI=', 'cm0gLXJmICIke0QjLi99L2J1aWxkIg==',
+               'cm0gLXJmICIkKGZhbHNlKSIvKg==',  # $(…) other than pwd
+               'cm0gLXJmICIkISIvKg==',  # $! is empty before any & job
+               'cm0gLXJmICIvdG1wLyR7IVh9Ig==',  # ${!X}
+               # The whole target, which the protected guard can't follow either.
+               'cm0gLXJmICIkKGVjaG8gIiRIT01FL0Rlc2t0b3AiKSI=', 'cm0gLXJmICIke0hPTUU6MH0i',
+               'cm0gLXJmICIke0hPTUUlL30i', 'WD1IT01FOyBybSAtcmYgIiR7IVh9Ig==',
+               'cHdkKCkgeyA6OyB9OyBybSAtcmYgIiQocHdkKSIvKg==',  # a redefined pwd
+               # $( (…); …) is a command substitution, not arithmetic
+               'cm0gLXJmICIkKCg6KTsgcHJpbnRmICVzICIkSE9NRS9EZXYiKSI=']
+    dot = ['RD0iJEhPTUUvRGV2Igpmb3IgZiBnIGluICQobHMgLWEgIiREIik7IGRvIHJtIC1yZiAiJHtEOj99LyR7Zzo/fSIvKjsgZG9uZQ==', 'RD0iJEhPTUUvRGV2Igpmb3IgZyAoJChscyAtYSAiJEQiKSkgcm0gLXJmICIke0Q6P30vJHtnOj99Ii8q',  # several loop names, zsh's `for g (…)`
+           'RD0vdG1wL3NwLXg7IGZvciBmIGluICIkRCIvLio7IGRvIHJtIC1yZiAiJHtmOj99IjsgZG9uZQ==',
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIGc9JChlY2hvICIkZiIpOyBybSAtcmYgIiR7RDo/fS8ke2c6P30iLyo7IGRvbmU=',
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHNldCAtLSAiJGYiOyBybSAtcmYgIiR7RDo/fS8kezE6P30iLyo7IGRvbmU=',
+           'RD0vdG1wL3NwLXg7IGZsYWdzPS1hOyBscyAkZmxhZ3MgIiREIiB8IHdoaWxlIHJlYWQgZjsgZG8gcm0gLXJmICIke0Q6P30vJHtmOj99Ii8qOyBkb25l',
+           'RD0vdG1wL3NwLXg7IEw9JChscyAtYSAiJEQiKTsgZm9yIGYgaW4gJEw7IGRvIHJtIC1yZiAiJHtEOj99LyR7Zjo/fSIvKjsgZG9uZQ==',
+           'RD0vdG1wL3NwLXg7IGxzIC0tYWxsICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHJtIC1yZiAiJHtEOj99LyR7Zjo/fSIvKjsgZG9uZQ==',
+           'bHMgLWxhICIkRCIgfCB3aGlsZSByZWFkIC1yIGY7IGRvIHJtIC1yZiAiJHtEOj99LyR7Zjo/fSI7IGRvbmU=',
+           # < <(ls -a), <<< "$(ls -a)", a copy g=$f, and .*/
+           'RD0vdG1wL3NwLXg7IHdoaWxlIHJlYWQgLXIgZjsgZG8gcm0gLXJmICIke0Q6P30vJHtmOj99Ii8qOyBkb25lIDwgPChscyAtYSAiJEQiKQ==',
+           'RD0vdG1wL3NwLXg7IHdoaWxlIHJlYWQgLXIgZjsgZG8gcm0gLXJmICIke0Q6P30vJHtmOj99Ii8qOyBkb25lIDw8PCAiJChscyAtYSAiJEQiKSI=',
+           'RD0vdG1wL3NwLXg7IGZvciBmIGluIC4qOyBkbyBnPSRmOyBybSAtcmYgIiR7RDo/fS8ke2c6P30iLyo7IGRvbmU=',
+           'RD0vdG1wL3NwLXg7IGZvciBmIGluIC4qLzsgZG8gcm0gLXJmICIke0Q6P30vJHtmOj99Ii8qOyBkb25l',
+           'dW5zZXQgZzsgRD0iJEhPTUUvRGV2L3giOyBmb3IgZiBpbiAkKGxzIC1hICIkRCIpOyBkbyBybSAtcmYgIiR7RDo/fS8ke2c6LSR7Zjo/fX0iLyo7IGRvbmU=',  # inside a nested default
+           # a copied flags=-a
+           'RD0vdG1wL3NwLXg7IGE9LWE7IGZsYWdzPSRhOyBscyAkZmxhZ3MgIiREIiB8IHdoaWxlIHJlYWQgZjsgZG8gcm0gLXJmICIke0Q6P30vJHtmOj99Ii8qOyBkb25l',
+           'RD0vdG1wL3NwLXg7IGE9LWE7IGZsYWdzPSIkYSI7IGxzICRmbGFncyAiJEQiIHwgd2hpbGUgcmVhZCBmOyBkbyBybSAtcmYgIiR7RDo/fS8ke2Y6P30iLyo7IGRvbmU=',
+           # ${10}, "$@" forwarded into a loop, and `for g; do`
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHNldCAtLSBhIGIgYyBkIGUgZiBnIGggaSAiJGYiOyBybSAtcmYgIiR7RDo/fS8kezEwOj99Ii8qOyBkb25l',
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHNldCAtLSAiJGYiOyBmb3IgZyBpbiAiJEAiOyBkbyBybSAtcmYgIiR7RDo/fS8ke2c6P30iLyo7IGRvbmU7IGRvbmU=',
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHNldCAtLSAiJGYiOyBmb3IgZzsgZG8gcm0gLXJmICIke0Q6P30vJHtnOj99Ii8qOyBkb25lOyBkb25l',
+           # `for g do`, no `;`
+           'RD0vdG1wL3NwLXg7IGxzIC1hICIkRCIgfCB3aGlsZSByZWFkIGY7IGRvIHNldCAtLSAiJGYiOyBmb3IgZyBkbyBybSAtcmYgIiR7RDo/fS8ke2c6P30iLyo7IGRvbmU7IGRvbmU=']
+    protected = ['WD1+L0RvY3VtZW50czsgcm0gLXJmICIke1g6P30i',
+                 'cm0gLXJmICIke0hPTUU6P30vRGVza3RvcCI=',
+                 'cm0gLXJmICIke1NQX1RFU1RfVU5TRVRfVkFSOi0kSE9NRX0vRGVza3RvcCI=',
+                 # ~ in a default word, $(pwd), and export/declare assignments
+                 'cm0gLXJmICR7U1BfVEVTVF9VTlNFVF9WQVI6LX4vRGVza3RvcH0=',
+                 'cm0gLXJmICR7U1BfVEVTVF9VTlNFVF9WQVI6PX4vRGVza3RvcH0vKg==',
+                 'cm0gLXJmICR7UEFUSDorfi9EZXNrdG9wfQ==', 'cm0gLXJmICR7U1BfVEVTVF9VTlNFVF9WQVI6LX59',
+                 'Y2QgIiRIT01FL0RldiIgJiYgcm0gLXJmICIkKHB3ZCkvLi4vRGVza3RvcCI=',
+                 'VD0kKHB3ZCk7IHJtIC1yZiAiJFQvLi4vRGVza3RvcCI=',
+                 'ZXhwb3J0IFg9fi9EZXNrdG9wOyBybSAtcmYgIiR7WDo/fSI=',
+                 # wrappers, builtin/command export, keyword-led assignments,
+                 # for-loop values (globs, splitting, .*), brace expansion
+                 'ZW52IHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'ZW52IC1TICJybSAtcmYgfi9EZXNrdG9wIg==',
+                 'Y29tbWFuZCAtcCBybSAtcmYgfi9EZXNrdG9w',
+                 'bmljZSAtbiAwIHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'dGltZSAtcCBybSAtcmYgfi9EZXNrdG9w',
+                 'ZXhlYyAtYSBybSBybSAtcmYgfi9EZXNrdG9w',
+                 'c3RkYnVmIC1vTCBybSAtcmYgfi9EZXNrdG9w',
+                 'dGltZW91dCA1IHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'c3VkbyAtdSBtZSBybSAtcmYgfi9EZXNrdG9w',
+                 'ZWNobyB4IHwgeGFyZ3Mgcm0gLXJmIH4vRGVza3RvcA==',
+                 'YnVpbHRpbiBleHBvcnQgWD0kSE9NRTsgcm0gLXJmICIkWC9EZXNrdG9wIg==',
+                 'Y29tbWFuZCBleHBvcnQgWD0kSE9NRTsgcm0gLXJmICIke1g6P30vRGVza3RvcCI=',
+                 'YnVpbHRpbiBleHBvcnQgWD1+L0Rlc2t0b3A7IHJtIC1yZiAiJHtYOj99Ig==',
+                 'Zm9yIGkgaW4gMTsgZG8gWD1+L0Rlc2t0b3A7IHJtIC1yZiAiJFgiOyBkb25l',
+                 'aWYgdHJ1ZTsgdGhlbiBYPX4vRGVza3RvcDsgcm0gLXJmICIkWCI7IGZp',
+                 'ISBYPX4vRGVza3RvcDsgcm0gLXJmICIkWCI=',
+                 'Zm9yIGkgaW4gMTsgZG8gWD1+L0Rlc2t0b3A7IHJtIC1yZiAiJHtYOj99IjsgZG9uZQ==',
+                 'Zm9yIFQgaW4gIiRIT01FIjsgZG8gcm0gLXJmICIkVC9EZXNrdG9wIjsgZG9uZQ==',
+                 'Zm9yIFQgaW4gL3RtcC9hICIkSE9NRSI7IGRvIHJtIC1yZiAiJHtUOj99L0Rlc2t0b3AiOyBkb25l',
+                 'Zm9yIGYgaW4gfi8qOyBkbyBybSAtcmYgIiRmIjsgZG9uZQ==',
+                 'cm0gLXJmIH4ve0Rlc2t0b3AsRG9jdW1lbnRzfQ==',
+                 'cm0gLXJmICRIT01FL3tEZXNrdG9wLERvY3VtZW50c30=',
+                 'Zm9yIGYgaW4gIiREIi8uKjsgZG8gcm0gLXJmICIke2Y6P30iOyBkb25l',
+                 'Y2Qgfi9EZXYgJiYgZm9yIGYgaW4gLio7IGRvIHJtIC1yZiAiJGYiOyBkb25l',
+                 'TD0iJEhPTUUgL3RtcC94IjsgZm9yIGYgaW4gJEw7IGRvIHJtIC1yZiAiJGYiOyBkb25l',
+                 # a loop list with an unknown word, cd to a default, assignments
+                 # and cd's that may not run, : ${X:=…}, a zsh brace in a default
+                 'Zm9yIGYgaW4gfi9EZXNrdG9wICQodHJ1ZSk7IGRvIHJtIC1yZiAiJHtmOj99IjsgZG9uZQ==',
+                 'Zm9yIGYgaW4gfi9EZXNrdG9wICQoZWNobyAvdG1wL3gpOyBkbyBybSAtcmYgIiRmIjsgZG9uZQ==',
+                 'Zm9yIGYgaW4gfi9EZXNrdG9wICIiOyBkbyBybSAtcmYgIiRmIjsgZG9uZQ==',
+                 'WD0kKGZhbHNlKTsgZm9yIGYgaW4gJHtYOi1+L0Rlc2t0b3B9OyBkbyBybSAtcmYgIiRmIjsgZG9uZQ==',
+                 'WD0kKGZhbHNlKTsgY2QgJHtYOi0kSE9NRX0gJiYgcm0gLXJmIERlc2t0b3A=',
+                 'WD0kKGZhbHNlKTsgY2QgIiR7WDotJEhPTUV9IiAmJiBybSAtcmYgRGVza3RvcA==',
+                 'WD0kKGZhbHNlKTsgY2QgJHtYOj0kSE9NRX0gJiYgcm0gLXJmIERlc2t0b3A=',
+                 'WD0kKGZhbHNlKTsgcHVzaGQgJHtYOi0kSE9NRX0gJiYgcm0gLXJmIERlc2t0b3A=',
+                 'WD0kKGZhbHNlKTsgY2QgJHtYOi1+L0Rlc2t0b3B9ICYmIHJtIC1yZiAuLyo=',
+                 'Y2QgLVAgfiAmJiBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgLS0gfiAmJiBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcDsgaWYgZmFsc2U7IHRoZW4gY2QgfjsgZmk7IHJtIC1yZiBEZXNrdG9w',
+                 'WD1+L0Rlc2t0b3A7IGlmIGZhbHNlOyB0aGVuIFg9L3RtcC9zcC1zYWZlOyBmaTsgcm0gLXJmICIkWCI=',
+                 'WD1+L0Rlc2t0b3A7IHdoaWxlIGZhbHNlOyBkbyBYPS90bXAvc3Atc2FmZTsgZG9uZTsgcm0gLXJmICIkWCI=',
+                 'WD1+L0Rlc2t0b3A7IGZvciBpIGluOyBkbyBYPS90bXAvc3Atc2FmZTsgZG9uZTsgcm0gLXJmICIkWCI=',
+                 'WD1+L0Rlc2t0b3A7IHVudGlsIHRydWU7IGRvIFg9L3RtcC9zcC1zYWZlOyBkb25lOyBybSAtcmYgIiRYIg==',
+                 'WD1+L0Rlc2t0b3A7IGYoKSB7IFg9L3RtcC9zcC1zYWZlOyB9OyBybSAtcmYgIiRYIg==',
+                 'WD1+L0Rlc2t0b3A7IGlmIHRydWU7IHRoZW4gZWNobzsgWD0vdG1wL3NwLXNhZmU7IGZpOyBybSAtcmYgIiRYIg==',
+                 'WD1+L0Rlc2t0b3A7IGZhbHNlICYmIFg9L3RtcC9zcC1zYWZlOyBybSAtcmYgIiRYIg==',
+                 'WD1+L0Rlc2t0b3A7IHRlc3QgLWQgL3ggfHwgWD0vdG1wL3NwLXNhZmU7IHJtIC1yZiAiJFgi',
+                 'WD1+L0Rlc2t0b3A7IChYPS90bXAvc3Atc2FmZSk7IHJtIC1yZiAiJFgi',
+                 'WD1+L0Rlc2t0b3A7IGVjaG8gfCBYPS90bXAvc3Atc2FmZTsgcm0gLXJmICIkWCI=',
+                 'Zm9yIGkgaW4gMTsgZG8gWD1+L0Rlc2t0b3A7IHJtIC1yZiAiJFgiOyBkb25l',
+                 'WD0kKGZhbHNlKTsgOiAke1g6PSRIT01FfTsgcm0gLXJmICIke1g6P30vRGVza3RvcCI=',
+                 'cm0gLXJmICR7U1BfVEVTVF9VTlNFVF9WQVI6LX4ve0Rlc2t0b3AsRG9jdW1lbnRzfX0=',
+                 # mixed unknowns through assignments and loops, writes that may not run,
+                 # a continued line, several directories, a copied oversized loop value,
+                 # a skipped arithmetic assignment
+                 'WD0kKGZhbHNlKTsgWT0kKHByaW50ZiB4KTsgWj0ke1g6LSR7WTorJEhPTUUvRGV2fX07IHJtIC1yZiAiJHtaOj99Ig==',
+                 'WD0kKGZhbHNlKTsgWT0kKHByaW50ZiB4KTsgZm9yIGYgaW4gIiR7WDotJHtZOiskSE9NRS9EZXZ9fSI7IGRvIHJtIC1yZiAiJHtmOj99IjsgZG9uZQ==',
+                 'dW5zZXQgWDsgZmFsc2UgJiYgOiAiJHtYOj0vdG1wL3NwLXI0fSI7IHJtIC1yZiAiJHtYOi0kSE9NRS9EZXZ9Ig==',
+                 'WD0iJEhPTUUvRGV2IjsgZmFsc2UgJiYgcmVhZCBYOyBybSAtcmYgIiR7WDo/fSI=',
+                 'WD0iJEhPTUUvRGV2IjsgZm9yIFggaW47IGRvIDo7IGRvbmU7IHJtIC1yZiAiJHtYOj99Ig==',
+                 'WD0iJEhPTUUvRGV2IjsgZmFsc2UgJiYgWD0vdG1wL1wKc3AtcjQ7IHJtIC1yZiAiJHtYOj99Ig==',
+                 'Y2QgIiRIT01FIjsgZmFsc2UgJiYgY2QgL3RtcApYPSRQV0QKcm0gLXJmICIke1g6P30vRGV2Ig==',
+                 'Y2QgL3RtcDsgdHJ1ZSAmJiBjZCAiJEhPTUUiCnVuc2V0IFgKcm0gLXJmICIke1g6PSRQV0R9L0RldiI=',
+                 'Y2QgIiRIT01FIgpmb3IgaSBpbiB7MS4uMTd9OyBkbyBmYWxzZSAmJiBjZCAiL3RtcC9zcC1yNC8kaSI7IGRvbmUKcm0gLXJmIERldg==',
+                 'Zm9yIGYgaW4gL3RtcC9zcC1yNC97MS4uNDA5N30gIiRIT01FL0RldiI7IGRvIGc9JGY7IHJtIC1yZiAiJHtnOj99IjsgZG9uZQ==',
+                 'WD0iJEhPTUUvRGV2IjsgOiAiJCgoMCAmJiAoWD0xKSkpIjsgcm0gLXJmICIke1g6P30i',
+                 # a := past the cap, bodies with no `;` before them (`for g do`, zsh
+                 # `if [[ ]] cmd`, `while (( )) { }`, `function f {`, `f() cmd`), zsh
+                 # `-`/noglob/repeat, and popd / `cd -` / `pushd -n` stacks
+                 'Zm9yIGYgaW4gezEuLjQwOTd9OyBkbyA6OyBkb25lOyA6ICR7Wjo9fi9EZXNrdG9wfSRmOyBybSAtcmYgIiRaIg==',
+                 'Zm9yIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZQ==',
+                 'c2VsZWN0IGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZQ==',
+                 'aWYgW1sgLWQgL3RtcCBdXSBybSAtcmYgfi9EZXNrdG9w',
+                 'aWYgW1sgLWQgL3RtcCBdXSB7IHJtIC1yZiB+L0Rlc2t0b3A7IH0=',
+                 'd2hpbGUgW1sgLXogJGQgXV0geyBybSAtcmYgfi9EZXNrdG9wOyBkPTE7IH0=',
+                 'dW50aWwgW1sgLW4gJGQgXV0gcm0gLXJmIH4vRGVza3RvcA==',
+                 'aWYgKCggMSApKSBybSAtcmYgfi9EZXNrdG9w',
+                 'd2hpbGUgKCggMCApKSB7IHJtIC1yZiB+L0Rlc2t0b3A7IH0=',
+                 'ZnVuY3Rpb24gZiB7IHJtIC1yZiB+L0Rlc2t0b3A7IH07IGY=',
+                 'ZnVuY3Rpb24gZigpIHsgcm0gLXJmIH4vRGVza3RvcDsgfTsgZg==',
+                 'ZigpIHJtIC1yZiB+L0Rlc2t0b3A7IGY=',
+                 'LSBybSAtcmYgfi9EZXNrdG9w',
+                 'bm9nbG9iIHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'bm9jb3JyZWN0IHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'cmVwZWF0IDIgcm0gLXJmIH4vRGVza3RvcA==',
+                 'cmVwZWF0IDEgeyBybSAtcmYgfi9EZXNrdG9wOyB9',
+                 'Y2QgfjsgY2QgL3RtcDsgY2QgLTsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgfjsgcHVzaGQgL3RtcDsgcG9wZDsgcm0gLXJmIERlc2t0b3A=',
+                 'cHVzaGQgfjsgcHVzaGQgLXEgL3RtcDsgcG9wZCAtcTsgcm0gLXJmIERlc2t0b3A=',  # zsh has no `pushd -n`
+                 'ZigpIGNkIC90bXA7IGNkIH47IHJtIC1yZiBEZXNrdG9w',
+                 # && inside [[ ]], modifiers before assignments, repeat 0, stack
+                 # operands from variables, an in-word arithmetic default, zsh
+                 # `for f (…)` lists and several loop names, the pushd stack
+                 'aWYgW1sgLWQgIiRIT01FIiAmJiAtZCAvdG1wIF1dIHJtIC1yZiAiJEhPTUUvRGV2Ig==',
+                 'aWYgW1sgLWQgIiRIT01FIiB8fCAtZCAvdG1wIF1dIHJtIC1yZiAiJEhPTUUvRGV2Ig==',
+                 'bm9jb3JyZWN0IGV4cG9ydCBYPSIkSE9NRS9EZXYiOyBybSAtcmYgIiR7WDo/fSI=',
+                 'cmVwZWF0IDEgWD0iJEhPTUUvRGV2Ijsgcm0gLXJmICIke1g6P30i',
+                 'Y2QgIiRIT01FIjsgcmVwZWF0IDAgY2QgL3RtcDsgcm0gLXJmIERldg==',
+                 'WD0iJEhPTUUvRGV2IjsgcmVwZWF0IDAgdW5zZXQgWDsgcm0gLXJmICIke1g6P30i',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgLXEgL3RtcApEPSsxOyBjZCAiJHtEOj99IgpybSAtcmYgRGV2',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgRD0tOyBjZCAiJEQiOyBybSAtcmYgRGV2',
+                 'WD0iJEhPTUUvRGV2IgpybSAtcmYgIiR7WDotJCgoMCAmJiAoWD0xKSkpfSI=',
+                 'Zm9yIGYgKCIkSE9NRS9EZXYiKSBybSAtcmYgIiR7Zjo/fSI=',
+                 'Y2QgfjsgZmFsc2UgJiYgcHVzaGQgL3RtcDsgcG9wZDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgfjsgcHVzaGQgL3RtcDsgcHVzaGQ7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgL3RtcDsgcHVzaGQgfjsgcHVzaGQgL3ZhcjsgcG9wZDsgcm0gLXJmIERlc2t0b3A=',
+                 'Zm9yIGYgZyAoYSAiJEhPTUUvRGV2Iikgcm0gLXJmICIke2c6P30i',
+                 'Zm9yIGYgZyBpbiBhICIkSE9NRS9EZXYiOyBkbyBybSAtcmYgIiR7Zzo/fSI7IGRvbmU=',
+                 # short bodies after `repeat N`, `time`, a function head or `{`;
+                 # a paren-for after them; a ${Z:=…} in a list too big to follow
+                 'cmVwZWF0IDEgaWYgW1sgLWQgL3RtcCBdXSBybSAtcmYgfi9EZXNrdG9w',
+                 'dGltZSBpZiBbWyAtZCAvdG1wIF1dIHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'ZigpIGlmIFtbIC1kIC90bXAgXV0gcm0gLXJmIH4vRGVza3RvcDsgZg==',
+                 'cmVwZWF0IDEgeyBpZiBbWyAtZCAvdG1wIF1dIHJtIC1yZiB+L0Rlc2t0b3A7IH0=',
+                 'ZigpIHsgaWYgW1sgLWQgL3RtcCBdXSBybSAtcmYgfi9EZXNrdG9wOyB9OyBm',
+                 'dGltZSB7IGlmIFtbIC1kIC90bXAgXV0gcm0gLXJmIH4vRGVza3RvcDsgfQ==',
+                 'c2V0IC0tIHg7IHJlcGVhdCAxIGZvciBnIGRvIHJtIC1yZiB+L0Rlc2t0b3A7IGRvbmU=',
+                 'c2V0IC0tIHg7IHRpbWUgZm9yIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZQ==',
+                 'ZigpIGZvciBnIGRvIHJtIC1yZiB+L0Rlc2t0b3A7IGRvbmU7IGYgeA==',
+                 'c2V0IC0tIHg7IHJlcGVhdCAxIHsgZm9yIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZTsgfQ==',
+                 'ZigpIHsgZm9yIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZTsgfTsgZiB4',
+                 'c2V0IC0tIHg7IHRpbWUgeyBmb3IgZyBkbyBybSAtcmYgfi9EZXNrdG9wOyBkb25lOyB9',
+                 'c2V0IC0tIHg7IHsgcmVwZWF0IDEgZm9yIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZTsgfQ==',
+                 'aWYgdHJ1ZTsgdGhlbiByZXBlYXQgMSBmb3IgZyBkbyBybSAtcmYgfi9EZXNrdG9wOyBkb25lOyBmaQ==',
+                 'RD1+L0Rlc2t0b3A7IHNldCAtLSB4OyByZXBlYXQgMSBmb3IgZyBkbyBybSAtcmYgIiR7RDo/fSI7IGRvbmU=',
+                 'cmVwZWF0IDEgZm9yIGcgKH4vRGVza3RvcCkgcm0gLXJmICIkZyI=',
+                 'dGltZSBmb3IgZyAofi9EZXNrdG9wKSBybSAtcmYgIiRnIg==',
+                 'dW5zZXQgWjsgZm9yIGYgaW4gezEuLjQwOTd9ICR7Wjo9fi9EZXNrdG9wfTsgZG8gcm0gLXJmICIkWiI7IGRvbmU=',
+                 'dW5zZXQgWjsgZm9yIGYgaW4gezEuLjQwOTd9JHtaOj1+L0Rlc2t0b3B9OyBkbyBybSAtcmYgIiRaIjsgZG9uZQ==',
+                 'dW5zZXQgWjsgZm9yIGYgaW4gezEuLjQwOTd9OyBkbyA6OyBkb25lOyBmb3IgZyBpbiAke1o6PX4vRGVza3RvcH0kZjsgZG8gcm0gLXJmICIkWiI7IGRvbmU=',
+                 'dGltZSAtcCBpZiBbWyAtZCAvdG1wIF1dIHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'ZnVuY3Rpb24gZiBpZiBbWyAtZCAvdG1wIF1dIHJtIC1yZiB+L0Rlc2t0b3A=',
+                 'ISByZXBlYXQgMSBmb3IgZyBkbyBybSAtcmYgfi9EZXNrdG9wOyBkb25l',
+                 # `[[` after `time`, nested arithmetic parens, a stack index from a
+                 # variable, zsh pushd options, a cd that may fail, later loop names
+                 'aWYgdGltZSBbWyAtZCAiJEhPTUUiICYmIC1kIC90bXAgXV0gcm0gLXJmICIkSE9NRS9EZXYi',
+                 'WD0iJEhPTUUvRGV2IgpybSAtcmYgIiR7WDotJCgoICgoMCkpICsgKFg9MSkgKSl9Ig==',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgLXEgL3RtcDsgcHVzaGQgLXEgLwpEPSsxOyBjZCAiJHtEOj99Igpwb3BkIC1xCnJtIC1yZiBEZXY=',
+                 'c2V0b3B0IHB1c2hkdG9ob21lCmNkICIkSE9NRSI7IHB1c2hkIC1xIC90bXA7IHB1c2hkIC1xIC8KcHVzaGQgLXEKcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApjZCAvZGV2L251bGwgfHwgOgpjZCAtCnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgLXEgL3RtcDsgY2QgLzsgcG9wZCAtcTsgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgY2QgL25vbmV4aXN0ZW50LXNwOyBybSAtcmYgRGV2',
+                 'Y2QgfjsgY2QgL25vbmV4aXN0ZW50LXNwIHx8IHRydWU7IHJtIC1yZiBEZXNrdG9w',
+                 # `for f g do`, `]]` on its own line, zsh `cd OLD NEW`, `~-`/`~+1`
+                 # in cd and rm, ${Z:=…} beside a cd operand, zsh ${Z::=…}
+                 'c2V0IC0tIHg7IGZvciBmIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZQ==',
+                 'c2V0IC0tIHg7IHRpbWUgZm9yIGYgZyBkbyBybSAtcmYgfi9EZXNrdG9wOyBkb25l',
+                 'c2V0IC0tIHg7IHJlcGVhdCAxIGZvciBmIGcgZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZQ==',
+                 'ZigpIGZvciBnIGggZG8gcm0gLXJmIH4vRGVza3RvcDsgZG9uZTsgZiB4',
+                 'aWYgW1sgLWQgIiRIT01FIgpdXSBybSAtcmYgIiRIT01FL0RldiI=',
+                 'd2hpbGUgW1sgLWQgL3RtcApdXSB7IHJtIC1yZiAiJEhPTUUvRGV2IjsgfQ==',
+                 'Y2QgL3RtcC9zcC1yNjsgY2QgL3RtcC9zcC1yNiAiJEhPTUUiOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcC9zcC1yNjsgcHVzaGQgL3RtcC9zcC1yNiAiJEhPTUUiOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FL0Rldi9jbGF1ZGUtc2tpbGxzIjsgY2QgIiRIT01FL0Rldi9jbGF1ZGUtc2tpbGxzIiAiJEhPTUUiOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcC9zcC1yNjsgY2Qgfi07IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcC9zcC1yNjsgcHVzaGQgfi07IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgL3RtcC9zcC1yNjsgcHVzaGQgIiRIT01FIjsgcHVzaGQgL3ZhcjsgY2QgfisxOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcC9zcC1yNjsgcHVzaGQgIiRIT01FIjsgcHVzaGQgL3ZhcjsgY2Qgfi0xOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgcm0gLXJmIH4tL0Rlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgcm0gLXJmIH4rL0Rlc2t0b3A=',
+                 'dW5zZXQgWjsgY2QgL3RtcCAke1o6PSRIT01FL0Rlc2t0b3B9OyBybSAtcmYgIiRaIg==',
+                 'dW5zZXQgWjsgcHVzaGQgL3RtcCAke1o6PSRIT01FL0Rlc2t0b3B9OyBybSAtcmYgIiRaIg==',
+                 'dW5zZXQgWjsgOiAke1o6Oj0kSE9NRS9EZXNrdG9wfTsgcm0gLXJmICIkWiI=',
+                 'dW5zZXQgWjsgOiAke1o6Oj0kSE9NRS9EZXNrdG9wfTsgcm0gLXJmICIke1o6P30i',
+                 'Wj0vdG1wL3g7IDogJHtaOjo9JEhPTUUvRGVza3RvcH07IHJtIC1yZiAiJHtaOj99Ig==',
+                 # a cd that may fail past `&&`/`|| :`/`set +e`, a failed `cd OLD NEW`,
+                 # `cd OLD ""`, a failed `cd ~-/…`, `~-` and $OLDPWD in values,
+                 # pushing the cwd again, `cd "${D::=…}"` expanded once
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyBjZCAvZGV2L251bGwgfHwgOjsgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgY2QgL2Rldi9udWxsICYmIDo7IHJtIC1yZiBEZXY=',
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyBzZXQgK2U7IGNkIC9kZXYvbnVsbDsgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApjZCBfX3NwX25vX21hdGNoX18geCB8fCA6CmNkIC0Kcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FL0RldiI7IGNkIC9EZXYgIiIgJiYgcm0gLXJmIERldg==',
+                 'Y2QgL3RtcDsgY2QgIiRIT01FIgpjZCB+LS8uLi9kZXYvbnVsbCB8fCA6CnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApUPX4tCnJtIC1yZiAiJHtUOj99L0RldiI=',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApmb3IgVCBpbiB+LTsgZG8gcm0gLXJmICIke1Q6P30vRGV2IjsgZG9uZQ==',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApybSAtcmYgIiR7WDotfi19L0RldiI=',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcApybSAtcmYgIiRPTERQV0QvRGV2Ig==',
+                 'Y2QgIiRIT01FIgpwdXNoZCAtcSAvdG1wOyBwdXNoZCAtcSAvdG1wCnBvcGQgLXEKcm0gLXJmIERldg==',
+                 'RD0iJEhPTUUvRGV2IgpjZCAiJHtEOjo9JEQvLi59IgpybSAtcmYgRGV2',
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyBpZiBjZCAvZGV2L251bGw7IHRoZW4gOjsgZmk7IHJtIC1yZiBEZXY=',
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyAhIGNkIC9kZXYvbnVsbDsgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgY2QgL2Rldi9udWxsICYmIGNkIC90bXAgfHwgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIjsgT0xEUFdEPS90bXA7IGNkIC90bXA7IGNkIC07IHJtIC1yZiBEZXY=',
+                 # $OLDPWD kept by a failed cd, `|| exit=1`, errexit turned off in
+                 # or after the leading `set`, `cd ""`
+                 'Y2QgLzsgY2QgL3RtcApPTERQV0Q9IiRIT01FIgpjZCAvZGV2L251bGwgfHwgOgpybSAtcmYgIiR7T0xEUFdEOj99L0RldiI=',
+                 'Y2QgLzsgY2QgL3RtcApPTERQV0Q9IiRIT01FIgpjZCAvZGV2L251bGwgJiYgOgpybSAtcmYgIiR7T0xEUFdEOj99L0RldiI=',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCBleGl0PTEKcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCByZXR1cm49MQpybSAtcmYgRGV2',
+                 'c2V0IC1lICtlCmNkICIkSE9NRSIKY2QgX19zcF9ub19tYXRjaF9fIHgKcm0gLXJmIERldg==',
+                 'c2V0IC1lICtvIGVycmV4aXQKY2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geApybSAtcmYgRGV2',
+                 'c2V0IC1lIC1vIG5vZXJyZXhpdApjZCAiJEhPTUUiCmNkIF9fc3Bfbm9fbWF0Y2hfXyB4CnJtIC1yZiBEZXY=',
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyBzZXQgLXggK2U7IGNkIC9kZXYvbnVsbDsgcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FL0RldiI7IGNkICIiOyBybSAtcmYgLi4vRGV2',
+                 # cd OLD NEW with stack tildes or an empty OLD, too many operands, popd DIR,
+                 # quoted `set "+e"`, `|| exit | true`; set -e isn't trusted (over-denies)
+                 'Y2QgL3RtcDsgY2QgIiRIT01FIjsgY2QgL3RtcDsgY2QgIiRQV0QiIH4tMTsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgY2QgIiRIT01FIjsgY2QgL3RtcDsgY2QgIiRQV0QiIH4xOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgY2QgIiRQV0QiIC90bXAgZXh0cmE7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgIiRQV0QiIC90bXAgZXh0cmE7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgL3RtcDsgcHVzaGQgIiRIT01FIjsgcG9wZCAiJFBXRCIgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgcHVzaGQgIiRIT01FIjsgcG9wZCAvdG1wOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcDsgcHVzaGQgIiRIT01FIjsgcG9wZCAtcSAvdG1wOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgY2QgIiIgL25vL3N1Y2gtc3Atcjc7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgTz07IGNkICIkTyIgL25vL3N1Y2gtc3Atcjc7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgIiIgIiI7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgIiIgL25vL3N1Y2gtc3Atcjc7IHJtIC1yZiBEZXNrdG9w',
+                 'c2V0IC1lOyBzZXQgIitlIgpjZCAiJEhPTUUiCmNkIF9fc3Bfbm9fbWF0Y2hfXyB4CnJtIC1yZiBEZXY=',
+                 'c2V0IC1lOyBzZXQgJytlJwpjZCAiJEhPTUUiCmNkIF9fc3Bfbm9fbWF0Y2hfXyB4CnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCBleGl0IDEgfCB0cnVlCnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCByZXR1cm4gfCB0cnVlCnJtIC1yZiBEZXY=',
+                 'c2V0IC1lOyBjZCAiJEhPTUUiOyBjZCAvZGV2L251bGw7IHJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIjsgY2QgIiIgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+                 'c2V0IC1lOyBjZCB+OyBjZCAvbm9uZXhpc3RlbnQtc3A7IHJtIC1yZiBEZXNrdG9w',
+                 'c2V0IC1ldTsgY2QgIiRIT01FIjsgY2QgL2Rldi9udWxsOyBybSAtcmYgRGV2',
+                 'c2V0IC1ldW8gcGlwZWZhaWwKY2QgIiRIT01FIjsgY2QgL2Rldi9udWxsOyBybSAtcmYgRGV2',
+                 # operands counted after expansion: an empty unquoted `$X` is gone (cd goes
+                 # home), an expanded `-q` is a flag, `$(…)`/braces/"$@" any number; fd numbers
+                 # before a redirection aren't operands; `|| exit {1,2}` doesn't exit
+                 'Y2QgL3RtcDsgWD0KY2QgIiRIT01FIiAkWCAkWApybSAtcmYgRGV2',
+                 'Y2QgIiRIT01FIjsgcHVzaGQgLXEgL3RtcApEPS0wOyBwb3BkIC1xICIkRCIKcm0gLXJmIERldg==',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCBleGl0IHsxLDJ9CnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCByZXR1cm4gezEsMn0Kcm0gLXJmIERldg==',
+                 'c2V0IC0tIDEgMjsgY2QgIiRIT01FIgpjZCBfX3NwX25vX21hdGNoX18geCB8fCBleGl0ICIkQCIKcm0gLXJmIERldg==',
+                 'Y2QgL3RtcApjZCAiJEhPTUUiIDE+JjIgMj4mMQpybSAtcmYgRGV2',
+                 'Y2QgL3RtcApjZCAiJEhPTUUiIDI+JjEKcm0gLXJmIERldg==',
+                 'Y2QgL3RtcApjZCAiJEhPTUUiIDI+L2Rldi9udWxsCnJtIC1yZiBEZXY=',
+                 'Y2QgL3RtcDsgWD07IGNkICRYOyBybSAtcmYgRGV2',
+                 'Y2QgL3RtcDsgRj0tcTsgY2QgIiRGIiAiJEhPTUUiOyBybSAtcmYgRGV2',
+                 'Y2QgL3RtcDsgRj0tLTsgY2QgIiRGIiAiJEhPTUUiOyBybSAtcmYgRGV2',
+                 'Y2QgL3RtcDsgY2QgJCh0cnVlKTsgcm0gLXJmIERldg==',
+                 'Y2QgL3RtcDsgY2Qgey90bXAsIiRIT01FIn07IHJtIC1yZiBEZXY=',
+                 'Y2QgL3RtcDsgWD07IHB1c2hkICRYOyBybSAtcmYgRGV2',
+                 'Y2QgL3RtcApjZCAiJEhPTUUiIHtmZH0+L2Rldi9udWxsCnJtIC1yZiBEZXY=',
+                 'Y2QgIiRIT01FIjsgWD07IGNkICIkWCIgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+                 # a stack tilde in a value is any folder seen; `~$N` is named at run time;
+                 # an unquoted brace group is its words; `|| exit` with exit redefined
+                 'Y2QgL3RtcC9zcC1yODsgY2QgIiRIT01FIjsgY2QgL3RtcDsgVD1+LTE7IGNkICIkVCI7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgdW5zZXQgWDsgcm0gLXJmICR7WDotfi0xfS9EZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgVD1+LTE7IHJtIC1yZiAiJHtUOj99L0Rlc2t0b3Ai',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgVD1+MTsgcm0gLXJmICIke1Q6P30vRGVza3RvcCI=',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgVD0xOyBybSAtcmYgfiR7VDo/fS9EZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgL3RtcDsgVT0tMTsgcm0gLXJmIH4ke1U6P30=',
+                 'VT0kVVNFUjsgcm0gLXJmIH4kVS9EZXNrdG9w',
+                 'Y2QgIiRIT01FL0Rlc2t0b3AiOyBjZCB7fi9EZXNrdG9wLH59OyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcC9zcC1yODsgY2Qgey90bXAvc3Atcjgsfn07IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgL3RtcC9zcC1yODsgcHVzaGQgey90bXAvc3Atcjgsfn07IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2Qge34sRGVza3RvcH07IHJtIC1yZiAuLi9EZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgeyRIT01FLERlc2t0b3B9OyBybSAtcmYgLi4vRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgZXhpdCgpIHsgOjsgfTsgY2QgL25vL3N1Y2gtc3AtcjggfHwgZXhpdDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgZnVuY3Rpb24gZXhpdCB7IDo7IH07IGNkIC9uby9zdWNoLXNwLXI4IHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgcmV0dXJuKCkgeyA6OyB9OyBjZCAvbm8vc3VjaC1zcC1yOCB8fCByZXR1cm47IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgZGlzYWJsZSBleGl0OyBjZCAvbm8vc3VjaC1zcC1yOCB8fCBleGl0OyBybSAtcmYgRGVza3RvcA==',
+                 # zsh's own flag letters only, and only before any operand (`cd -s`
+                 # may fail); a quote inside `${…}`; `|| exit` with a quoted redefinition
+                 'Y2QgIiRIT01FIjsgRD0tcTsgY2QgL3RtcCAiJEQiOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgRD0tYmFkOyBjZCAiJEQiIC90bXA7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgLWJhZCAvdG1wOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgY2QgLXg7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgY2QgLXMgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgRD0tczsgY2QgJEQgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgRD0tcTsgY2QgLS0gIiREIjsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgWD07IGNkICR7WDorIngifTsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgWD07IGNkICR7WC0ieCJ9OyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcDsgWD07IGNkICR7WDorJ3gnfTsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgZnVuY3Rpb24gImV4aXQiIHsgOjsgfTsgY2QgL2Rldi9udWxsIHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgZSJ4Iml0KCkgeyA6OyB9OyBjZCAvZGV2L251bGwgfHwgZXhpdDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgZnVuY3Rpb24gZiBleGl0IHsgOjsgfTsgY2QgL2Rldi9udWxsIHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgYWxpYXNlc1tleGl0XT06OyBjZCAvZGV2L251bGwgfHwgZXhpdDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgZnVuY3Rpb25zIC1jIGYgZXhpdDsgY2QgL2Rldi9udWxsIHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+                 'cm0gLXJmIH4kVVNFUi9EZXNrdG9w',
+                 'cm0gLXJmIH4iJFVTRVIiL0Rlc2t0b3A=',
+                 'cm0gLXJmICJ4IiB+JFVTRVIvRGVza3RvcA==',
+                 # empty quotes don't quote a tilde; `cd -s -` checks the old folder
+                 'cm0gLXJmICcnfi9EZXNrdG9w',
+                 'cm0gLXJmICIifi9EZXNrdG9w',
+                 'cm0gLXJmICcnfiR7VVNFUjo/fS9EZXNrdG9w',
+                 'Y2QgL3RtcDsgY2QgIiRIT01FIjsgY2QgLXMgLTsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgY2QgIiRIT01FIjsgRD0tOyBjZCAtcyAkRDsgcm0gLXJmIERlc2t0b3A=',
+                 # `cd -Ps` takes `..` after the link; `$''` doesn't quote a tilde
+                 'Y2QgIiRIT01FIjsgY2QgLVBzIC90bXAvLi47IHJtIC1yZiBEZXNrdG9w',
+                 'cm0gLXJmICQnJ34vRGVza3RvcA==',
+                 # `~$U` stored in a value; a computed command name may disable `exit`
+                 'Y2QgL3RtcC9zcC1yODsgY2QgIiRIT01FIjsgY2QgL3RtcDsgVT0tMTsgVD1+JFU7IGNkICIkVCI7IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgL3RtcC9zcC1yODsgY2QgIiRIT01FIjsgY2QgL3RtcDsgTj0xOyBUPX4kTjsgY2QgIiRUIjsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgL3RtcDsgVT07IFQ9fiRVOyBjZCAiJFQiOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgL3RtcDsgVT07IFQ9fiRVOyBybSAtcmYgIiR7VDo/fS9EZXNrdG9wIg==',
+                 'Y2QgL3RtcDsgVT07IGZvciBUIGluIH4kVTsgZG8gcm0gLXJmICIke1Q6P30vRGVza3RvcCI7IGRvbmU=',
+                 'Y2QgL3RtcDsgVT07IHVuc2V0IFg7IDogJHtYOj1+JFV9OyBybSAtcmYgIiR7WDo/fS9EZXNrdG9wIg==',
+                 'Y2QgL3RtcDsgVT07IFQ9fiR7VX07IHJtIC1yZiAiJHtUOj99L0Rlc2t0b3Ai',
+                 'Y2QgIiRIT01FIjsgbmFtZT1leGl0OyAkbmFtZSgpIHsgOjsgfTsgY2QgL25vL3N1Y2gtc3AtcjkgfHwgZXhpdDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgIiRIT01FIjsgbmFtZT1yZXR1cm47ICRuYW1lKCkgeyA6OyB9OyBjZCAvbm8vc3VjaC1zcC1yOSB8fCByZXR1cm47IHJtIC1yZiBEZXNrdG9w',
+                 'Y2QgIiRIT01FIjsgbmFtZT1leGl0OyAkbmFtZSgpIHsgOjsgfTsgY2QgL25vL3N1Y2gtc3AtcjkgfHwgZXhpdCAwOyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgYT1kaXM7IGI9YWJsZTsgJGEkYiBleGl0OyBjZCAvbm8vc3VjaC1zcC1yOSB8fCBleGl0OyBybSAtcmYgRGVza3RvcA==',
+                 'Y2QgIiRIT01FIjsgYT1kaXM7IGI9YWJsZTsgYnVpbHRpbiAkYSRiIGV4aXQ7IGNkIC9uby9zdWNoLXNwLXI5IHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+                 # zsh's `$"…"` keeps its `$`; `$'…'` decoded before the exit-trust
+                 # check; a NUL ends the word, as it does for a syscall
+                 'Y2QgL3RtcDsgT0xEUFdEPSIkSE9NRS9EZXYiOyBjZCAkIi90bXAiOyBybSAtcmYgIiRPTERQV0Qi',
+                 'Y2QgL3RtcDsgT0xEUFdEPSIkSE9NRS9EZXYiCiQnXHg2NGlzYWJsZScgZXhpdApjZCAvZGV2L251bGwgfHwgZXhpdApybSAtcmYgIiRPTERQV0Qi',
+                 'Y2QgIiRIT01FIjsgJCdceDY0aXNhYmxlJyBleGl0OyBjZCAvbm8vc3VjaC1zcC1yMTQgfHwgZXhpdDsgcm0gLXJmIERlc2t0b3A=',
+                 'Y2QgLVAgJCcvdG1wXDAnOyBybSAtcmYgIiRIT01FL0RldiI=',
+                 'Y2QgLVAgJCcvdG1wXDBqdW5rJzsgcm0gLXJmICIkSE9NRS9EZXYi',
+                 'Y2QgJCcvdG1wXDBqdW5rJzsgcm0gLXJmICIkSE9NRS9EZXYi',
+                 'cm0gLXJmIH4vRGVza3RvcCQnXDAnL2p1bms=',
+                 'cm0gLXJmICIkSE9NRS9EZXNrdG9wIiQnXHgwMCciL3ggeSI=',
+                 'Y2QgLXMgJCcvdG1wXDAnOyBybSAtcmYgIiRIT01FL0RldiI=',
+                 # a NUL stays in a value (zsh keeps it); a surrogate escape
+                 'VD0kJ1wwJzsgWT0ke1Q6KyRIT01FL0Rldn07IHJtIC1yZiAiJFki',
+                 'dW5zZXQgWDsgOiAkJ1wwJyR7WDo9JEhPTUUvRGV2fTsgcm0gLXJmICIkWCI=',
+                 'Y2QgL3RtcDsgT0xEUFdEPSIkSE9NRS9EZXYiCmVjaG8gJCdcMCciXCIiOyBkaXNhYmxlIGV4aXQKY2QgL2Rldi9udWxsIHx8IGV4aXQKcm0gLXJmICIkT0xEUFdEIg==',
+                 'Y2QgLVAgJCcvdG1wL1xVMDAwMGQ4MDAnOyBybSAtcmYgIiRIT01FL0RldiI=',
+                 'Y2QgLVAgJCcvdG1wL1x1ZDgwMCc7IHJtIC1yZiAiJEhPTUUvRGV2Ig==',
+                 # too many mixes of unknown values to check: denied, not skipped
+                 'WDA9JChmYWxzZSk7WDE9JChmYWxzZSk7WDI9JChmYWxzZSk7WDM9JChmYWxzZSk7WDQ9JChmYWxzZSk7WDU9JChmYWxzZSk7WDY9JChmYWxzZSk7WDc9JChmYWxzZSk7WDg9JChmYWxzZSk7IFk9JChwcmludGYgeCk7IHJtIC1yZiAiJHtYMDotJHtYMTotJHtYMjotJHtYMzotJHtYNDotJHtYNTotJHtYNjotJHtYNzotJHtYODotJHtZOiskSE9NRS9EZXZ9fX19fX19fX19Ig==',
+                 'QT0kKGRhdGUpO0I9JChkYXRlKTtDPSQoZGF0ZSk7RD0kKGRhdGUpO0U9JChkYXRlKTtGPSQoZGF0ZSk7Rz0kKGRhdGUpO0g9JChkYXRlKTsgcm0gLXJmICIvdG1wLyR7QTo/fSR7Qjo/fSR7Qzo/fSR7RDo/fSR7RTo/fSR7Rjo/fSR7Rzo/fSR7SDo/fSIve2EsYixjLGR9e2EsYixjLGR9e2EsYixjLGR9e2EsYixjLGR9e2EsYixjLGR9e2EsYixjLGR9',
+                 # := writes from every pass, mixed unknowns, arithmetic
+                 # assignments, braces in loops, a big brace, command -p export
+                 'Zm9yIGsgaW4gYnVpbGQ7IGRvIHJtIC1yZiAiJHtYOj0kSE9NRS9EZXZ9LyR7azo/fSIgIiRYIjsgZG9uZQ==',
+                 'WD0kKGZhbHNlKTsgcm0gLXJmICIke1g6PSRIT01FL0Rldn0vYnVpbGQiICIkWCI=',
+                 'WD0kKGZhbHNlKTsgWT0kKHByaW50ZiB4KTsgcm0gLXJmICIke1g6LSR7WTorJEhPTUUvRGV2fX0i',
+                 'dW5zZXQgWDsgcm0gLXJmICIvdG1wLyQoKFg9MSkpIiAiJHtYOiskSE9NRS9EZXZ9Ig==',
+                 'Zm9yIGYgaW4gIiRIT01FIi97RGV2LERlc2t0b3B9OyBkbyBybSAtcmYgIiR7Zjo/fSI7IGRvbmU=',
+                 'cm0gLXJmICIkSE9NRSIve0Rldix0bXB9eyxhfXssYn17LGN9eyxkfXssZX17LGZ9eyxnfXssaH0=',
+                 'Y29tbWFuZCAtcCBleHBvcnQgWD0iJEhPTUUvRGV2Ijsgcm0gLXJmICIke1g6P30i',
+                 'YnVpbHRpbiAtLSBleHBvcnQgWD0iJEhPTUUvRGV2Ijsgcm0gLXJmICIke1g6P30i',
+                 'ZGVjbGFyZSBYPX4vRGVza3RvcDsgcm0gLXJmICIke1g6P30i',
+                 # unknown values both ways, unset -f / declare -p, :=, deep nesting
+                 'dW5zZXQgWTsgWD0ke1k6LX07IHJtIC1yZiAiJHtYOi0kSE9NRS9EZXZ9Ig==',
+                 'WD0kKGZhbHNlKTsgcm0gLXJmICIke1g6LSRIT01FL0Rldn0i',
+                 'WD0iJEhPTUUvRGV2IjsgdW5zZXQgLWYgWCB8fCA6OyBybSAtcmYgIiRYIg==',
+                 'WD0iJEhPTUUvRGV2IjsgZGVjbGFyZSAtcCBYPS90bXAvc3AtcjIgfHwgOjsgcm0gLXJmICIkWCI=',
+                 'cm0gLXJmICIke1g6PSRIT01FL0Rldn0vYnVpbGQiICIkWCI=',
+                 'cm0gLXJmICIke0E6LSR7QjotJHtDOi0ke0Q6LSR7RTotJHtGOi0kSE9NRX19fX19fSI=',
+                 'WD0iJEhPTUUvRGV2Ijsgcm0gLXJmICIke1g6LSR7WTo/JChmYWxzZSl9fSI=',
+                 'Y2QgL3RtcDsgUFdEPSRIT01FOyBybSAtcmYgIiRQV0Qi',
+                 'cm0gLXJmICIkSE9NRS9EZXYiICIvdG1wLwUwBSI=',
+                 ]
+
+    for enc, fixed in steer:
+        cmd = d(enc)
+        for name, script in (('pretool', PRETOOL), ('learner', LEARNER)):
+            dec, msg = hook(script, cmd)
+            check(f'steer {name} denies: {enc[:24]}', dec, 'deny')
+            check(f'steer {name} names the rewrite: {enc[:24]}',
+                  bool(msg) and 'Rewrite needed' in msg and fixed in msg, True)
+        reqs = os.path.join(tempfile.mkdtemp(), 'reqs.jsonl')
+        check(f'steer skips the LLM: {enc[:24]}',
+              (hook(PRETOOL, cmd, llm={'safe': True}, reqs=reqs)[0], _requests(reqs)), ('deny', []))
+    for enc in literal:
+        dec, msg = hook(PRETOOL, d(enc))
+        check(f'steer unguardable asks for a literal path: {enc}',
+              (dec, bool(msg) and 'literal absolute path' in msg), ('deny', True))
+    for enc in dot:
+        dec, msg = hook(PRETOOL, d(enc))
+        check(f'steer dot-entry list: {enc[:24]}', (dec, bool(msg) and '`..`' in msg), ('deny', True))
+    for enc in protected:
+        dec, msg = hook(PRETOOL, d(enc))
+        check(f'protected guard sees through ${{X:?}}/${{X:-}}: {enc[:24]}',
+              (dec, bool(msg) and 'protected folder' in msg), ('deny', True))
+    # Read as bash runs them (Linux, Git Bash): split unquoted values, `$"…"`
+    # a plain string, `$'\0'` empty, cd failing on `-q`/`-s` and on a second
+    # operand, `enable -n exit`.
+    bash_protected = [
+        'Y2QgIiRIT01FIjsgY2Qge34sRGVza3RvcH07IHJtIC1yZiBEZXNrdG9w',
+        'Y2QgIiRIT01FIjsgRD0tcTsgY2QgIiREIiAvdG1wOyBybSAtcmYgRGVza3RvcA==',
+        'Y2QgIiRIT01FIjsgY2QgL3RtcDsgY2QgLXMgLjsgcm0gLXJmICIke09MRFBXRDo/fS9EZXNrdG9wIg==',
+        'Y2QgLVAgL3RtcDsgY2QgIiRIT01FIjsgY2QgLXMgLTsgcm0gLXJmIERlc2t0b3A=',
+        'cm0gLXJmICQiJEhPTUUvRGV2Ig==',
+        'Y2QgL3RtcDsgVD0kJ1wwJzsgWT0ke1Q6LSRIT01FL0Rldn07IHJtIC1yZiAiJFki',
+        'WD0iYnVpbGQgJEhPTUUvRGV2Ijsgcm0gLXJmICRY',
+        'WD0iYnVpbGQgJEhPTUUvRGV2Ijsgcm0gLXJmIC90bXAvJFg=',
+        'SUZTPTo7IFg9Ii90bXAvYTokSE9NRS9EZXYiOyBybSAtcmYgJFg=',
+        'SUZTPSRTRVA7IFg9Ii90bXAvYTokSE9NRS9EZXYiOyBybSAtcmYgJFg=',
+        'Y2QgIiRIT01FIjsgY2QgLXEgL3RtcDsgcm0gLXJmIERlc2t0b3A=',
+        'Y2QgIiRIT01FIjsgY2QgL3RtcCAveDsgcm0gLXJmIERlc2t0b3A=',
+        'Y2QgIiRIT01FIjsgRD0iL3RtcCAveCI7IGNkICREOyBybSAtcmYgRGVza3RvcA==',
+        'Y2QgIiRIT01FIjsgZW5hYmxlIC1uIGV4aXQ7IGNkIC9ub3BlIHx8IGV4aXQ7IHJtIC1yZiBEZXNrdG9w',
+        # flags from a value (zsh too), an unknown IFS, IFS in a loop list,
+        # `pushd -n` then popd, `\c@`/`\400` as NUL, cdable_vars
+        'WD0iLXJmICRIT01FL0RldiI7IHJtICRY',
+        'Rj0tcmY7IHJtICRGIH4vRGV2',
+        'Rj0tcmY7IHJtICIkRiIgfi9EZXY=',
+        'U0VQPTosOyBJRlM9JFNFUDsgWD0iYTokSE9NRS9EZXYsYiI7IHJtIC1yZiAkWA==',
+        'SUZTPTo7IFg9Ii90bXAvYTokSE9NRS9EZXYiOyBmb3IgZCBpbiAkWDsgZG8gcm0gLXJmICIkZCI7IGRvbmU=',
+        'Y2QgL3RtcDsgcHVzaGQgLW4gIiRIT01FIjsgcG9wZDsgcm0gLXJmIERldg==',
+        'VD0kJ1xjQCc7IFk9JHtUOi0kSE9NRS9EZXZ9OyBybSAtcmYgIiRZIg==',
+        'VD0kJ1w0MDAnOyBZPSR7VDotJEhPTUUvRGV2fTsgcm0gLXJmICIkWSI=',
+        'c2hvcHQgLXMgY2RhYmxlX3ZhcnM7IEQ9JEhPTUU7IGNkIEQ7IHJtIC1yZiBEZXNrdG9w',
+        'c2V0b3B0IGNkYWJsZXZhcnM7IEQ9JEhPTUU7IGNkIEQ7IHJtIC1yZiBEZXNrdG9w',
+        # `$'\c\\'` and `$'\c\''` end at bash's closing quote; `rm -$F`
+        # splits into a flag and a target; `pushd -n` from a split or an
+        # expanded flag; an unknown IFS of two letters
+        'WD0iYSAkSE9NRS9EZXYiOyBybSAtcmYgJCdcY1xcJyAkWA==',
+        'WD0iYSAkSE9NRS9EZXYiOyBybSAtcmYgJCdcY1wnJyAkWA==',
+        'Rj0iciAkSE9NRS9EZXYiOyBybSAtJEY=',
+        'RD0iICRIT01FIjsgcHVzaGQgLW4gJEQ7IHBvcGQ7IHJtIC1yZiBEZXY=',
+        'RD0iLW4gJEhPTUUiOyBwdXNoZCAkRDsgcG9wZDsgcm0gLXJmIERldg==',
+        'U0VQPXh5OyBJRlM9JFNFUDsgWD0ieCR7SE9NRX0vRGV2eSI7IHJtIC1yZiAkWA==',
+        # a split cd/pushd operand is its words (`-L ~`, `~ /tmp`); CDPATH
+        'RD0iLUwgJEhPTUUiOyBjZCAkRDsgcm0gLXJmIERlc2t0b3A=',
+        'RD0iJEhPTUUgL3RtcCI7IGNkICREOyBybSAtcmYgRGVza3RvcA==',
+        'RD0iJEhPTUUgL3RtcCI7IHB1c2hkICREOyBybSAtcmYgRGVza3RvcA==',
+        'Q0RQQVRIPSRIT01FOyBjZCAvdG1wOyBjZCBEZXY7IHJtIC1yZiAiJFBXRCI=',
+        'Q0RQQVRIPSRIT01FOyBjZCAvdG1wOyBjZCBEZXY7IHJtIC1yZiAuLi9EZXY=',
+        # a blank split operand is a bare `cd`; an expanded `pushd -n` stays;
+        # a missing $CDPATH name fails; ./NAME beside a missing $CDPATH one
+        # is taken; a MYIFS name doesn't hide a literal IFS
+        'Y2QgL3RtcDsgRD0iICAgIjsgY2QgJEQ7IHJtIC1yZiBEZXNrdG9w',
+        'Y2QgIiRIT01FIjsgRD0iLW4gL3RtcCI7IHB1c2hkICREICYmIHJtIC1yZiBEZXNrdG9w',
+        'Y2QgIiRIT01FIjsgQ0RQQVRIPS90bXAvc3AtcjI7IGNkIE5vU3VjaFNwOyBybSAtcmYgRGVza3RvcA==',
+        'Y2QgIiRIT01FIjsgQ0RQQVRIPS90bXAvc3AtcjI7IGNkIERlc2t0b3A7IHJtIC1yZiAiJFBXRCI=',
+        'Y2QgL3RtcDsgSUZTPTo7IE1ZSUZTPTE7IFg9Ii90bXAvc3AtYTokSE9NRS9EZXYiOyBybSAtcmYgJFg=',
+    ]
+    for enc in bash_protected:
+        dec, msg = hook(PRETOOL, d(enc))
+        check(f'protected guard reads it as bash too: {enc[:24]}',
+              (dec, bool(msg) and 'protected folder' in msg), ('deny', True))
+
+    # A non-empty inherited X proves nothing once the command unsets or trims it.
+    inherited = {'X': '/tmp/sp-cache'}
+    dec, msg = hook(PRETOOL, d('dW5zZXQgWDsgcm0gLXJmICIkWCIvKg=='), extra=inherited)
+    check('unset X with an inherited X is denied', dec, 'deny')
+    dec, msg = hook(PRETOOL, d('RD0vdG1wL3NwLXg7IGxzICRTUF9GTEFHUyAiJEQiIHwgd2hpbGUgcmVhZCBmOyBkbyBybSAtcmYgIiR7RDo/fS8ke2Y6P30iLyo7IGRvbmU='), extra={'SP_FLAGS': '-la'})
+    check('an inherited flags=-la lists dot entries', (dec, bool(msg) and '`..`' in msg), ('deny', True))
+    dec, msg = hook(PRETOOL, d('cm0gLXJmICIke1glL3RtcC9zcC1jYWNoZX0iLyo='), extra=inherited)
+    check('${X%…} of an inherited X asks for a literal path',
+          (dec, bool(msg) and 'literal absolute path' in msg), ('deny', True))
+    check('inherited non-empty X is not steered',
+          hook(PRETOOL, 'rm -rf "$X"/*', extra=inherited), ('ask', None))
+    # No-colon operators: an exported empty X is set.
+    dec, msg = hook(PRETOOL, d('cm0gLXJmICIke1grJEhPTUV9Ig=='), extra={'X': ''})
+    check('${X+$HOME} with X exported empty is protected',
+          (dec, bool(msg) and 'protected folder' in msg), ('deny', True))
+    check('${X-$HOME} with X exported empty deletes nothing',
+          hook(PRETOOL, 'rm -rf "${X-$HOME}"', extra={'X': ''}), ('ask', None))
+    # `..` after a value it can't work out: ask for the resolved path.
+    dec, msg = hook(PRETOOL, d('VD0kKGZyb2IpOyBybSAtcmYgIiR7VDo/fS8uLi9EZXNrdG9wIg=='))
+    check('`..` after an unknown value asks for the resolved path',
+          (dec, bool(msg) and 'without `..`' in msg), ('deny', True))
+    for cmd in ['VD0kKGZyb2IpOyBybSAtcmYgIiRUIi4uLyo=', 'VD0kKGZyb2IpOyBybSAtcmYgIiR7VDo/fSIuLg==']:
+        dec, msg = hook(PRETOOL, d(cmd))
+        check(f'a `..` glued after an expansion asks for the resolved path: {cmd[:24]}',
+              (dec, bool(msg) and 'without `..`' in msg), ('deny', True))
+    # A loop can fill X at run time, so ${X:?} must not hide a climb to ~.
+    dec, msg = hook(PRETOOL, d('Zm9yIFggaW4gIiRQV0QiOyBkbyBybSAtcmYgIiR7WDo/fS8uLiI7IGRvbmU='))
+    check('${X:?}/.. on an unknown X stays protected',
+          (dec, bool(msg) and 'protected folder' in msg), ('deny', True))
+
+    # Provably safe or out of scope: not steered. Recursive ones still go to
+    # the LLM; the rest keep their old rule result.
+    llm_review = [
+        'T=$(getconf DARWIN_USER_TEMP_DIR); for k in $(comm -13 <(echo "$a") <(echo "$b")); '
+        'do rm -rf "${T:?}/${k:?}"; done',
+        'rm -rf "$TMPDIR/foo"',
+        'rm -rf build/$k',
+        'rm -rf "${D:-/tmp/fallback}/x"',
+        'ls -la "$D"; for f in a b; do rm -rf "${D:?}/${f:?}"; done',
+        'rm -rf "$SP_TEST_UNSET_VAR"',  # empty → rm -rf "" deletes nothing
+        'rm -rf "$@"',
+        "X=leaf; rm -rf '/tmp/$X'",  # single-quoted: a literal $X
+        'X=leaf; rm -rf /tmp/\\$X',
+        'rm -rf "/tmp/${X:-${Y:?}}/leaf"',  # nested guard
+        'for f in $(ls -a /tmp); do rm -rf "/tmp/cache/pre_${f:?}"; done',  # not a whole component
+        'rm -rf "${X:?}/$X"',  # the first guard covers the second
+        'rm -rf "/tmp/$((1+2))"',
+        # wrappers still reach the LLM; literal loops, braces, an opaque cd
+        'env rm -rf build',
+        'nice -n 5 rm -rf /tmp/sp-x/build',
+        'D=/tmp/sp-x; rm -rf "${D:?}"/{a,b}',
+        'for f in /tmp/sp-x/*; do rm -rf "${f:?}"; done',
+        'cd "$(git rev-parse --show-toplevel)" && rm -rf build',
+        'ls -A /tmp | while read f; do echo "$f"; done; D=$(mktemp -d); rm -rf "${D:?}"/*',
+        # a branch that may not run, a cd that can be followed, a loop with an unknown word
+        'X=/tmp/sp-a; if true; then X=/tmp/sp-b; fi; rm -rf "$X"',
+        'cd /tmp && rm -rf sp-build',
+        'for f in /tmp/sp-x/a $(echo b); do rm -rf "${f:?}"; done',
+        # a dot glob that can't match `.`/`..`; a quoted loop word isn't split
+        'for f in /tmp/.sp-cache*; do rm -rf "${f:?}"; done',
+        'cd "$HOME"; for f in "/tmp/sp Dev"; do rm -rf "${f:?}"; done',
+        # pushd -n doesn't change directory; after `--`, `-P` is the directory
+        'pushd -n "$HOME"; rm -rf Desktop',
+        'cd -- -P; rm -rf Desktop',
+        # popd returns to where pushd left
+        'cd /tmp; pushd "$HOME"; popd; rm -rf Dev',
+        'cd /tmp; pushd ~; pushd /var; popd; popd; rm -rf Desktop',
+        # foreach … end closes its loop; a cd that may fail but stops what follows
+        'foreach f (a); echo "$f"; end\nX="$HOME/Dev"; X=/tmp/sp-r6\nrm -rf "${X:?}"',
+        'cd ~; cd /nonexistent-sp && rm -rf Desktop',
+        'cd ~; cd /nonexistent-sp || exit 1; rm -rf Desktop',
+        # `cd ~-` back to /tmp; `~+` is the cwd
+        'cd /tmp; cd "$HOME"; cd ~-; rm -rf Desktop',
+        'cd /tmp; rm -rf ~+/sp-build',
+        # a literal ${X::=…} target; ~- back to /tmp, through an assignment too
+        'unset X; rm -rf "${X::=/tmp/sp-r7}"',
+        'cd "$HOME"; cd /tmp; cd ~-; cd /tmp; rm -rf Dev',
+        'cd "$HOME"; cd /tmp; T=~-; cd /tmp; rm -rf sp-build',
+        # a failed cd keeps $OLDPWD; a bare `|| exit` stops what follows
+        'cd "$HOME"; cd /tmp; OLDPWD=/tmp; cd /dev/null || :; rm -rf "${OLDPWD:?}/Dev"',
+        'cd "$HOME"; cd /dev/null || exit; rm -rf Dev',
+        # `too many arguments` stays put; `|| exit N && …` still exits
+        'cd /tmp; cd /tmp "$HOME" extra; rm -rf Desktop',
+        'cd "$HOME"; cd /dev/null || exit 1; rm -rf Dev',
+        'cd "$HOME"; cd /dev/null || exit 1 && echo hi; rm -rf Dev',
+        'cd /tmp && rm -rf sp-build',
+        # an empty `$X` operand is gone; a redirection's fd isn't an operand
+        'cd "$HOME"; X=; cd /tmp $X $X; rm -rf Dev',
+        'cd /tmp; cd "$HOME/x" 2>/dev/null || exit 1; rm -rf Dev',
+        'cd /tmp; D=/tmp; cd $D && rm -rf Dev',
+        'cd "$HOME"; cd "$TMPDIR" && rm -rf Dev',
+        'cd "$HOME"; cd $TMPDIR && rm -rf Dev',
+        'cd "$HOME"; cd /dev/null || exit "$?"; rm -rf Dev',
+        '[[ -d /tmp ]] && cd /tmp && rm -rf sp-build',
+        'cd /tmp >/dev/null 2>&1 && rm -rf Dev',
+        # popd of a non-number stays; brace words; `~+` in a value
+        'cd /tmp; N=foo; popd $N; rm -rf Desktop',
+        'cd /tmp; cd {/tmp,/tmp}; rm -rf Desktop',
+        'cd /tmp; T=~+; rm -rf "${T:?}/sp-build"',
+        # `${D:?}`; a quoted `~$U` is a literal name; flags zsh takes
+        'D=/tmp; cd ${D:?}; rm -rf Desktop',
+        'D=/tmp; cd ${D?}; rm -rf Desktop',
+        "rm -rf '~$USER'",
+        'rm -rf \\~\\$USER',
+        'rm -rf "~${USER:?}/cache"',
+        'cd -q /tmp && rm -rf Desktop',
+        'cd "$HOME"; cd -P /tmp && rm -rf Desktop',
+        'cd "$HOME"; cd -s /private/tmp && rm -rf Desktop',
+        'cd "$HOME"; cd /tmp || exit 1; rm -rf Desktop',
+        'cd "$HOME"; cd -s /tmp && rm -rf Desktop',
+        'cd "$HOME"; D=-s; cd $D /tmp && rm -rf Desktop',
+        'cd "$HOME"; pushd /tmp; popd -s; rm -rf Desktop',
+        # a quoted `~`; `$'\x7e'` is a quoted `~`
+        "rm -rf '~'/Desktop",
+        "rm -rf $'\\x7e'/Desktop",
+        # an empty `$U` without a tilde; a literal `~/x` value
+        'cd /tmp; U=; T="$U"; rm -rf "${T:?}/Desktop"',
+        'cd /tmp; T=~/x; rm -rf "${T:?}/sp-build"',
+        # `$""~` is no home in zsh or bash; a NUL inside an unrelated word
+        'rm -rf $""~/Desktop',
+        'cd /tmp; rm -rf $"/x"',
+        "cd /tmp; echo $'a\\0b' c; rm -rf sp-build",
+        # bash: a quoted value isn't split, an unquoted one into safe words;
+        # a second cd operand stays put or takes the first
+        'X="/tmp/sp a"; rm -rf "$X"',
+        'X="/tmp/sp-a /tmp/sp-b"; rm -rf $X',
+        'cd /tmp /x && rm -rf sp-build',
+        'cd "$HOME"; D="/tmp/sp Dev"; cd "$D" && rm -rf Dev',
+        # quoted text beside an unquoted value isn't split; `enable` as a word
+        'X=x; rm -rf "$HOME/Dev safe/"${X:?}',
+        'echo enable; cd "$HOME"; cd /dev/null || exit; rm -rf Dev',
+        # a quoted loop word isn't split at IFS
+        'IFS=:; X="/tmp/sp-a:$HOME/Dev"; for d in "$X"; do rm -rf "$d"; done',
+    ]
+    # past `--` an expanded `-r` is a name, not a flag; a quoted pushd -n
+    # operand isn't split; an invalid option pushes nothing; a cd bash 5
+    # fails and bash 3.2 follows doesn't keep the old folder past `&&`;
+    # `unset IFS` and IFS reads are the default IFS; an expanded `~` is no
+    # home; an expanded `-P` or `pushd -n`; a $CDPATH NAME where ./NAME isn't
+    for cmd in ('F=-r; rm -- "$F" "$HOME/Dev"',
+                'D="$HOME sp"; pushd -n "$D"; popd; rm -rf Dev',
+                'pushd -x "$HOME"; popd; rm -rf Dev',
+                'cd "$HOME"; cd /tmp /x && rm -rf Desktop',
+                'cd "$HOME"; D="-L /tmp"; cd $D && rm -rf Desktop',
+                'cd "$HOME"; D="/tmp /x"; cd $D && rm -rf Desktop',
+                'unset IFS; X="sp:$HOME/Dev"; rm -rf $X',
+                'cd "$HOME"; IFS=" "; D="-L /tmp"; cd $D && rm -rf Desktop',
+                'cd "$HOME"; D="-L ~"; cd $D && rm -rf Desktop',
+                'cd /tmp; D="-P /tmp/.."; cd $D; rm -rf "$PWD"',
+                'cd /tmp; F=-P; cd $F /tmp/..; rm -rf "$PWD"',
+                'cd /tmp; D="-n $HOME"; pushd $D; rm -rf Desktop',
+                'cd /tmp; D="/tmp $HOME"; pushd $D; popd; rm -rf Desktop',
+                'cd /tmp; echo ${#IFS}; X="sp:$HOME/Dev"; rm -rf $X',
+                'cd /tmp; MYIFS=1; X="sp:$HOME/Dev"; rm -rf $X',
+                'cd /tmp; unset -v IFS; X="sp:$HOME/Dev"; rm -rf $X',
+                'cd "$HOME"; CDPATH=/; cd tmp; rm -rf Desktop'):
+        check(f'not a protected deny: {cmd[:40]}', hook(PRETOOL, cmd)[0] != 'deny', True)
+    for cmd in llm_review:
+        check(f'not steered, no LLM falls through: {cmd[:40]}', hook(PRETOOL, cmd), ('ask', None))
+        check(f'not steered, LLM approves: {cmd[:40]}', hook(PRETOOL, cmd, llm={'safe': True})[0], 'allow')
+    for cmd in ('rm -f "$D/$k"', 'git rm -r --cached "$X/foo"', 'echo "rm -rf $X"',
+                'F=-f; rm $F /tmp/sp-x.log', 'rm -f "$TMPFILE"'):
+        check(f'not a recursive rm target: {cmd}', hook(PRETOOL, cmd)[0], 'allow')
+    for cmd in ('repeat 3 if [[ -d /tmp ]] echo hi', 'f() { if [[ -d /tmp ]] echo hi; }; f',
+                'time for g (a b) echo "$g"', 'f() echo hi; f', 'time { git status; }',
+                'if [[ -d /tmp\n]]; then echo hi; fi'):
+        check(f'zsh short form stays allowed: {cmd}', hook(PRETOOL, cmd)[0], 'allow')
+
+
 # ---- LLM-volume fixes: rules that keep routine calls off the LLM ----------
 
 def _bash(cmd):
@@ -3263,6 +3963,7 @@ if __name__ == '__main__':
     test_llm_recheck_flow()
     test_llm_context()
     test_protected_delete_guard()
+    test_unguarded_delete_steer()
 
     # LLM-volume fixes + Anthropic provider
     test_safe_inline_python_allowed()

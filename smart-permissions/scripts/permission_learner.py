@@ -62,6 +62,8 @@ from pretool_safety import (  # noqa: E402
     _reason_is_risky,
     _is_destructive_rm,
     protected_delete_check,
+    unguarded_delete_check,
+    _STEER_PREFIX,
     set_hook_cwd,
     _auto_learn,
     _contains_case_start,
@@ -84,11 +86,11 @@ def _emit_allow():
     }))
 
 
-def _emit_deny():
+def _emit_deny(message="Blocked by safety hook"):
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "deny", "message": "Blocked by safety hook"},
+            "decision": {"behavior": "deny", "message": message},
         }
     }))
 
@@ -114,7 +116,8 @@ def main():
     if verdict == "deny":
         log_decision("permission_request", tool, tool_input, "deny", "learner",
                      reason, duration_ms=_elapsed_ms(start))
-        _emit_deny()
+        # A steer carries rewrite instructions the agent needs to see.
+        _emit_deny(reason if reason.startswith(_STEER_PREFIX) else "Blocked by safety hook")
         return
 
     if verdict == "ask":
@@ -226,9 +229,18 @@ def evaluate_for_learning(tool, tool_input):
 def evaluate_bash_for_learning(command):
     """Classify a bash command for the learner. See evaluate_for_learning.
 
-    A recursive delete of a protected folder is denied; any other recursive
+    A recursive delete of a protected folder is denied; one whose target leans
+    on a possibly-empty variable is denied with a guarded rewrite (the LLM can
+    only guess at what an unguarded variable holds); any other recursive
     delete consults the LLM with a manual-prompt fallback, never approve+learn.
     """
+    # Same order as evaluate_bash: plain deny, rewrite, then the empty case.
+    guard = protected_delete_check(command, pretool_safety.HOOK_CWD, empty_side=False)
+    if guard and guard[0] == "deny":
+        return ("deny", None, guard[1])
+    steer = unguarded_delete_check(command)
+    if steer:
+        return ("deny", None, steer[1])
     guard = protected_delete_check(command, pretool_safety.HOOK_CWD)
     if guard and guard[0] == "deny":
         return ("deny", None, guard[1])
