@@ -1620,7 +1620,7 @@ def test_learner_classification_unchanged():
         ('risky', 'Bash', {'command': 'rm *'}, 'consult', "Risky command pattern — confirm before running"),
         ('C9 bash write', 'Bash', {'command': f'echo x >> {H}/.claude/settings.json'}, 'ask', "Bash write to permission-config path"),
         ('ambiguous parse', 'Bash', {'command': 'echo "unterminated'}, 'ask', "Ambiguous parse — unbalanced quotes or incomplete heredoc"),
-        ('compound unsafe', 'Bash', {'command': 'f() { bash -c x; }; f'}, 'consult', "Interpreter execution in compound block: bash"),
+        ('compound unsafe', 'Bash', {'command': 'f() { bash -c x; }; f'}, 'consult', "Inline interpreter execution: bash"),
         ('interpreter', 'Bash', {'command': 'bash -c whoami'}, 'consult', "Inline interpreter execution: bash"),
         ('wrapped', 'Bash', {'command': 'env evil-tool --wipe'}, 'consult', "Unknown command(s): evil-tool"),
         ('variable', 'Bash', {'command': '$DOCKER run alpine'}, 'consult', "Unknown command(s): $DOCKER"),
@@ -4595,6 +4595,85 @@ def test_phase3_constant_command_word():
     check('C9 through a constant reaches the human', out, _C9)
 
 
+def test_phase4_bodies_built_words_env():
+    print('\n--- Phase 4: function bodies, words built at run time, environment hazards ---')
+    hard = d('Z2l0IHJlc2V0IC0taGFyZA==')            # the hard reset
+    asks = [
+        # every function body form is judged like the top level
+        f'f() ( {hard} ); f', f'f() {hard}; f', 'f() { frob; }; f', 'f() ( frob ); f',
+        # a word built at run time where it decides the verdict
+        'git $S --hard', 'git reset --h{a..a}rd', 'git $(echo reset) --hard', 'git -c $K log',
+        'git checkout $B', 'git -C $W stash drop', 'git -C $W status', 'git -c "$K" log',
+        'git -C "$@" status', 'git re* --hard', 'flutter pub pub{lish,}',
+        'docker volume $V x', 'docker compose down $V', 'chmod -R $M .', 'az {group,x} list',
+        # environment that makes an allowed command run other code
+        'GIT_SSH_COMMAND="sh -c id" git fetch', 'env GIT_SSH_COMMAND="sh -c id" git fetch',
+        'export PAGER="frob x"; git log', 'LD_PRELOAD=/tmp/x.so ls', 'DYLD_INSERT_LIBRARIES=/tmp/x ls',
+        "GIT_CONFIG_PARAMETERS=\"'core.pager=frob'\" git log", 'X=1 GIT_PAGER=$P git log',
+        'GIT_EXTERNAL_DIFF=frob git diff', 'declare -x EDITOR=frob; git commit',
+        # review round 1: each was allowed by the first version of these rules
+        'spctl --status --master-${ACTION}', 'git -c alias.wipe=reset wipe --h{a..a}rd',
+        'env -S "git $S"', 'git -C "${a[@]}" status',
+        'GIT_SSH_COMMAND="sh -c id PAGER=cat" git fetch',
+        '2>/dev/null GIT_SSH_COMMAND="sh -c id" git fetch', 'X=1 >f GIT_PAGER=frob git log',
+        'env "LD_PRELOAD"=/tmp/x.so ls', 'export "GIT_SSH_COMMAND"="sh -c id"; git fetch',
+        'nice env PAGER=frob git log', 'command export PAGER=frob', 'env -S "PAGER=frob git" log',
+        'PAGER+=frob git log',
+        # review round 2
+        '< <(printf x) GIT_SSH_COMMAND="sh -c id" git fetch', "env -S 'git ${S} --hard'",
+        'env -S LD_PRELOAD=/tmp/x.so ls', "env -S 'env LD_PRELOAD=/tmp/x.so ls'",
+        'builtin export GIT_SSH_COMMAND="sh -c id"; git fetch',
+        'export GIT_SSH_COMMAND=git; export GIT_SSH_COMMAND+=cat; git fetch',
+        'PAGER=frob cat <<EOF \\\n a b c d e\nx\nEOF',
+        # review round 3 and Grok: an `env` option the wrapper reader doesn't know, a name
+        # built at run time, an array assignment, an empty word before the setting
+        'env -S X=1 LD_PRELOAD=/tmp/x.so ls', 'env -C /tmp/ GIT_SSH_COMMAND="sh -c id" git fetch',
+        'K=LD_PRELOAD; export "$K=/tmp/x.so"; ls', 'LD_PRELOAD=(/tmp/x.so) ls',
+        'GIT_SSH_COMMAND=(sh -c id) git fetch', 'LD_PRELOAD+=(/tmp/x.so) ls', 'export "" PAGER=frob',
+        '>PAGER=x PAGER=frob git log',
+        # review round 4: a name built by braces or a substitution, a quoted operator word,
+        # zsh's "$a[@]", an element write into an exported scalar
+        'export LD_PRELO{AD,AD}=/tmp/x.so; ls', 'export `echo LD_PRELOAD`=/tmp/x.so; ls',
+        'export ">" LD_PRELOAD=/tmp/x.so; ls', 'a=(. x y); git -C "$a[@]"',
+        'export LD_PRELOAD=; LD_PRELOAD[1]=/tmp/x.so ls',
+        # review round 5: a glob in the name, a quoted operator as a file name, an
+        # arithmetic index; a redirection's file name now counts like any word
+        'export GIT_PAG[E]R=frob; git log', '> ">" LD_PRELOAD=/tmp/x.so ls',
+        'export LD_PRELOAD=; LD_PRELOAD[1==1]=/tmp/x.so ls', 'git log > PAGER=x',
+    ]
+    allows = [
+        'f() { ls; }; f', 'f() { if [[ -d /tmp ]] echo hi; }; f', 'f() { ls; } > /tmp/o; f',
+        'f() ( ls ); f', 'function f { git status; }; f',
+        # built words outside deciding positions keep their verdict
+        'git status', 'git log $R', 'git show HEAD:$f', 'chmod +x $F', 'git log -n $N',
+        'git diff --stat {a,b}.txt', 'git -C "$HOME/x" status', 'ls *.py',
+        # harmless or empty values, and assignments that are only text
+        'GIT_PAGER=cat git log', 'GIT_PAGER="less -R" git log', 'GIT_EDITOR=true git commit -m x',
+        'GIT_PAGER= git log', 'echo PAGER=x', 'PAGER=less git log', 'grep -r LD_PRELOAD= .',
+        'echo env PAGER=frob', 'echo export LD_PRELOAD=/tmp/x.so', 'spctl --status',
+        'git -C "${HOME}/x" status', 'git -C "$(pwd)" status', 'git -C "$HOME/work@2" status',
+        'git commit -m "PAGER=frob x"', 'git -C "$HOME/work[@]" status',
+        'echo PAGER=frob echo', 'builtin echo PAGER=frob', 'X="note PAGER=frob" git status',
+    ]
+    _phase3_check('Phase 4', [], asks, allows)
+    res = _both_hooks(['f() { frob; }; f', 'git $S --hard', 'LD_PRELOAD=/tmp/x.so ls'])
+    check('an unknown in a function body is named', res[0][1], 'Unknown command(s): frob (logged)')
+    check('a built git word names its reason', res[1][1],
+          'Risky git with a word built at run time where it decides the verdict ($S) — LLM review')
+    check('a loader variable names its reason', res[2][1], 'Sets LD_PRELOAD to run other code (/tmp/x.so)')
+    code = ('import sys, json\nsys.path.insert(0, %r)\nimport pretool_safety as p\n'
+            'print(json.dumps([p._extract_json_decision(c) for c in json.loads(sys.stdin.read())]))\n'
+            ) % SCRIPT_DIR
+    texts = ['Sure:\n```json\n{"safe": true, "reason": "ok"}\n```',
+             'It uses {a,b} braces. {"x": 1} {"safe": false, "reason": "a } in text"}',
+             'no json here', '{"safe": "yes"}']
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                         input=json.dumps(texts)).stdout
+    check('JSON decision found in fences and prose', json.loads(out or 'null'),
+          [{'safe': True, 'reason': 'ok'}, {'safe': False, 'reason': 'a } in text'}, None,
+           {'safe': 'yes'}])
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -4710,6 +4789,7 @@ if __name__ == '__main__':
     test_phase3_wrappers_after_assignments()
     test_phase3_scratch_deletes()
     test_phase3_constant_command_word()
+    test_phase4_bodies_built_words_env()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

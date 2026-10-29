@@ -36,8 +36,10 @@ import time
 import threading
 import hashlib
 import glob
+import collections
+import functools
 import itertools
-from fnmatch import fnmatch
+from fnmatch import fnmatch, translate
 from datetime import datetime
 import urllib.request
 import urllib.error
@@ -97,14 +99,8 @@ def load_config():
     Scalar values and objects are replaced by user overrides.
     Entries starting with '__ ' are section comments — stripped before use.
 
-    Returns (config, defaults_safe_commands, removals):
-      - config: the fully merged config (defaults + platform + user − removals)
-      - defaults_safe_commands: the raw shipped safe_commands (defaults.json +
-        platform overlay) BEFORE user merge/subtraction — anchors C0's
-        restricted-family set so user config can never demote a shipped
-        multi-word family back to unknown-allow.
-      - removals: the user's remove_from_defaults map (allowlist keys only),
-        used by C0 (subtracted safe_commands bases stay restricted).
+    Returns (config, defaults_ok): the fully merged config (defaults +
+    platform + user − removals), and False when defaults.json failed to load.
     """
     # Load defaults
     defaults_ok = True
@@ -137,10 +133,6 @@ def load_config():
                     config[key] = value
         except (OSError, json.JSONDecodeError):
             pass  # No platform overlay — use base defaults
-
-    # Snapshot the shipped safe_commands (defaults + platform) before the
-    # user's config can touch it — this is C0's subtraction-proof anchor.
-    defaults_safe_commands = list(config.get("safe_commands", []))
 
     # Load user overrides, bootstrapping the file if it doesn't exist
     try:
@@ -220,18 +212,16 @@ def load_config():
 
     # Apply remove_from_defaults LAST (after defaults + overlay + user union),
     # ONLY for allowlist keys. Deny/prompt lists are never subtractable.
-    removals = {}
     raw_removals = user.get("remove_from_defaults", {})
     if isinstance(raw_removals, dict):
         for key, vals in raw_removals.items():
             if key not in SUBTRACTABLE_KEYS or not isinstance(vals, list):
                 continue
-            removals[key] = list(vals)
             if isinstance(config.get(key), list):
                 drop = set(vals)
                 config[key] = [x for x in config[key] if x not in drop]
 
-    return config, defaults_safe_commands, removals, defaults_ok
+    return config, defaults_ok
 
 
 IS_WINDOWS = sys.platform == "win32"
@@ -260,7 +250,7 @@ def _strip_comments(items):
 
 
 # Load configuration once at module level
-_CONFIG, _DEFAULTS_SAFE_COMMANDS, _REMOVALS, _DEFAULTS_OK = load_config()
+_CONFIG, _DEFAULTS_OK = load_config()
 
 # their-M1: if the shipped defaults failed to load, all safety lists are empty.
 # A permission hook must FAIL CLOSED — evaluate()/classify_request() return
@@ -330,90 +320,6 @@ INTERPRETER_EXEC_FLAGS = {
     for k, v in (_raw_interp.items() if isinstance(_raw_interp, dict) else [])
     if isinstance(v, list)
 }
-
-
-# ============================================================
-# C0 — RESTRICTED-FAMILY ENFORCEMENT (learner-side)
-# ============================================================
-# A "restricted base" is a command whose destructive subcommands are gated:
-# it appears only as multi-word/wildcard safe_commands entries, never as a
-# bare single-word entry. The learner classifies such a base apart from a
-# plain unknown (`docker run`, `npm publish`, …), so the log says why the
-# call went to the LLM or the human.
-
-def _restricted_first_word(entry):
-    """First real word of a multi-word/wildcard safe_commands entry.
-
-    "docker build *" → "docker"; "kubectl get*" → "kubectl";
-    single-word wildcard "kube*" → "kube". Returns None for empties.
-    """
-    toks = entry.split()
-    if not toks:
-        return None
-    first = toks[0].rstrip("*?")
-    return first or None
-
-
-def _compute_restricted_bases(safe_commands):
-    """Bases that appear ONLY as multi-word/wildcard entries in `safe_commands`.
-
-    A base present as a bare single-word entry is NOT restricted — explicit
-    single-word trust is the documented override.
-    """
-    singles = set(
-        c for c in safe_commands
-        if isinstance(c, str) and not c.startswith("__ ")
-        and " " not in c and "*" not in c and "?" not in c
-    )
-    restricted = set()
-    for c in safe_commands:
-        if not isinstance(c, str) or c.startswith("__ "):
-            continue
-        if " " in c or "*" in c or "?" in c:
-            base = _restricted_first_word(c)
-            if base and base not in singles:
-                restricted.add(base)
-    return restricted
-
-
-# Two components (see plan C0, as amended — a plan defect fix):
-#  1. defaults-anchored — from raw shipped defaults + overlay, immune to
-#     user subtraction (docker/npm/… can never be demoted to unknown-allow).
-#     Every known-dangerous family (docker, npm, gh, terraform, kubectl,
-#     cargo, helm, pip, yarn, ansible*, …) ships here.
-#  2. subtracted safe_commands first words — removing `rm`/`docker build *`
-#     means "ask me", never "unknown → allow".
-#
-# The plan's third component — "merged-multi-only", any live-config base
-# appearing only as multi-word entries — was DROPPED: in the merged config an
-# entry the retired learning feature wrote ("foo bar") looks exactly like a
-# hand-authored multi-only family. The defaults component already covers
-# every shipped-dangerous family subtraction-proof.
-_DEFAULTS_RESTRICTED = _compute_restricted_bases(
-    _strip_comments(_DEFAULTS_SAFE_COMMANDS))
-_SUBTRACTED_FIRST_WORDS = set()
-for _entry in _REMOVALS.get("safe_commands", []):
-    _fw = _restricted_first_word(_entry) if isinstance(_entry, str) else None
-    if _fw:
-        _SUBTRACTED_FIRST_WORDS.add(_fw)
-RESTRICTED_BASES = _DEFAULTS_RESTRICTED | _SUBTRACTED_FIRST_WORDS
-# Case-folded view for matching (FIX 2): on a case-insensitive filesystem
-# (macOS APFS default), `Docker`/`DOCKER` resolve to and execute the real
-# `docker` binary, so an exact-case check misfiled a restricted family as a
-# plain unknown. Fold to lower — this only ever makes the guard match MORE
-# (fail-closed).
-_RESTRICTED_BASES_LOWER = frozenset(b.lower() for b in RESTRICTED_BASES)
-
-
-def is_restricted_base(basename):
-    """True if `basename` is a restricted command family (see RESTRICTED_BASES).
-
-    Consulted only for commands not already matched as safe — an explicit
-    single-word allowlist entry short-circuits before this check. Case-folded
-    so a cased variant (`Docker`) is still recognized on a case-insensitive
-    filesystem.
-    """
-    return isinstance(basename, str) and basename.lower() in _RESTRICTED_BASES_LOWER
 
 
 # ============================================================
@@ -900,17 +806,32 @@ _INTERPRETER_WRAPPERS = frozenset({
     "env", "command", "exec", "time", "timeout", "nohup",
     "stdbuf", "nice", "ionice", "taskset", "chrt", "setsid", "unbuffer",
     # H3: xargs runs its trailing argument as a command, so a single-word-safe
-    # `xargs` would let `xargs docker run` skip C0. Peel it to the inner command.
+    # `xargs` would let `xargs docker run` pass as xargs. Peel it to the inner command.
     "xargs",
 })
 
-# H4: meta-execution builtins run their argument list as a command, so the
-# real command family hides behind them (`eval docker run`, `source x`). The
-# learner treats these as their own class, never a plain unknown.
-# (exec/command are also peeled as wrappers above; eval/source/. are not.)
-_META_EXEC_BUILTINS = frozenset({"eval", "exec", "source", ".", "command"})
+
+def _memo(fn):
+    """Cache a reader whose answer depends only on its arguments and the
+    loaded config: one command is read many times over (rules, guards, C9,
+    the code it runs). Callers get their own copy of a list or dict in the
+    answer. A call with an unhashable argument (a list to fill) is not cached."""
+    cached = functools.lru_cache(maxsize=4096)(fn)
+
+    @functools.wraps(fn)
+    def read(*args, **kwargs):
+        try:
+            out = cached(*args, **kwargs)
+        except TypeError:
+            return fn(*args, **kwargs)
+        if isinstance(out, tuple):
+            return tuple(v.copy() if isinstance(v, (list, dict)) else v for v in out)
+        return out.copy() if isinstance(out, (list, dict)) else out
+    read.cache_clear = cached.cache_clear
+    return read
 
 
+@_memo
 def _shlex_split_safe(cmd):
     """shlex.split that doesn't raise on unbalanced quotes / unclosed
     expansions. Falls back to naive split() so resolver callers never
@@ -921,6 +842,7 @@ def _shlex_split_safe(cmd):
         return cmd.split()
 
 
+@_memo
 def _resolve_through_wrappers(cmd, _seen=None):
     """If `cmd` starts with a transparent wrapper (env, timeout, nohup, …),
     return the inner command string starting at the real basename.
@@ -1262,50 +1184,18 @@ def _is_safe_inline_python(basename, cmd, outer=None):
 
 
 def _extract_json_decision(content):
-    """Extract a {"safe": bool} decision from LLM response content.
-
-    Reasoning models (e.g. grok-*-reasoning) often include extra text,
-    markdown fencing, or explanations around the JSON even when told to
-    return only JSON. This function tries multiple extraction strategies.
-
-    Returns the parsed dict or None.
-    """
-    # Strategy 1: direct parse (clean JSON response)
-    try:
-        return json.loads(content)
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Strategy 2: strip markdown code fencing
-    if "```" in content:
+    """The first JSON object with a `safe` key in `content`, for a model that
+    wraps its answer in prose or a code fence despite the structured-output
+    request; None if there is none. The caller still requires a real boolean."""
+    start = content.find("{")
+    while start >= 0:
         try:
-            start = content.index("```")
-            inner_start = content.index("\n", start) + 1
-            end = content.index("```", inner_start)
-            inner = content[inner_start:end].strip()
-            return json.loads(inner)
-        except (ValueError, json.JSONDecodeError):
+            obj = json.JSONDecoder().raw_decode(content, start)[0]
+            if "safe" in obj:
+                return obj
+        except ValueError:
             pass
-
-    # Strategy 3: regex — find {"safe": true/false, ...} anywhere in text
-    match = re.search(
-        r'\{\s*"safe"\s*:\s*(true|false)(?:\s*,\s*"reason"\s*:\s*"(?:[^"\\]|\\.)*")?\s*\}',
-        content,
-    )
-    if match:
-        try:
-            return json.loads(match.group())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # Strategy 4: looser regex for malformed JSON with extra fields
-    match = re.search(r'\{\s*"safe"\s*:\s*(true|false)[^}]*\}', content)
-    if match:
-        try:
-            return json.loads(match.group())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
+        start = content.find("{", start + 1)
     return None
 
 
@@ -2181,7 +2071,6 @@ _UNKNOWN_NONEMPTY = "/__smart_permissions_unknown__"
 _OLDPWD_KEY = "__smart_permissions_oldpwd"
 _STACK_KEY = "__smart_permissions_stack"  # what `~1`, `~-1`, `~+1` in a value may be
 _TILDE_KEY = "__smart_permissions_tilde"  # what `~$U`, `~${N:?}` in a value may be
-_PWD_SUBSTITUTION_RE = re.compile(r"\$\(\s*pwd(?:\s+-[LP])?\s*\)|`\s*pwd(?:\s+-[LP])?\s*`")
 _DECLARATION_BUILTINS = frozenset({"export", "declare", "local", "readonly", "typeset"})
 # A command that redefines pwd makes $(pwd) print anything.
 _PWD_REDEFINED_RE = re.compile(
@@ -3045,6 +2934,7 @@ def _field_marks(segment, bash=False):
     return "".join(out)
 
 
+@_memo
 def _shell_words(segment, bash=False):
     """Unquoted words of one command segment; shell operators become their own words."""
     if "<<" in segment:
@@ -4611,7 +4501,70 @@ def evaluate_bash(command, log_unknowns=True, _depth=0):
     if result[0] == "allow" and _SHELL_ENV_SET_RE.search(command) \
             and any(part and _shell_fed(part) for part in _iter_commands(command)):
         return ("ask", "Shell loads other code first (BASH_ENV, … set in this command)")
-    return result
+    hazard = result[0] == "allow" and _env_hazard(command)
+    return ("ask", hazard) if hazard else result
+
+
+# Environment variables that make the commands after them run other code:
+# a program they name (ssh, diff, pager, editor, askpass) — fine when it is
+# plain words the rules allow, like `GIT_PAGER=cat` or `GIT_EDITOR=true` —
+# or a library, file or git setting loaded first (always a question).
+_ENV_PROGRAM_VARS = ("GIT_SSH_COMMAND|GIT_SSH|GIT_EXTERNAL_DIFF|GIT_PAGER|PAGER|GIT_EDITOR"
+                     "|GIT_SEQUENCE_EDITOR|EDITOR|VISUAL|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND")
+_ENV_LOADER_VARS = r"LD_PRELOAD|LD_AUDIT|DYLD_\w+|BASH_ENV|GIT_EXEC_PATH|GIT_CONFIG\w*"
+# NAME=, NAME+= or NAME[i]= (zsh writes an element into an exported scalar)
+_ENV_WORD_RE = re.compile(r"(?:(%s)|(%s))((?:\[[^]]*\])?\+?)=(.*)" % (_ENV_PROGRAM_VARS, _ENV_LOADER_VARS),
+                          re.S)
+
+
+def _env_settings(part):
+    """(the unquoted words of one simple command that may set environment
+    variables, whether they include a wrapper's or builtin's arguments).
+    A plain command with no wrapper passes its arguments on (`git commit -m
+    PAGER=x`), so they are left out; every other word counts, and with
+    `env` in the command each word holding spaces is split too (`env -S`)."""
+    words = _shell_words(part)
+    peeled = _peel_words(_parse_simple_command(part)[0])
+    tokens = peeled[1] if peeled and peeled[0] == 0 else []
+    if tokens[:1] == ["builtin"]:
+        tokens = tokens[1:]
+    if tokens and "=" not in tokens[0] \
+            and os.path.basename(tokens[0]) not in _DECLARATION_BUILTINS | {"builtin", "command"}:
+        left = collections.Counter(words)
+        left.subtract(tokens[1:])  # its arguments; the first copies of a word stay
+        kept = []
+        for w in words:
+            if left[w] > 0:
+                kept.append(w)
+                left[w] -= 1
+        return kept, False
+    if "env" in map(os.path.basename, words):
+        words = words + [w for word in words if re.search(r"\s", word) for w in _shlex_split_safe(word)]
+    return words, True
+
+
+def _env_hazard(command):
+    """Why `command` sets an environment variable that makes what it runs
+    run other code (see above), or None (see _env_settings for where). An
+    append (`PAGER+=…`), an element (`PAGER[1]=…`), an array (`PAGER=(…)`)
+    and, among a wrapper's or builtin's arguments, a name built at run time
+    (`export "$K=…"`, `export LD_PRELO{AD,AD}=…`) are always a question."""
+    if "=" not in command:
+        return None
+    for part in _iter_commands(command):
+        words, setter = _env_settings(part) if part else ([], False)
+        for i, word in enumerate(words):
+            if setter and "=" in word and re.search(r"[$`{*?[]", word.split("=", 1)[0]):
+                return f"Sets a variable whose name is built at run time ({word[:60]})"
+            m = _ENV_WORD_RE.match(word)
+            if m and not m.group(4) and words[i + 1:i + 2] == ["("]:
+                return f"Sets {m.group(1) or m.group(2)} to an array"
+            if not m or not m.group(4).strip():
+                continue
+            if m.group(2) or m.group(3) or not _plain_allowed(m.group(4), ("less", "more")):
+                name = m.group(1) or m.group(2)
+                return f"Sets {name} to run other code ({' '.join(m.group(4).split())[:60]})"
+    return None
 
 
 _MAX_SUBSTITUTION_DEPTH = 6
@@ -4668,153 +4621,134 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
     if parse_uncertain:
         return held or ("ask", "Ambiguous parse — unbalanced quotes or incomplete heredoc")
 
-    # First pass: collect shell function definitions
-    defined_functions = set()
-    for cmd in commands:
-        func_name = get_function_definition_name(cmd)
-        if func_name:
-            defined_functions.add(func_name)
-
-    # Check each sub-command
+    # Function names defined anywhere in the command are known commands
+    defined_functions = {name for name in map(get_function_definition_name, commands) if name}
     unknown_words = []
     constants = None  # _command_constants(command), once a `$NAME` command word needs it
-    for cmd in commands:
-        cmd = _strip_leading_keywords(cmd)
-        if not cmd.strip():
-            continue
-        # Re-check risky patterns on ALL sub-commands, including function
-        # definitions and merged case blocks (dangerous patterns were
-        # checked per part above)
-        if not held and any(re.search(pattern, cmd) for pattern in RISKY_PATTERNS):
-            held = ("ask", "Risky command pattern — confirm before running")
 
-        # For function definitions and case blocks, extract their inner
-        # commands and feed them back through the same evaluation.
-        # This catches unknown commands, $VAR words, interpreter flags,
-        # and anything else that the first-word check would flag.
-        if get_function_definition_name(cmd):
-            body = _extract_function_body(cmd)
-            bodies = [body] if body else []
-        elif _contains_case_start(cmd):
-            bodies = _extract_case_arm_bodies(cmd)
-        else:
+    def check(parts, body=False):
+        """Judge each part: return a deny, else hold the first ask in `held`
+        and collect unknown command words. `body` marks the parts of a
+        function body or case arm, whose own anchored dangerous patterns
+        are matched here and which are not opened further."""
+        nonlocal held, constants
+        for cmd in parts:
+            cmd = _strip_leading_keywords(cmd)
+            if not cmd.strip():
+                continue
+            if body:
+                danger = _dangerous_verdict(cmd)
+                if danger and danger[0] == "deny":
+                    return danger
+                held = held or danger
+            # Risky patterns on every part, function definitions and merged
+            # case blocks included
+            if not held and any(re.search(pattern, cmd) for pattern in RISKY_PATTERNS):
+                held = ("ask", "Risky command pattern — confirm before running")
+
+            # Function bodies and case arms: their commands go through the
+            # same checks (unknown words, `$VAR` words, interpreter flags, …)
             bodies = None
-        if bodies is not None:
-            for body in bodies:
-                inner_result = _check_inner_commands(body, defined_functions,
-                                                     _depth, log_unknowns)
-                if inner_result and inner_result[0] == "deny":
-                    return inner_result
-                held = held or inner_result
-            continue
-
-        # Code the command runs (shell -c/heredoc, trap, find -exec, awk,
-        # eval), and risky uses of allowed commands
-        inner_result = _exec_bearing_verdict(cmd, _depth, log_unknowns) \
-            or _risky_operation(cmd)
-        if inner_result:
-            if inner_result[0] == "deny":
-                return inner_result
-            held = held or inner_result
-            continue
-        if held:
-            continue  # an ask is settled; only a deny in a later part can change it
-
-        # `< in cmd …`, `2>/dev/null cmd …`: the command word follows them.
-        cmd = part = _strip_leading_redirections(cmd)
-        first_word = get_first_command_word(cmd)
-        if first_word is None:
-            # Command substitution as the command itself (e.g. `$(which
-            # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
-            # statically and is a known interpreter-hiding bypass — ask.
-            if _is_substitution_word(cmd):
-                held = ("ask", "Command substitution as command word")
-            continue
-
-        # Check for interpreter string execution (bash -c, python -c, etc.)
-        # Must come BEFORE safe-command check since interpreters are in SAFE_COMMANDS.
-        # Peel off transparent wrappers (env, timeout, nohup, …) so
-        # `env python -c "…"` is detected the same as `python -c "…"`.
-        basename = os.path.basename(first_word)
-        inner_cmd = _resolve_through_wrappers(cmd)
-        inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
-        inner_basename = os.path.basename(inner_first) if inner_first else basename
-        if (_has_interpreter_exec_flag(basename, cmd)
-                and not _is_safe_inline_python(basename, cmd)):
-            held = ("ask", f"Inline interpreter execution: {basename}")
-            continue
-        if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
-                and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
-            held = ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
-            continue
-
-        # If a transparent wrapper was peeled, the inner command's safety
-        # is what matters — the wrapper is no longer in SAFE_COMMANDS
-        # exactly so that destructive inners like
-        # `env kubectl delete` / `timeout 5 terraform apply` can't hide.
-        if inner_cmd != cmd and inner_first is not None:
-            if matches_safe_command(inner_first, inner_cmd):
-                continue
-            # Inner is not safe; switch first_word to the inner so the
-            # subsequent unknown-command path logs and prompts on the
-            # real command rather than the wrapper.
-            first_word = inner_first
-            cmd = inner_cmd
-            basename = inner_basename
-
-        # `PY=/x/bin/python; $PY t.py`: a name set once to a literal before
-        # every read is its value; the command it runs is judged written out.
-        if first_word.startswith("$"):
-            if constants is None:
-                constants = _command_constants(command)
-            expanded = _expand_constant(part, constants)
-            if expanded:
-                verdict = _nested_verdict(expanded, _depth, log_unknowns)
-                if verdict[0] == "deny":
-                    return verdict
-                if verdict[0] != "allow":
-                    held = verdict
-                elif _expansion_left(expanded):  # only a fully written command is trusted
-                    held = ("ask", f"{first_word} runs with words built at run time")
+            if not body and get_function_definition_name(cmd):
+                # What follows the head: `{ …; }` (whose end the split may have
+                # put in a later part), `( … )`, or zsh's one command (`f() ls`)
+                text = cmd.strip()[_FUNCTION_HEAD_RE.match(cmd.strip()).end():].strip()
+                if text.startswith("{"):
+                    text = text[1:text.rfind("}")] if "}" in text else text[1:]
+                bodies = [text]
+            elif not body and _contains_case_start(cmd):
+                bodies = _extract_case_arm_bodies(cmd)
+            if bodies is not None:
+                for text in bodies:
+                    inner, uncertain = split_compound_command(text)
+                    if uncertain:
+                        held = held or ("ask", "Ambiguous parse in compound block")
+                        continue
+                    deny = check(inner, body=True)
+                    if deny:
+                        return deny
                 continue
 
-        # Check known-safe commands (supports multi-word like "flutter doctor")
-        if matches_safe_command(first_word, cmd):
-            continue
-
-        # Check user-defined shell functions
-        if first_word in defined_functions:
-            continue
-
-        # Check relative scripts (./build.sh, scripts/foo.sh)
-        # Paths containing .. could traverse outside the project directory,
-        # so only allow simple relative paths without parent traversal
-        if first_word.startswith("./") or first_word.startswith("../"):
-            if ".." not in first_word:
+            # Code the command runs (shell -c/heredoc, trap, find -exec, awk,
+            # eval), and risky uses of allowed commands
+            result = _exec_bearing_verdict(cmd, _depth, log_unknowns) or _risky_operation(cmd)
+            if result:
+                if result[0] == "deny":
+                    return result
+                held = held or result
                 continue
-            # Has .. traversal — treat as unknown
-            unknown_words.append(first_word)
-            continue
-        if "/" in first_word and not first_word.startswith("/"):
-            if ".." not in first_word:
+            if held:
+                continue  # an ask is settled; only a deny in a later part can change it
+
+            # `< in cmd …`, `2>/dev/null cmd …`: the command word follows them.
+            cmd = part = _strip_leading_redirections(cmd)
+            first_word = get_first_command_word(cmd)
+            if first_word is None:
+                # Command substitution as the command itself (e.g. `$(which
+                # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
+                # statically and is a known interpreter-hiding bypass — ask.
+                if _is_substitution_word(cmd):
+                    held = ("ask", "Command substitution as command word")
+                continue
+
+            # Interpreter string execution (bash -c, python -c, …), before the
+            # safe-command check since interpreters are in SAFE_COMMANDS.
+            # Transparent wrappers (env, timeout, nohup, …) are peeled so
+            # `env python -c "…"` is caught like `python -c "…"`.
+            basename = os.path.basename(first_word)
+            inner_cmd = _resolve_through_wrappers(cmd)
+            inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
+            inner_basename = os.path.basename(inner_first) if inner_first else basename
+            if (_has_interpreter_exec_flag(basename, cmd)
+                    and not _is_safe_inline_python(basename, cmd)):
+                held = ("ask", f"Inline interpreter execution: {basename}")
+                continue
+            if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
+                    and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
+                held = ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
+                continue
+
+            # A peeled wrapper is judged by its inner command: wrappers are not
+            # in SAFE_COMMANDS so `env kubectl delete` / `timeout 5 terraform
+            # apply` can't hide; an unsafe inner is what gets logged and asked.
+            if inner_cmd != cmd and inner_first is not None:
+                if matches_safe_command(inner_first, inner_cmd):
+                    continue
+                first_word, cmd, basename = inner_first, inner_cmd, inner_basename
+
+            # `PY=/x/bin/python; $PY t.py`: a name set once to a literal before
+            # every read is its value; the command it runs is judged written out.
+            if first_word.startswith("$") and not body:
+                if constants is None:
+                    constants = _command_constants(command)
+                expanded = _expand_constant(part, constants)
+                if expanded:
+                    verdict = _nested_verdict(expanded, _depth, log_unknowns)
+                    if verdict[0] == "deny":
+                        return verdict
+                    if verdict[0] != "allow":
+                        held = verdict
+                    elif _expansion_left(expanded):  # only a fully written command is trusted
+                        held = ("ask", f"{first_word} runs with words built at run time")
+                    continue
+
+            # Known-safe commands (multi-word like "flutter doctor" too) and
+            # functions the command defines
+            if matches_safe_command(first_word, cmd) or first_word in defined_functions:
+                continue
+            # Relative scripts (./build.sh, scripts/foo.sh) unless a `..` may
+            # leave the project; scripts under safe_script_paths
+            if "/" in first_word and not first_word.startswith("/"):
+                if ".." not in first_word:
+                    continue
+            elif any(os.path.expanduser(first_word).startswith(p) for p in SAFE_SCRIPT_PATHS):
                 continue
             unknown_words.append(first_word)
-            continue
+        return None
 
-        # Check absolute paths in safe directories
-        expanded = os.path.expanduser(first_word)
-        if any(expanded.startswith(p) for p in SAFE_SCRIPT_PATHS):
-            continue
-
-        # Check tilde paths
-        if first_word.startswith("~"):
-            expanded = os.path.expanduser(first_word)
-            if any(expanded.startswith(p) for p in SAFE_SCRIPT_PATHS):
-                continue
-
-        # This command word is unknown
-        unknown_words.append(first_word)
-
+    deny = check(commands)
+    if deny:
+        return deny
     if held:
         return held
     if unknown_words:
@@ -4825,100 +4759,6 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
         return ("ask", f"Unknown command(s): {', '.join(unknown_words)} (logged)")
 
     return ("allow", "All commands in safe list")
-
-
-def _check_inner_commands(body_text, defined_functions, _depth=0, log_unknowns=True):
-    """Check commands extracted from function bodies and case arms.
-
-    Splits the body into sub-commands and runs the same checks as the
-    main evaluate_bash loop: dangerous/risky patterns, interpreter exec,
-    known-safe commands, and unknown command detection.
-
-    Returns (decision, reason) tuple if any check fails, or None if all safe.
-    A deny in a later command wins over an ask in an earlier one.
-    """
-    inner_cmds, uncertain = split_compound_command(body_text)
-    if uncertain:
-        return ("ask", "Ambiguous parse in compound block")
-    if not inner_cmds:
-        return None
-
-    held = None
-    for cmd in inner_cmds:
-        cmd = _strip_leading_keywords(cmd)
-        if not cmd.strip():
-            continue
-        # Dangerous/risky patterns
-        danger = _dangerous_verdict(cmd)
-        if danger and danger[0] == "deny":
-            return danger
-        if any(re.search(pattern, cmd) for pattern in RISKY_PATTERNS):
-            danger = danger or ("ask", "Risky pattern in compound block")
-        inner_result = _exec_bearing_verdict(cmd, _depth, log_unknowns) \
-            or _risky_operation(cmd)
-        if inner_result and inner_result[0] == "deny":
-            return inner_result
-        held = held or danger or inner_result
-        if held:
-            continue
-
-        cmd = _strip_leading_redirections(cmd)
-        first_word = get_first_command_word(cmd)
-        if first_word is None:
-            # Command substitution as the command itself (e.g. `$(which
-            # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
-            # statically and is a known interpreter-hiding bypass — ask.
-            if _is_substitution_word(cmd):
-                held = ("ask", "Command substitution as command word")
-            continue
-
-        # Interpreter exec flags (peel off transparent wrappers first)
-        basename = os.path.basename(first_word)
-        inner_cmd = _resolve_through_wrappers(cmd)
-        inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
-        inner_basename = os.path.basename(inner_first) if inner_first else basename
-        if (_has_interpreter_exec_flag(basename, cmd)
-                and not _is_safe_inline_python(basename, cmd)):
-            held = ("ask", f"Interpreter execution in compound block: {basename}")
-            continue
-        if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
-                and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
-            held = ("ask", f"Interpreter execution via wrapper in compound block: {basename} … {inner_basename}")
-            continue
-
-        # Wrapper peel: delegate safety to the inner command (env / timeout /
-        # nohup are no longer single-word safe, so they must not hide
-        # destructive inners like `env kubectl delete`)
-        if inner_cmd != cmd and inner_first is not None:
-            if matches_safe_command(inner_first, inner_cmd):
-                continue
-            first_word = inner_first
-            cmd = inner_cmd
-            basename = inner_basename
-
-        # Known-safe commands (supports multi-word like "flutter doctor")
-        if matches_safe_command(first_word, cmd):
-            continue
-        if first_word in defined_functions:
-            continue
-
-        # Relative scripts without traversal
-        if first_word.startswith("./") or first_word.startswith("../"):
-            if ".." not in first_word:
-                continue
-        elif "/" in first_word and not first_word.startswith("/"):
-            if ".." not in first_word:
-                continue
-
-        # Absolute paths in safe dirs
-        expanded = os.path.expanduser(first_word)
-        if any(expanded.startswith(p) for p in SAFE_SCRIPT_PATHS):
-            continue
-
-        # Unknown command inside compound block
-        held = ("ask", f"Unknown command in compound block: {first_word}")
-
-    return held
 
 
 # ── `$NAME` as a command word ───────────────────────────────────────────────
@@ -4948,6 +4788,7 @@ _SPECIAL_NAMES = frozenset({"_", "IFS", "PATH", "PWD", "OLDPWD", "HOME", "CDPATH
                             "RANDOM", "SECONDS", "LINENO", "UID", "EUID", "PPID"})
 
 
+@_memo
 def _command_constants(command):
     """{NAME: value} for the names `command` reads as `$NAME` command
     words that can only hold one literal value there (see above)."""
@@ -5164,6 +5005,7 @@ _AWK_NAMES = frozenset({"awk", "gawk", "nawk", "mawk"})
 _FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 
 
+@_memo
 def _heredoc_split(text):
     """(text without its heredoc bodies, [(body, quoted), …] in order,
     orphan, missing). `missing` counts heredocs opened with no body after
@@ -5232,6 +5074,7 @@ def _attach_heredoc_bodies(parts):
     return out
 
 
+@_memo
 def _unquote_word(raw):
     """A shell word as the command receives it (quotes removed)."""
     try:
@@ -5261,6 +5104,53 @@ def _raw_is_literal(raw):
     return True
 
 
+# An unquoted brace expansion (`{a,b}`, `{1..3}`)
+_BRACE_EXPANSION_RE = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
+
+
+def _built_word(raw):
+    """True if the shell builds `raw` at run time: an expansion, a
+    substitution, or a brace or glob expansion outside quotes."""
+    return not _raw_is_literal(raw) or bool(_BRACE_EXPANSION_RE.search(_outside_quotes(raw)))
+
+
+def _may_split(raw):
+    """True if the shell may turn `raw` into no word or several: a built
+    word outside double quotes, or an `@` expansion (`"$@"`, `"${a[@]}"`,
+    zsh's `"$a[@]"`). A quoted `"$W"`, `"${W}/x"` or `"$(pwd)"` stays one
+    word, so as an option's value it cannot become an option or a
+    subcommand. A quoted substitution that holds quotes of its own counts as
+    splitting: its end can't be read here."""
+    if re.search(r"\$\w+\[@", raw):
+        return True
+    sq = dq = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if sq:
+            sq = c != "'"
+        elif c == "\\":
+            i += 1
+        elif c == "'" and not dq:
+            sq = True
+        elif c == '"':
+            dq = not dq
+        elif not dq:
+            if c in "$`*?[":
+                return True
+        elif c == "`" or raw.startswith("$@", i):
+            return True
+        elif raw.startswith("$(", i) or raw.startswith("${", i):
+            # one word, unless an `@` makes it a list ("${a[@]}", "${(@)a}")
+            j = _matching_close(raw, i + 1, raw[i + 1], ")" if raw[i + 1] == "(" else "}")
+            if any(q in raw[i:j] for q in "\"'`\\" + "@" * (raw[i + 1] == "{")):
+                return True
+            i = j
+        i += 1
+    return bool(_BRACE_EXPANSION_RE.search(_outside_quotes(raw)))
+
+
+@_memo
 def _parse_simple_command(part):
     """Read one simple command: (raw words from the command word on, stdin
     source, hazard). Reserved words, assignments and redirections are set
@@ -5766,6 +5656,7 @@ def _danger_message(pattern, match):
     return f"Blocked dangerous pattern `{pattern}` (matched `{shown}`)"
 
 
+@_memo
 def _dangerous_verdict(command):
     """("deny", message) for a dangerous_patterns match in code, ("ask", …)
     for one only in data (see the section comment), None for no match.
@@ -6160,6 +6051,8 @@ _PUB_RISKY = frozenset({"publish", "lish", "upload", "token", "global"})
 # … the subcommands that may take a word built at run time (not compile,
 # doc or build, which write where they're told: `-o "$D/settings.json"`)
 _DART_ARG_SUBCOMMANDS = frozenset({"test", "analyze", "format", "run"})
+# what may make a word (quotes already removed) one the shell builds at run time
+_RUNTIME_CHARS_RE = re.compile(r"[$`*?\[{]")
 
 
 def _pub_risk(cmd):
@@ -6174,17 +6067,17 @@ def _pub_risk(cmd):
             continue
         rest = [a.lower() for a in words[1:]]
         sub = next((a for a in words[1:] if not a.startswith("-")), "")
-        if re.search(r"[$`]", sub):
+        if _RUNTIME_CHARS_RE.search(sub):
             return f"{tool} subcommand built at run time ({sub})"
         # A run-time word is trusted only after a subcommand it can't turn
         # into a publish (an option's value can pass for the subcommand:
         # `flutter --device-id pixel $S publish`).
-        dynamic = next((a for a in words[1:] if re.search(r"[$`]", a)), None)
+        dynamic = next((a for a in words[1:] if _RUNTIME_CHARS_RE.search(a)), None)
         if dynamic and sub not in _DART_ARG_SUBCOMMANDS and not sub.endswith(".dart"):
             return f"{tool} with a word built at run time ({dynamic})"
-        pub =next((j for j, a in enumerate(rest) if a in ("pub", "packages")), None)
+        pub = next((j for j, a in enumerate(rest) if a in ("pub", "packages")), None)
         if pub is not None:
-            hit = next((a for a in rest[pub + 1:] if a in _PUB_RISKY or re.search(r"[$`]", a)), None)
+            hit = next((a for a in rest[pub + 1:] if a in _PUB_RISKY or _RUNTIME_CHARS_RE.search(a)), None)
             if hit:
                 return f"{tool} pub {hit} (publishes a package, or changes pub credentials or global tools)"
     return None
@@ -6291,6 +6184,7 @@ def _sensitive_operand(word):
     return None
 
 
+@_memo
 def _command_line(cmd):
     """(words of the command `cmd` runs, unquoted and unwrapped; the files
     its redirections write; the files they read)."""
@@ -6314,6 +6208,47 @@ def _command_line(cmd):
     return _unwrap_command(words), targets, reads
 
 
+# git subcommands whose risk _git_risk reads from their words
+_GIT_ROUTED = frozenset({"reset", "clean", "checkout", "switch", "restore", "stash", "branch",
+                         "filter-branch", "filter-repo", "push"})
+
+
+def _built_word_risk(cmd):
+    """Why a command the rules judge by its literal words has a word the
+    shell builds at run time where it decides the verdict, or None:
+    `git $S --hard`, `git reset --h{a..a}rd`, `docker volume $V`. For git
+    that is any word up to the subcommand, and any word of a subcommand
+    _git_risk reads; for docker, any word of a volume, system or compose
+    command; for chmod, any word up to the mode. (dart and flutter: _pub_risk.)
+    A wrapper chain that can't be lined up with its words (`env -S`) counts
+    every word, and a `$` even in single quotes, which `env -S` expands."""
+    raws = _parse_simple_command(cmd)[0]
+    peeled = _peel_words(raws)
+    if peeled is None:
+        built = next((r for r in raws if "$" in r or _built_word(r)), None)
+        return built and f"wrapped command with a word built at run time ({built})"
+    k, tokens = peeled
+    name, args, raws = os.path.basename(tokens[k]), tokens[k + 1:], raws[k + 1:]
+    if not any(map(_built_word, raws)):
+        return None
+    n, paths = 0, set()  # the deciding words: raws[:n]; `paths` need only stay one word
+    if name == "git":
+        while n < len(args) and args[n].startswith("-"):
+            if args[n] in _GIT_VALUE_OPTS and args[n] not in ("-c", "--config-env"):
+                paths.add(n + 1)
+            n += 2 if args[n] in _GIT_VALUE_OPTS else 1
+        # an alias set here may stand for any subcommand _git_risk reads
+        routed = args[n:n + 1] and args[n] in _GIT_ROUTED or any("alias." in a.lower() for a in args[:n])
+        n = len(args) if routed else n + 1
+    elif name == "docker-compose" or name == "docker" and {"compose", "volume", "system"} & set(args):
+        n = len(args)
+    elif name == "chmod":
+        n = next((j for j, a in enumerate(args) if not a.startswith("-")), len(args)) + 1
+    built = next((r for j, r in enumerate(raws[:n])
+                  if (_may_split if j in paths else _built_word)(r)), None)
+    return built and f"{name} with a word built at run time where it decides the verdict ({built})"
+
+
 def _risky_operation(cmd):
     """("ask", reason) for a command the allowlist trusts doing something that
     can lose work, send local data away, or plant code that runs later
@@ -6329,6 +6264,7 @@ def _risky_operation(cmd):
               else _xargs_replace_risk(cmd) or _pub_risk(cmd))
     if isinstance(reason, tuple):
         return reason  # a steer
+    reason = reason or _built_word_risk(cmd)
     if reason:
         return ("ask", f"Risky {reason} — LLM review")
     for path in targets + _written_operands(name, args):
@@ -6472,6 +6408,7 @@ def _find_closing_paren(s, start, open_ch="(", close_ch=")"):
     return -1
 
 
+@_memo
 def extract_substitutions(command, quotes=True):
     """Bodies of every command/process substitution the shell would execute.
 
@@ -6558,6 +6495,7 @@ def extract_substitutions(command, quotes=True):
     return bodies, bool(pending) and quotes
 
 
+@_memo
 def split_compound_command(command, _depth=0):
     """
     Split a compound command into individual commands.
@@ -6863,6 +6801,7 @@ def _word_starts(text):
 _REDIRECTION_RE = re.compile(r"(?:\d+|\{[A-Za-z_]\w*\})?(&>>?|[<>]&|>>|>\||<<<|<<-?|<>|<|>)")
 
 
+@_memo
 def _strip_leading_redirections(cmd):
     """`cmd` without the redirections before its command word: `< in kubectl …`
     and `2>/dev/null kubectl …` → `kubectl …`; `X=1 >out cmd` → `X=1 cmd`.
@@ -7029,22 +6968,6 @@ def get_function_definition_name(cmd):
     return None
 
 
-def _extract_function_body(cmd):
-    """Extract the body of a function definition for inner-command checking.
-
-    Given 'name() { body; }' or 'function name { body; }', returns 'body;'.
-    Returns empty string if no body can be extracted.
-    """
-    # Find the opening { and extract everything between { and }
-    brace_start = cmd.find('{')
-    if brace_start == -1:
-        return ""
-    brace_end = cmd.rfind('}')
-    if brace_end <= brace_start:
-        return ""
-    return cmd[brace_start + 1:brace_end].strip()
-
-
 def _extract_case_arm_bodies(cmd):
     """Extract the bodies of case arms for inner-command checking.
 
@@ -7093,12 +7016,12 @@ def _extract_case_arm_bodies(cmd):
     return bodies
 
 
+@_memo
 def get_command_words(cmd, max_words=2, flag_handling="stop"):
     """Extract up to `max_words` command words from a single command.
 
     Skips env variable assignments (VAR=value), leading pipes, and
-    redirections — same logic as get_first_command_word but returns a
-    list of up to `max_words` words.
+    redirections, and returns a list of up to `max_words` words.
 
     flag_handling controls what happens when a flag token (starting with -)
     is encountered while scanning for subcommand words:
@@ -7169,9 +7092,12 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
         return []
     if word.startswith(">") or word.startswith("<"):
         return []
-    # Command substitution as the first word — see get_first_command_word.
+    # Command substitution as the first word (`$(which bash) -c …`) picks the
+    # command at run time: no word, so the caller asks.
     if word.startswith("$(") or word.startswith("`") or word.startswith("\\`"):
         return []
+    # A variable as the command word can't be resolved here: returned as is
+    # so it stays unknown (or a constant the caller writes out)
     if word.startswith("$") and not word.startswith("$("):
         return [word]
     if word == "-":
@@ -7197,6 +7123,13 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
     while subcommands_needed > 0 and scan_idx + 1 < max_scan:
         scan_idx += 1
         w = tokens[scan_idx].rstrip(";)")
+        if _built_word(w):
+            # Built at run time: may be any subcommand or flag. The prefix
+            # before it still counts, except in include mode, where only the
+            # full list of words names the command.
+            if flag_handling == "include":
+                return []
+            break
 
         # Handle flags
         if w.startswith("-"):
@@ -7217,6 +7150,8 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
                 # Handles: docker --context prod build → ["docker", "build"]
                 if "=" not in w and scan_idx + 1 < max_scan:
                     scan_idx += 1  # skip presumed value
+                    if _may_split(tokens[scan_idx]):
+                        break  # it may be no value but the subcommand
                 continue
             elif flag_handling == "skip":
                 # Skip the flag only, continue scanning.
@@ -7299,33 +7234,19 @@ def _check_candidates(basename, candidates, wordwise=False):
             for pattern_words in SAFE_COMMANDS_WORDWISE:
                 if _wordwise_match(candidate, pattern_words):
                     return True
-
-    # Check exact multi-word entries first, longest match wins
-    if SAFE_COMMANDS_MULTI:
-        for candidate in candidates:
-            if candidate in SAFE_COMMANDS_MULTI:
-                return True
-
-    # Check wildcard patterns (e.g. "kubectl get*", "docker *")
-    # A pattern like "cargo build *" also matches bare "cargo build"
-    # (trailing " *" means "with optional arguments").
-    if SAFE_COMMANDS_WILD:
-        for candidate in candidates:
-            for pattern in SAFE_COMMANDS_WILD:
-                if fnmatch(candidate, pattern):
-                    return True
-                if pattern.endswith(" *") and candidate == pattern[:-2]:
-                    return True
-        # Also test single-word against wildcards (e.g. "kube*")
-        for pattern in SAFE_COMMANDS_WILD:
-            if fnmatch(basename, pattern):
-                return True
-            if pattern.endswith(" *") and basename == pattern[:-2]:
-                return True
-
-    return False
+    # Exact multi-word entries, then wildcard patterns (e.g. "kubectl get*",
+    # "docker *"; "cargo build *" also matches bare "cargo build"), then the
+    # single word against wildcards (e.g. "kube*")
+    return any(c in SAFE_COMMANDS_MULTI for c in candidates) or bool(SAFE_COMMANDS_WILD) and any(
+        _WILD_RE.match(os.path.normcase(c)) or c in _WILD_BARE for c in candidates + [basename])
 
 
+# SAFE_COMMANDS_WILD as one regex: fnmatch against each pattern in turn
+_WILD_RE = re.compile("|".join(translate(os.path.normcase(p)) for p in SAFE_COMMANDS_WILD) or "(?!)")
+_WILD_BARE = frozenset(p[:-2] for p in SAFE_COMMANDS_WILD if p.endswith(" *"))
+
+
+@_memo
 def matches_safe_command(first_word, cmd):
     """Check if a command matches SAFE_COMMANDS, supporting multi-word entries.
 
@@ -7372,92 +7293,9 @@ def matches_safe_command(first_word, cmd):
 
 
 def get_first_command_word(cmd):
-    """Extract the first command word from a single command.
-
-    Skips env variable assignments (VAR=value) and redirections.
-    Returns None for comments and empty strings.
-    """
-    if not cmd:
-        return None
-
-    cmd = _strip_leading_redirections(cmd.strip())
-
-    if cmd.startswith("#"):
-        return None
-
-    tokens = cmd.split()
-    if not tokens:
-        return None
-
-    idx = 0
-
-    # Skip leading pipe tokens
-    while idx < len(tokens) and tokens[idx] == "|":
-        idx += 1
-
-    # Skip env var assignments (VAR=value and bash += array/string append)
-    while idx < len(tokens):
-        token = tokens[idx]
-        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\+?=", token):
-            idx += 1
-            value_part = token.split("=", 1)[1]
-
-            if value_part and value_part[0] in ('"', "'"):
-                quote_char = value_part[0]
-                if not (len(value_part) >= 2 and value_part.endswith(quote_char)):
-                    while idx < len(tokens):
-                        if tokens[idx].endswith(quote_char):
-                            idx += 1
-                            break
-                        idx += 1
-                    continue
-
-            open_parens = value_part.count("(")
-            close_parens = value_part.count(")")
-            while open_parens > close_parens and idx < len(tokens):
-                next_token = tokens[idx]
-                open_parens += next_token.count("(")
-                close_parens += next_token.count(")")
-                idx += 1
-        else:
-            break
-
-    if idx >= len(tokens):
-        return None
-
-    word = tokens[idx]
-
-    if word.startswith("#"):
-        return None
-
-    if word.startswith(">") or word.startswith("<"):
-        return None
-
-    # Command substitution as the FIRST word: `$(which bash) -c "evil"` or
-    # `\`python -c …\`` selects the interpreter dynamically and previously
-    # collapsed to the inner safe command (e.g. "which") — bypassing the
-    # interpreter-exec check on the *actual* command that runs. Return None
-    # so the caller treats the whole command as unknown and prompts.
-    if word.startswith("$(") or word.startswith("`") or word.startswith("\\`"):
-        return None
-
-    # Variable expansion as first word — can't resolve statically, treat as
-    # unknown so it gets prompted (prevents $CMD bypasses like $'\x73udo')
-    if word.startswith("$") and not word.startswith("$("):
-        return word
-
-    if word == "-":
-        return None
-
-    word = word.lstrip("(")
-    word = word.rstrip(";)")
-
-    if len(word) >= 2 and word[0] in ('"', "'") and word[-1] == word[0]:
-        word = word[1:-1]
-    elif word and word[0] in ('"', "'"):
-        return None
-
-    return word if word else None
+    """The command word of a single command (see get_command_words), or None."""
+    words = get_command_words(cmd, max_words=1)
+    return words[0] if words else None
 
 
 if __name__ == "__main__":

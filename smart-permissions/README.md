@@ -127,151 +127,20 @@ reads code a command runs: a shell's `-c` string, heredoc or here-string
 `find -exec` command, `eval` and awk's `system()`, with any `cd` before it.
 `unlink` and `shred` remove single files, not folders, and are not covered.
 
-A recursive `rm` whose target leans on a variable that may be empty is denied
-with a rewrite for the agent to run instead. `rm -rf "$T/$k"` becomes
-`rm -rf /` when both are empty. Claude Code stops for manual approval on that
-shape, and no hook, auto mode or bypass mode can clear that prompt. The deny
-tells the agent to write `"${T:?}/${k:?}"`: the shell then aborts instead of
-deleting when a value is empty, which proves the empty case away at run time,
-and Claude Code runs it without asking. The rule covers targets that start with
-`/`, `~`, `$VAR` or `$(…)`, and requires a guard on every variable that the
-command sets or unsets itself or that is unset or empty in the environment. It
-also covers `"$D"/*` and `/tmp/$k`, which Claude Code's own check lets through;
-the rewrite keeps globs, brace groups and a leading `~` outside the quotes
-(`"${D:?}/"*`). A
-bare `rm -rf "$X"` is left alone, since an empty X deletes nothing, and so is a
-`$`, glob or `~` in quotes or escaped. One guard covers later uses of the same
-name, and `${X:-${Y:?}}` counts as guarded. Values that can't take a guard in
-place (`$!`, `${X%/}`, `${X:+…}`, `${!X}`, a `$(…)` other than `$(pwd)`) get
-"use a literal path", and so does a whole target the protected-folder guard
-can't follow (`rm -rf "${HOME%/}"`; `"$@"` is exempt) and any `..` after an
-expansion (`"$D/../x"`, or glued on as `"$D"../*`). A variable that can hold
-`.` or `..` is refused even when guarded, if it forms a whole path component.
-That covers a loop or `read` variable fed by `ls -a`/`--all` (or `ls $flags`
-with `flags=-a`, a copy of it, or one inherited), a `.*` glob, a variable holding such a list, a value taken
-from one (`g=$f`, `g=$(echo "$f")`), and `$1`…`${99}` or `"$@"` after
-`set -- "$f"` (including `for g; do` and `for g do`). Guarded
-targets still go to the LLM like any other recursive delete. The
-protected-folder guard reads through `${X:?}` and the default operators
-(including a `~` in the default), `$(pwd)` (unless the command redefines
-`pwd`), `${X:=…}`, zsh's `${X::=…}` and `$((X=1))` assignments in any command, and
-`export`/`declare`/`local` assignments, also behind `builtin` or `command` and
-their flags. Anything that may not run, or runs in a subshell (inside
-`if`/`while`/`for`/`case`/`{ }`, after `&&` or `||`, in `( )`, a pipeline or
-an `&` job, or an arithmetic operand like `0 && (X=1)`), adds what it assigns
-or `cd`s to beside the old value. Each command is followed once per directory
-the command may be in, and the target is checked against each. `pushd`/`popd`
-follow the directory stack and `cd -` the previous directory; once that can't be
-known (an entry from before the command, `cd +1`, a stack change that may not
-run, a plain `cd` under zsh's `AUTO_PUSHD`, a folder already on the stack under
-`PUSHD_IGNORE_DUPS`, `setopt` or `shopt` in the command), they may go to any directory seen
-so far; a bare `pushd` may also go home (`PUSHD_TO_HOME`), and pushing the
-current folder again counts as a duplicate too. A `cd` to a folder that doesn't
-exist (or a `cd OLD NEW` whose OLD isn't in the path, or a `cd ~-/…` that isn't
-there) may fail and leave the shell where it was. What runs there: nothing after
-an `|| exit [N]`/`|| return [N]` (N a number or `$?`) that ends the command (not
-one piped on, and not in a command that defines, disables or aliases them, even
-with a quoted name like `function "exit"` or an escaped one like `$'\x64isable'`, uses `eval`, `source` or `.`, or runs a
-command whose name is expanded, like `$a$b exit`); the commands after the `&&` chain the `cd` starts (`cd x && a; rm
-…` runs the `rm` either way); otherwise the next command. `set -e` isn't counted
-(quoting, variables, `eval` or a function can turn it off), so the delete after a
-may-fail `cd` is checked from both folders. A deny caused that way says to chain
-the delete with `cd DIR && rm …`. The `cd`/`pushd`/`popd` operands are counted
-after expansion: an unquoted `$X` (or `$(cmd)`) that expands to nothing is gone,
-so `cd $X` goes home (a deny caused that way says to quote it; a quote inside
-`${X:+"x"}` doesn't keep it), a flag is only zsh's own (`-q`, `-s`, `-L`, `-P`, `--`;
-`popd` takes just `-q`) before any operand, literal or expanded (`cd -bad /tmp` and
-`cd /tmp -q` are `cd OLD NEW`, which fails), `cd -s` fails when a folder its
-operand names (or `cd -s -`'s previous folder) is a symlink, `cd -P` ends in the
-physical folder (`link/..` is the link target's parent), an unquoted brace group is its words (`cd {A,B}` is `cd A
-B`), and an unquoted `$(cmd)`, glob or `"$@"` may make any number of operands; the descriptor in `2>&1` or `{fd}>f` is not an operand.
-A `cd`/`pushd` with more than two operands, or a `popd` given anything but
-`+N`/`-N`, is an error that changes nothing. zsh's `cd
-OLD NEW` swaps OLD for NEW in the current directory (an empty NEW removes OLD,
-an empty OLD puts NEW in front; either may be a stack tilde), and `~+`, `~-` and `~N` (in a
-`cd` or an `rm` target) are the current, previous and stack directories; once a
-`cd` has run, `~-` in a value (`T=~-`, `for T in ~-`, `${X:-~-}`) is the tracked
-previous directory too (and `~1`, `~-1`, `~+1` there any directory seen so far,
-`~$N`/`~$U` there any of those or home; a
-`~$N`/`~$U` delete target, named only at run time, is denied; a quoted one, `'~$U'`,
-is a file by that name, but `''~$U` and `$''~$U` are not quoted; zsh's `$'…'`
-is read with its escapes decoded, a NUL kept in a value as zsh keeps it but
-ending a `cd` or `rm` path as the system call does, and zsh's `$"…"` is a `$` and a quoted string: `cd $"/tmp"` goes to
-`$/tmp`), and `$OLDPWD` is where that `cd` came from (or, when it
-may not run or may fail, what it held before). The `cd`/`pushd` operands are expanded
-once, so `cd "${D::=$D/..}"` climbs once. Inside a loop, or after zsh's
-`repeat N`, a relative `cd` and an assignment that reads a variable can also end
-up anywhere. A body with no `;` before it is a command of its own: `for g do
-rm …` (or `for f g do`), zsh's `if [[ -d x && -d y ]] rm …`, `while (( n )) { … }`, `for f (a b)
-rm …` and `f() rm …`, and `function f { … }`, also after `repeat N`, `time`,
-`{`, `!` or a function head (`f() { if [[ -d x ]] rm …; }`). zsh's `-`, `noglob`,
-`nocorrect`, `repeat N` and `time` run the command after them, and `for f g in …`
-gives each name any of the values (a loop over `ls -a` marks each name as one
-that can hold `..`). A `${Z:=…}` in a list too big to follow
-leaves `Z` too big to follow, so a delete that reads it is denied. A `for` loop
-over a list it can follow is checked once per value, with braces expanded, globs
-matched and words split where an expansion can split them (`for f in ~/*` is
-denied); a word it can't follow adds an unknown value beside the rest. zsh's
-brace expansion inside a default (`${X:-~/{Desktop,Documents}}`) is checked
-too. A value it can't know (`X=$(cmd)`, a `read` variable, a loop over
-`$(cmd)`) is checked both as some folder and as empty, each such value on its
-own, also through assignments and loop lists, so `"${X:?}/../.."` still climbs to `/` and `"${X:-$HOME/Dev}"` still
-reaches `~/Dev`. A target with too many paths to check (a brace expansion over
-4096 words, more than 8192 loop values or mixes of values in one word, a copy
-of such a value, more than 256 directories the command may be in, or more than
-about a second of checking in one command) is denied with "list the targets". A target that hits a protected folder even with every such value
-non-empty is denied outright; one that only an empty value would turn into a
-protected folder gets the rewrite first.
+A recursive `rm` whose target leans on a variable that may be empty
+(`rm -rf "$T/$k"`, which is `rm -rf /` when both are empty) is denied with a
+rewrite: `"${T:?}/${k:?}"` makes the shell abort instead of deleting. Claude
+Code stops for manual approval on the unguarded shape, and no hook can clear
+that prompt, so the rewrite is what keeps the agent moving.
 
-All of the above is zsh's reading (the macOS default shell). Every command is
-also read as bash runs it (Linux, Git Bash on Windows, or zsh with
-`SH_WORD_SPLIT`), and a protected folder either reading reaches is denied. In
-bash an unquoted value splits into words (`X="build $HOME/Dev"; rm -rf $X`
-deletes `~/Dev`), in an `rm` target and a `for` list alike. It splits at the
-characters of a literal `IFS=…` too, and once IFS is set some other way, at
-any characters at all (any stretch of the value is a possible word; past 256
-characters only at each one, or all its punctuation, and the LLM judges the rest). Quoted
-text beside the value (`"a b"$X`), and a quoted `for` word, are never split. `$"…"` is a plain quoted string, and a
-`$'…'` string ends at a NUL, so `$'\0'`, `$'\c@'` and `$'\400'` are empty. A `~` after a quote
-(`''~/x`) is not home. `cd` takes only `-L`, `-P`, `-e` and `-@`, and
-`pushd`/`popd` only `-n`, which doesn't change directory (though a later
-`popd` may go to what `pushd -n` pushed, an expanded or split one too). Any other `-x` there, including
-`cd -1`, fails and leaves the shell where it was. A second operand makes
-bash 5 fail and bash 3.2 go to the first, so both are checked. An unquoted
-`cd $D` whose value holds a space is its words (`D="-L $HOME"` is `cd -L
-~`; an expanded `~` stays a literal name), one holding only spaces is a bare
-`cd` (home), an expanded `-P` goes to the LLM, and it lands anywhere once IFS
-is set. `unset IFS` and reads like `$IFS` or `${#IFS}` leave the
-default. `enable -n exit` turns
-the builtin off as zsh's `disable` does, and `shopt` counts like `setopt`.
-
-In either shell, an `rm` argument whose value the guard can work out and that
-turns out to be a flag (`F=-rf; rm $F ~/Dev`, or bash's `X="-rf ~/Dev"; rm
-$X` and `F="r ~/Dev"; rm -$F`) makes the delete recursive; past `--` it is a
-name. Once options are set (`setopt`, `shopt`), a `cd NAME` with no `NAME`
-folder there may also go to `$NAME` (CDABLE_VARS). When the command sets
-`CDPATH` (or the environment has it), a relative `cd NAME` may also go to
-each of its folders' `NAME`, and it fails only when none of them exists;
-zsh's `cdpath=(…)` array isn't followed, so there it lands anywhere.
-
-Two kinds of recursive `rm` are allowed by rule, because they only clear
-scratch space: a folder at least one level below `/tmp` or `/private/tmp`
-(`rm -rf /tmp/build-1`, not `/tmp` itself), and a Python, pytest, mypy, ruff
-or Dart cache (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
-`.dart_tool`) inside the working directory, when that directory and the cache,
-as written and with symlinks resolved, are under a `safe_write_paths` folder
-other than `/var/folders`. Every target has to be spelled out: no `$`, glob,
-brace, `..`, space or flag from a variable, and no `cd` to a variable earlier
-in the command. A symlink is followed (`/tmp/link/sub` with `link` → `/usr` is
-not scratch). Because a command earlier in the same call could plant a link
-(`ln -s ~ /tmp/x && rm -rf /tmp/x/Documents`), a temp path deeper than
-`/tmp/NAME`, a cache in a subfolder, or a target ending in `/`, counts only
-when every other command in the call is one that can't create or move a link
-(`ls`, `mkdir`, `echo`, `cd`, `grep`, …), named plainly and with no way to
-change which program a name runs (`./mkdir`, `export`, `printf -v` and a call
-that mentions `PATH` don't count). `/var/folders`, `build`, `dist`, `node_modules` and `target` are
-not on the list, and one target off the list sends the whole delete to the LLM.
-The protected-folder deny still comes first.
+The guard follows what the shell would do to reach the target: assignments,
+`cd`, `pushd`/`popd`, loops, `|| exit`, zsh and bash word splitting, and values
+it can't know (checked both as some folder and as empty). A target with too
+many paths to check is denied with "list the targets". Two kinds of recursive
+`rm` are allowed by rule because they only clear scratch space: a folder below
+`/tmp`, and a Python or Dart cache (`__pycache__`, `.dart_tool`, …) in the
+working directory, each spelled out in full. The full rules, with the zsh and
+bash details and the known limits, are in [GUARD.md](GUARD.md).
 
 Every other recursive or bulk delete (`rm -r`, `find -delete`, `find -exec rm`,
 `xargs rm`) goes to the LLM on every call. It is never auto-allowed by rule,
@@ -281,13 +150,6 @@ whole project or data the task doesn't cover. Without an LLM configured, these
 fall through to the normal prompt. The guard reads only the command text: a
 delete hidden in a script file or an inline interpreter (`python -c`) reaches
 the LLM through the other rules, not this one.
-
-Known limits: the guard models plain shell, not deliberate obfuscation. A
-`cd` flag that comes from a variable (`F=-P; cd $F link`), a brace group
-holding `${…}` in a `cd` operand (`cd {/tmp,${HOME}/x}`), a brace-spelled
-builtin (`di{s,s}able exit`, `e{x,x}it() …`) or a nested `~${U:-${V}}` can
-put the shell somewhere the guard doesn't follow. None of these is
-auto-allowed: they reach the LLM like any other recursive delete.
 
 ### What gets auto-allowed
 
@@ -328,7 +190,10 @@ A dangerous pattern counts only where it can run. When it appears only in text p
 - **Risky operations of allowed tools** (always to the LLM) — `git reset --hard`, `git clean -f`, `git checkout` of a file or `.` (an operand that is a glob, has a file extension or exists in the folder counts as a file), `git checkout -f`/`git switch -f`, `git restore` of the work tree, `git stash drop`/`clear`, `git branch -D`, `git filter-branch`, a force push to `main`/`master` or with no branch named, a push that deletes a remote branch, `git -c` settings that run a command (an `alias.*` that isn't `!cmd` is read as the git command it stands for; a pager or editor that is `less`, `more` or a plain allowed command, like `core.pager=cat`, is fine); `curl` uploads of local files (`-d @file`, `-F f=@file`, `-T`, `-K`) and `wget --post-file`; `chmod -R` that makes a tree world-writable; `docker volume rm`/`prune`, `docker system prune`, `docker compose down -v`; writes to raw disks (`/dev/disk*`, `/dev/sd*`); writes to shell startup files (`~/.zshrc`, `~/.bashrc`, …) and `~/Library/LaunchAgents`
 - **Sensitive paths read** — Read, Glob or Grep of a `sensitive_paths` entry (also a file glob that can match one, like `**/.ssh*` or `*.env`), and a Bash command naming one (`cat ~/.ssh/id_rsa`, `cat .env`, `git show HEAD:.env`)
 - Archive extraction to system roots (`tar -C /usr/`)
-- **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
+- **Subcommands not on the list** — a command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`, is unknown with any other subcommand (`docker run`, `npm publish`): it is never approved by rule, and goes to the LLM or, without one, to you.
+- **Words built at run time where they decide the verdict** — a `$VAR`, `$(…)`, unquoted glob or brace expansion in a word the rules read to choose a verdict: a git option or subcommand (`git $S --hard`, `git reset --h{a..a}rd`, `git -c "$K" log`), any word of a git subcommand the risky-operation checks read (`git checkout $B`, `git push origin HEAD:$R`), any word of `docker volume`/`system`/`compose`, a `chmod` mode, or a subcommand matched against a multi-word entry (`az {group,x} list`). A quoted value of `git -C`, `--git-dir` or `--work-tree` is one word whatever it holds, so `git -C "$W" status` and `git -C "$(pwd)" status` are still allowed; an unquoted `git -C $W` (or a quoted `"$@"`) can split into a subcommand and goes to the LLM. A `git -c alias.…` makes every word deciding, and so does a wrapper the rules can't line up with its words (`env -S "git $S"`). Built words elsewhere (`git log $R`, `chmod +x $F`) are fine.
+- **Environment that runs other code** — a command that sets a variable a tool runs as a program (`GIT_SSH_COMMAND`, `GIT_PAGER`, `PAGER`, `GIT_EDITOR`, `EDITOR`, `VISUAL`, `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_PROXY_COMMAND`, …) to anything but `less`, `more` or a plain allowed command, or sets a loader variable at all (`LD_PRELOAD`, `LD_AUDIT`, `DYLD_*`, `BASH_ENV`, `GIT_EXEC_PATH`, `GIT_CONFIG_*`). Such a word counts anywhere in a command except as an argument a plain command just passes on (`git commit -m "PAGER=x"`): a leading assignment, `env` (also `env -S '…'` and behind other wrappers), `export`, `declare`/`local`/`typeset`, also behind `builtin` or `command`. An append (`PAGER+=…`), an element (`PAGER[1]=…`), an array (`LD_PRELOAD=(…)`) and, after a wrapper or builtin, a name built at run time (`export "$K=…"`, a brace or backtick in the name) always count. `GIT_PAGER=cat git log` is allowed, `GIT_SSH_COMMAND="sh -c …" git fetch` goes to the LLM. A value set without `=` (`read`, `printf -v`) isn't read.
+- **Function bodies** — every form of a function the command defines (`f() { …; }`, `f() ( … )`, `function f { … }`, zsh's `f() cmd`) is checked command by command like the top level, and so is each `case` arm.
 - **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / log / LLM-flag files, and Bash commands that write to them (`tee`, `>`, `sed -i`, `mv`, `ln`, a `dart`/`flutter` command that names one (`dart compile exe x -o …`), or a `cp`/`install`/`rsync` whose destination is one; copying one of them elsewhere is a read) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
 - WebFetch to domains not in the allow list
 - MCP tools not matching any `safe_mcp_tools` pattern
@@ -364,7 +229,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `allowed_web_domains` | string array | Domains auto-allowed for WebFetch (subdomains included) |
 | `safe_mcp_tools` | string array | MCP tool name patterns auto-allowed (supports glob wildcards) |
 | `safe_internal_tools` | string array | Claude Code / harness internal tools auto-allowed (no side effects outside the harness) |
-| `sensitive_paths` | string array | Path substrings: Write/Edit to them is denied; Read/Glob/Grep of them, and Bash commands naming them, go to the LLM |
+| `sensitive_paths` | string array | Write/Edit to a path containing one is denied (substring match); Read/Glob/Grep of one, and Bash commands naming one, go to the LLM (matched where a path component ends, case-insensitive: `/.env` matches `.env.local`, not `.envrc`) |
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
 | `dangerous_patterns` | string array | Regex patterns that deny when they match code (the whole command or one of its commands); a match only in data goes to the LLM |
 | `protected_delete_paths` | string array | Folders a recursive delete may never touch, nor anything above them (default `~`, `~/*`; globs expand on disk). **Not subtractable.** |
@@ -388,7 +253,7 @@ Arrays only ever *add* to the defaults, so to remove a shipped entry use `remove
 }
 ```
 
-Removal is applied last, after defaults + platform overlay + your additions. Removing a `safe_commands` entry also makes that base a **restricted family** — the first word of a removed entry means "ask me", never "unknown → allow".
+Removal is applied last, after defaults + platform overlay + your additions. A command whose entry you remove is unknown: it goes to the LLM or, without one, to you. Nothing unknown is ever allowed by rule.
 
 ### Decision log
 
@@ -434,7 +299,7 @@ The parser handles compound operators (`&&`, `||`, `;`, `|`, `|&`, and a lone `&
 
 One exception for `$VAR`: when the command sets the variable exactly once, unconditionally and at top level, to a literal (`PY=.venv/bin/python; $PY -I x.py`), the command word is read as that value and checked like any other command (`K=kubectl; $K delete …` still goes to the LLM). Every read of such a variable is written in, inside a word too (`G=git; F=hard; $G reset --$F` is `git reset --hard`), and a command that still holds a word built at run time after that (`$PY x.py $R`, `--${F:-hard}`, an unquoted brace or glob) goes to the LLM. A `~/…` value is read as the home path it expands to on assignment. Anything that could change or split the value turns the exception off: a second assignment, a read before the assignment, an assignment inside `if`, a loop, a group or after `cd x &&`, `read`/`eval`/`source`/`declare`/`printf -v`/`unset`/`export NAME`, a function, `trap`, a heredoc, a comment, a line continuation, `IFS`, or a special name like `PATH`. A control word or bracket anywhere before the assignment turns it off too, even as an argument (`echo fi`). The protected-delete guard and the permission-config check also read the command with the value written in, so `R=rm; cd ~ && $R -rf Documents` is denied and `C=cp; $C x ~/.claude/settings.json` goes to you. An `xargs` with a replace string (`-I`, `-J`, `-i`) goes to the LLM, since its input fills in words of the command.
 
-If **any** sub-command in a compound command is unknown, the entire command falls through to the permission prompt.
+If **any** sub-command in a compound command is unknown, the entire command goes to the LLM or, without one, to the permission prompt. A deny anywhere in the command wins over an ask earlier in it.
 
 Code that runs as part of the command is checked too:
 
@@ -599,6 +464,11 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
   - The inline-Python checker rejects more write paths (`gzip.GzipFile(…).write`, `sys.modules[…]` through an alias, `from os import …`, module attributes like `gzip.os`).
   - A command nested too deeply to read, or any internal error, now prompts (PreToolUse) or falls through to the prompt (PermissionRequest) instead of crashing the hook.
   - Fewer LLM calls: `dart` development commands, macOS status reads (`vm_stat`, `pmset -g`, `diskutil list`, …), recursive deletes of folders below `/tmp` and of Python/Dart caches in the working directory, and a `$VAR` command word set once to a literal are allowed by rule. Runners after leading assignments are peeled (`TMPDIR=/tmp/x timeout 300 dart test`); this also stops `X=1 xargs kubectl delete` from being rule-allowed. `dart`/`flutter pub publish`, `pub token` and `pub global` go to the LLM, and so does an `xargs` with a replace string (`-I`/`-J`/`-i`), which was rule-allowed before.
+  - A word built at run time where it decides the verdict goes to the LLM: `git $S --hard`, `git reset --h{a..a}rd`, `git -C $W …` (unquoted), `git checkout $B`, `docker compose down $V`, `chmod -R $M .`, a subcommand matched against a multi-word entry. These were rule-allowed before. On the author's decision log this sends about 0.2% of calls (19 of 8,994, all `git`) to the LLM that were allowed by rule.
+  - A command that sets a variable which makes a tool run other code (`GIT_SSH_COMMAND`, `GIT_PAGER`, `EDITOR`, …, to anything but `less`, `more` or a plain allowed command; `LD_PRELOAD`, `DYLD_*`, `GIT_CONFIG_*` and other loader variables at all) goes to the LLM. These were rule-allowed before.
+  - Function bodies in `( )` and zsh's short form (`f() cmd`) are checked like `{ }` bodies; `f() ( git reset --hard ); f` was rule-allowed before. An unknown command in a function body or `case` arm is now named and logged like one at top level.
+  - Bash evaluation is about six times faster (median 6.7 → 1.1 ms, p99 22 → 5 ms per command on a back-to-back replay of 8,994 logged commands), from caching the parsers within one hook call and matching wildcard entries with one compiled pattern.
+  - Internal cleanup: the unused restricted-command-family code is gone (its effect, an unlisted subcommand counting as unknown, is unchanged), the LLM-answer fallback parser is shorter, and the long protected-delete detail moved from this README to [GUARD.md](GUARD.md).
 - **2026-10-29 — auto-learning removed.** Approvals are no longer written to your config. Without an LLM, unknown Bash commands, home/temp writes and WebFetch to new domains now prompt instead of being approved and learned. `SAFETY_HOOK_AUTO_LEARN`, `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored. Previously learned entries stay in your config. See [the upgrade note](#smart-permissions) at the top.
 
 ## License
