@@ -921,7 +921,7 @@ def _shlex_split_safe(cmd):
         return cmd.split()
 
 
-def _resolve_through_wrappers(cmd):
+def _resolve_through_wrappers(cmd, _seen=None):
     """If `cmd` starts with a transparent wrapper (env, timeout, nohup, …),
     return the inner command string starting at the real basename.
 
@@ -943,17 +943,23 @@ def _resolve_through_wrappers(cmd):
 
     Uses shlex so quoted env values like `env FOO="bar baz" python -c …`
     are tokenized correctly. Wrapper chains (`env timeout 5 python -c …`)
-    are handled by tail-calling. Redirections before the wrapper
-    (`< /dev/null env …`) are skipped.
+    are handled by tail-calling. Redirections and assignments before the
+    wrapper (`< /dev/null env …`, `TMPDIR=/tmp/x timeout 300 …`) are
+    skipped; callers that judge the environment read it from `cmd`.
     """
     tokens = _shlex_split_safe(_strip_leading_redirections(cmd))
-    if not tokens:
+    start = 0
+    while start < len(tokens) and _ASSIGNMENT_RE.match(tokens[start]):
+        start += 1
+    if start >= len(tokens):
         return cmd
-    first = os.path.basename(tokens[0])
+    first = os.path.basename(tokens[start])
     if first not in _INTERPRETER_WRAPPERS:
         return cmd
+    if _seen is not None:  # every wrapper on the way, for _xargs_replace_risk
+        _seen.append(tokens[start:])
 
-    idx = 1
+    idx = start + 1
     # Skip wrapper-specific flags and positional arguments.
     while idx < len(tokens):
         tok = tokens[idx]
@@ -976,7 +982,7 @@ def _resolve_through_wrappers(cmd):
                     inner_tokens = _shlex_split_safe(s_value) + rest
                     if inner_tokens:
                         inner_cmd = shlex.join(inner_tokens)
-                        return _resolve_through_wrappers(inner_cmd)
+                        return _resolve_through_wrappers(inner_cmd, _seen)
                 return cmd
             if first == "env" and (tok.startswith("-S") or tok.startswith("--split-string=")):
                 # Attached form: -S"cmd" or --split-string=cmd
@@ -988,7 +994,7 @@ def _resolve_through_wrappers(cmd):
                 inner_tokens = _shlex_split_safe(value) + rest
                 if inner_tokens:
                     inner_cmd = shlex.join(inner_tokens)
-                    return _resolve_through_wrappers(inner_cmd)
+                    return _resolve_through_wrappers(inner_cmd, _seen)
                 return cmd
             # Wrappers with value-flags we care about
             if first == "env" and tok in ("-u", "--unset"):
@@ -1055,7 +1061,7 @@ def _resolve_through_wrappers(cmd):
     # Recurse to handle wrapper chains (env timeout 5 python -c …)
     inner_first = os.path.basename(tokens[idx])
     if inner_first in _INTERPRETER_WRAPPERS:
-        return _resolve_through_wrappers(inner)
+        return _resolve_through_wrappers(inner, _seen)
     return inner
 
 
@@ -1820,7 +1826,7 @@ def is_always_ask_write_path(file_path):
 # must stay auto-allowed. A redirect (>, >>) is handled separately as write intent.
 _FILE_WRITER_COMMANDS = frozenset({
     "cp", "mv", "dd", "tee", "install", "ln", "truncate",
-    "touch", "rsync", "sed",
+    "touch", "rsync", "sed", "dart", "flutter",   # `dart compile exe x -o FILE`
 })
 
 
@@ -1929,6 +1935,12 @@ def bash_writes_to_config_path(command):
     """
     if not command:
         return False
+    alt = _constant_text(command)  # `C=cp; $C x ~/.claude/settings.json`
+    return _bash_writes_config(command) or bool(alt) and _bash_writes_config(alt)
+
+
+def _bash_writes_config(command):
+    """bash_writes_to_config_path for the command as written."""
     names = _references_always_ask_path(command)
     try:
         # A path only printf's output spells (`printf '~/.%s/…' claude | sh`)
@@ -2800,6 +2812,83 @@ def _delete_paths_for(path):
     return out
 
 
+# A recursive delete approved by rule (no LLM): every target a literal word
+# and every path it may destroy (symlinked parents and contents resolved, as
+# _delete_paths_for gives them) a temp folder's entry, or a tool cache folder
+# inside a cwd that is under a safe write path. Build output (build, dist,
+# node_modules, target) and /var/folders still go to the LLM.
+#
+# The symlinks are resolved now, before the command runs. A command before
+# the delete could plant one (`ln -s ~ /tmp/x && rm -rf /tmp/x/Documents`).
+# A link can't reach outside through `/tmp` itself, and rm removes a link
+# named as its last component without following it, so `/tmp/NAME` is safe
+# either way, and so is a cache folder named in the cwd (a cwd a planted link
+# led to still loses only a folder of that cache name). A deeper temp path,
+# a cache folder in a subfolder, or a target with a trailing `/` (rm follows
+# that link), counts only when every other command is one
+# that can't create a link or move one into place, nor start another program
+# (`rg --pre`, `sort --compress-program` can, so they're not listed):
+# _LINK_INERT_COMMANDS.
+_SCRATCH_WORD_RE = re.compile(r"(?:~/)?[\w./@%+,:-]+")
+_TEMP_ROOTS = ("/tmp/", "/private/tmp/")
+_CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+                         ".dart_tool"})
+_LINK_INERT_COMMANDS = frozenset({
+    "rm", "rmdir", "mkdir", "touch", "cd", "pushd", "popd", "pwd", "echo", "printf",
+    "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "uniq", "cut", "tr", "comm", "paste", "column", "nl", "jq", "date", "sleep", "true", "false",
+    ":", "test", "[", "[[", "df", "du", "stat", "file", "which", "type", "basename",
+    "dirname", "realpath", "readlink", "shasum", "sha256sum", "md5", "md5sum", "cmp",
+    "diff", "pgrep", "ps", "pkill", "kill", "wait", "exit", "unset", "uname",
+    "whoami", "id", "hostname", "seq", "tee"})
+
+
+def _scratch_delete(word, paths, cwd, link_inert):
+    """True when deleting rm target `word` (unquoted), which may destroy
+    `paths`, only removes scratch: see _SCRATCH_WORD_RE above.
+    `link_inert()` says whether the rest of the command can plant a link."""
+    if not paths or not _SCRATCH_WORD_RE.fullmatch(word) or ".." in word.split("/") \
+            or not (cwd or word.startswith(("/", "~/"))):
+        return False
+    homes = [os.path.normpath(d) for d in (cwd, cwd and os.path.realpath(cwd)) if d]
+    follows = word.endswith("/")
+    for path in map(os.path.normpath, paths):
+        root = next((r for r in _TEMP_ROOTS if path.startswith(r)), None)
+        if root:
+            if (follows or "/" in path[len(root):]) and not link_inert():
+                return False
+            continue
+        if os.path.basename(path) in _CACHE_DIRS \
+                and any(path.startswith(h.rstrip("/") + "/") for h in homes) \
+                and _cache_home(homes[0]) and _cache_home(path) \
+                and (not (follows or "/" in word.strip("/").removeprefix("./")) or link_inert()):
+            continue
+        return False
+    return True
+
+
+def _cache_home(path):
+    """True when `path` is under a safe write path (as written or resolved)
+    other than /var/folders, which the scratch rule leaves to the LLM."""
+    return any(path.startswith(w.rstrip("/") + "/")
+               for safe in SAFE_WRITE_PATHS if safe.rstrip("/") not in ("/var/folders", "/private/var/folders")
+               for w in {safe, os.path.realpath(safe)})
+
+
+def _link_inert(command):
+    """True when no command `command` may run can create a symlink or move
+    one into place (see _LINK_INERT_COMMANDS), nor change which program a
+    name runs (`./mkdir`, `PATH=.; mkdir`, zsh `path=(.)`, `printf -v`)."""
+    if re.search(r"(?<!\w)path", re.sub(r"[\"'\\]", "", command), re.I):
+        return False
+    for cmd in _iter_commands(command):
+        if cmd is None:
+            return False
+        words = _command_line(cmd)[0]
+        if words and (words[0] not in _LINK_INERT_COMMANDS or _sets_variables(cmd)):
+            return False
+    return True
+
+
 _ANSI_C_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f",
                    "v": "\v", "e": "\x1b", "E": "\x1b"}
 
@@ -3176,11 +3265,15 @@ def protected_delete_check(command, cwd=None, empty_side=True):
     if not command or ("rm" not in command and "-delete" not in command):
         return None
     results = []
-    for bash in (False, True):
-        result = _protected_delete_check(command, cwd, empty_side, bash)
-        if result and result[0] == "deny":
-            return result
-        results.append(result)
+    # The command with its `$NAME` constants written out is read too, so
+    # `R=rm; cd ~ && $R -rf Documents` is seen with its cd.
+    alt = _constant_text(command)
+    for text in (command, alt) if alt else (command,):
+        for bash in (False, True):
+            result = _protected_delete_check(text, cwd, empty_side, bash)
+            if result and result[0] == "deny":
+                return result
+            results.append(result)
     return next((r for r in results if r), None)
 
 
@@ -3259,6 +3352,13 @@ def _protected_delete_check(command, cwd, empty_side, bash):
     cwds_overflow = False
     trust_pwd = not _PWD_REDEFINED_RE.search(command)
     recursive_delete = False
+    variable_cd = re.search(r"(?:^|[\s;&|({])(?:cd|pushd|popd)\b[^;&|\n]*[$`]", command)
+    inert = []
+
+    def link_inert():
+        if not inert:
+            inert.append(_link_inert(command))
+        return inert[0]
     budget = [_MAX_PASSES]
     too_many = ("deny", "Blocked recursive delete: `{}` expands to too many paths (brace "
                 "groups, loop values, directories, values known only at run time) to check "
@@ -3439,10 +3539,8 @@ def _protected_delete_check(command, cwd, empty_side, bash):
         options = args[:args.index("--")] if "--" in args else args
         flag_words = [] if recursive else [a for a in options if re.search(r"[$`]", a)]
         targets += [a for a in options if a.startswith("-") and a in split]
-        if not (recursive or bulk or flag_words):
-            return None
-        if (recursive or bulk) and risky:
-            recursive_delete = True
+        if bulk and risky:
+            recursive_delete = True  # xargs: the targets come from its input
         if not (recursive or flag_words):
             return None
         if protected is None:
@@ -3465,7 +3563,10 @@ def _protected_delete_check(command, cwd, empty_side, bash):
             nonlocal recursive_delete
             if flag_words and not any(expands_to_flag(t, where, vs) for t in flag_words):
                 return None
-            recursive_delete = recursive_delete or risky
+            # Scratch (literal temp paths, cache folders) is deleted by rule;
+            # any other recursive delete goes to the LLM. A cwd reached by a
+            # `cd "$D"` rests on what the hook's environment says D is.
+            scratch = not flag_words and not variable_cd
             for t in targets:
                 if cwds_overflow:
                     return (too_many[0], too_many[1].format(t))
@@ -3491,6 +3592,8 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                                    " was: chain it with `cd DIR && rm …`)" if cd_may_fail else "")
                                 + (" (an unquoted `$…` that expands to nothing makes `cd` go"
                                    " home: quote it, `cd \"$D\" && rm …`)" if cd_may_go_home else ""))
+                scratch = scratch and _scratch_delete(t, paths, where, link_inert)
+            recursive_delete = recursive_delete or risky and not scratch
             return None
         return step
 
@@ -4574,6 +4677,7 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
 
     # Check each sub-command
     unknown_words = []
+    constants = None  # _command_constants(command), once a `$NAME` command word needs it
     for cmd in commands:
         cmd = _strip_leading_keywords(cmd)
         if not cmd.strip():
@@ -4617,7 +4721,7 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
             continue  # an ask is settled; only a deny in a later part can change it
 
         # `< in cmd …`, `2>/dev/null cmd …`: the command word follows them.
-        cmd = _strip_leading_redirections(cmd)
+        cmd = part = _strip_leading_redirections(cmd)
         first_word = get_first_command_word(cmd)
         if first_word is None:
             # Command substitution as the command itself (e.g. `$(which
@@ -4657,6 +4761,22 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
             first_word = inner_first
             cmd = inner_cmd
             basename = inner_basename
+
+        # `PY=/x/bin/python; $PY t.py`: a name set once to a literal before
+        # every read is its value; the command it runs is judged written out.
+        if first_word.startswith("$"):
+            if constants is None:
+                constants = _command_constants(command)
+            expanded = _expand_constant(part, constants)
+            if expanded:
+                verdict = _nested_verdict(expanded, _depth, log_unknowns)
+                if verdict[0] == "deny":
+                    return verdict
+                if verdict[0] != "allow":
+                    held = verdict
+                elif _expansion_left(expanded):  # only a fully written command is trusted
+                    held = ("ask", f"{first_word} runs with words built at run time")
+                continue
 
         # Check known-safe commands (supports multi-word like "flutter doctor")
         if matches_safe_command(first_word, cmd):
@@ -4799,6 +4919,181 @@ def _check_inner_commands(body_text, defined_functions, _depth=0, log_unknowns=T
         held = ("ask", f"Unknown command in compound block: {first_word}")
 
     return held
+
+
+# ── `$NAME` as a command word ───────────────────────────────────────────────
+# `PY=/x/bin/python; $PY t.py` runs /x/bin/python. The value is used only when
+# the shell can't hold anything else when the read runs: one statement of
+# literal assignments, outside any loop, group, condition or subshell, after
+# `;`, a newline or the start (or after `&&`, with every read later in the
+# same and-chain), every read after it, and nothing in the command that can
+# set a variable some other way (builtins below, a command word built at
+# run time, the name written anywhere else).
+_CONST_VALUE = r"(?:(?:~/)?[\w./@%+,:-]+|\"[\w./@%+,:-]+\"|'[\w./@%+,:-]+')"
+_CONST_STATEMENT_RE = re.compile(
+    r"(?:^|(?<=[;\n&]))[ \t]*((?:[A-Za-z_]\w*=%s[ \t]+)*[A-Za-z_]\w*=%s)[ \t]*(?=;(?!;)|\n|&&|$)"
+    % (_CONST_VALUE, _CONST_VALUE))
+_CONST_PAIR_RE = re.compile(r"([A-Za-z_]\w*)=(%s)" % _CONST_VALUE)
+_VARIABLE_SETTERS = frozenset({
+    "eval", "source", ".", "read", "mapfile", "readarray", "declare", "typeset", "local",
+    "readonly", "float", "integer", "let", "getopts", "unset", "vared", "zparseopts",
+    "coproc", "alias", "zmodload", "zle", "trap", "enable", "disable", "emulate", "setopt",
+    "unsetopt", "shopt", "functions", "autoload", "zstyle", "zformat", "zregexparse",
+    "sysread", "zstat", "strftime", "getln", "compgen", "fc", "r", "select", "repeat"})
+# … and these with an option (`printf -v NAME`, `set -A NAME`), or for export
+# any word but a NAME=value
+_VARIABLE_SETTER_FLAGS = {"printf": r"-\w*v", "print": r"-\w*v", "wait": r"-\w*p",
+                          "set": r"[-+]\w*A", "export": r"-|(?![A-Za-z_]\w*=)"}
+_SPECIAL_NAMES = frozenset({"_", "IFS", "PATH", "PWD", "OLDPWD", "HOME", "CDPATH", "ENV",
+                            "RANDOM", "SECONDS", "LINENO", "UID", "EUID", "PPID"})
+
+
+def _command_constants(command):
+    """{NAME: value} for the names `command` reads as `$NAME` command
+    words that can only hold one literal value there (see above)."""
+    if "$" not in command or "<<" in command or "IFS" in command or "\\\n" in command \
+            or re.search(r"(?:^|\s)#|\$\{[\s|(]|\(\s*\)|\bfunction\b", command):
+        return {}
+    parts, uncertain = split_compound_command(command)
+    if uncertain or any(_sets_variables(part, dynamic=True) for part in parts):
+        return {}
+    tokens = [w for part in parts for w in _shell_words(part)]
+    constants = {}
+    for m in _CONST_STATEMENT_RE.finditer(command):
+        prefix = command[:m.start(1)].rstrip(" \t")
+        chained = prefix.endswith("&&")
+        if prefix and not (chained or prefix.endswith((";", "\n")) and not prefix.endswith(";;")) \
+                or bash_parse_uncertain(prefix) or _CONTROL_RE.search(prefix):
+            continue
+        for name, value in _CONST_PAIR_RE.findall(m.group(1)):
+            read = re.compile(r"\$(?:\{%s\}|%s(?!\w))" % (name, name))
+            reads = [r.start() for r in read.finditer(command)]
+            # Written anywhere but by this statement (`${N:=x}` included): no.
+            mentions = sum(bool(re.search(r"(?<!\w)%s(?!\w)" % name, read.sub("", t))) for t in tokens)
+            if name in _SPECIAL_NAMES or mentions != 1 \
+                    or any(r < m.end() for r in reads) or chained and not all(
+                        re.fullmatch(r"(?:[^;&|\n(){}`]|&&)*", command[m.end():r]) for r in reads):
+                continue
+            value = value.strip("\"'")
+            if value.startswith("~/"):  # the shell expands it on assignment
+                value = os.path.expanduser(value)
+                if re.search(r"(?<!\w)HOME(?!\w)", command) or not re.fullmatch(r"[\w./@%+,:-]+", value):
+                    continue
+            constants[name] = value
+    # A constant can name a setter itself (`P=printf; $P -v K …`).
+    if constants and any(_sets_variables(part) for part in
+                         split_compound_command(_replace_constant_reads(command, constants))[0]):
+        return {}
+    return constants
+
+
+# A statement inside a condition, loop, group or subshell: any of these
+# words, or a bracket, before it (also as an argument: `echo fi` fails safe).
+_CONTROL_RE = re.compile(r"(?:^|[\s;&|])(?:if|then|else|elif|fi|for|while|until|do|done|case"
+                         r"|esac|select|foreach|end|repeat|coproc|!)(?=$|[\s;&|])|[(){}]")
+
+
+def _sets_variables(part, dynamic=False):
+    """True when simple command `part` may set a shell variable (see
+    _VARIABLE_SETTERS), or with `dynamic`, has a command word built at run
+    time other than a plain `$NAME`."""
+    words = _command_line(part)[0]
+    name = words[0] if words else ""
+    if name in _VARIABLE_SETTER_FLAGS:
+        if any(re.match(_VARIABLE_SETTER_FLAGS[name], a) for a in words[1:]):
+            return True
+        for a in words[1:]:  # an option built at run time (`printf -$F`) may be it
+            if re.search(r"[$`]", a):
+                return True
+            if a == "--" or not a.startswith(("-", "+")):
+                break
+    return name in _VARIABLE_SETTERS \
+        or dynamic and bool(re.search(r"[$`]", name)) \
+        and not re.fullmatch(r"\$\{?[A-Za-z_]\w*\}?", name)
+
+
+_CONST_READ_RE = re.compile(r"\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))")
+
+
+def _replace_constant_reads(text, constants):
+    """`text` with every `$N`/`${N}` read of a constant, outside single
+    quotes and backticks, written out as its value (`--$F` → `--hard`).
+    The values hold no quote, space, glob or `~`, so the words mean the
+    same."""
+    out, i, n, quote = [], 0, len(text), None
+    while i < n:
+        c = text[i]
+        if c == "\\" and quote in (None, '"'):
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote and quote != '"':
+            if c == quote:
+                quote = None
+        elif c == "$" and text[i + 1:i + 2] == "$":  # `$$F` is the pid, then F
+            out.append("$$")
+            i += 2
+            continue
+        elif c == "$":
+            m = _CONST_READ_RE.match(text, i)
+            name = m and (m.group(1) or m.group(2))
+            if name in constants:
+                out.append(constants[name])
+                i = m.end()
+                continue
+        elif c == '"':
+            quote = None if quote else c
+        elif c in "'`" and not quote:
+            quote = c
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _constant_text(command):
+    """`command` with its constants' reads written out (see
+    _command_constants), or None when it has none. The guard and the C9
+    check read this too, so `R=rm; cd ~ && $R -rf Documents` is denied."""
+    if not command or "$" not in command:
+        return None
+    constants = _command_constants(command)
+    return _replace_constant_reads(command, constants) if constants else None
+
+
+def _expand_constant(part, constants):
+    """`part` with its constants' reads written out (`$G reset --$F` →
+    `git reset --hard`), or None when its first `$` word, the command word,
+    is no constant."""
+    for start, word in _iter_word_starts(part):
+        if not word.startswith(("$", '"$')):
+            continue
+        m = re.fullmatch(r"(\"?)\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))\1", word)
+        name = m and (m.group(2) or m.group(3))
+        if name not in constants:
+            return None
+        return _replace_constant_reads(part, constants)
+    return None
+
+
+def _expansion_left(text):
+    """True when `text` still holds a `$` or backtick outside single quotes,
+    or an unquoted brace, glob or parenthesis: a word the shell builds at
+    run time (`--${F:-hard}`, `$R`, `--h{a..a}rd`, `--h?rd`)."""
+    i, quote = 0, None
+    while i < len(text):
+        c = text[i]
+        if quote == "'":
+            quote = None if c == "'" else quote
+        elif c == "\\":
+            i += 1
+        elif c in "$`" or not quote and c in "{}*?[(":
+            return True
+        elif c == '"':
+            quote = None if quote else c
+        elif c == "'" and not quote:
+            quote = c
+        i += 1
+    return False
 
 
 _FUNCTION_HEAD_RE = re.compile(r"^(?:function\s+)?[A-Za-z_][\w-]*\s*(?:\(\s*\))?")
@@ -5861,6 +6156,80 @@ def _docker_risk(name, args):
     return None
 
 
+_PUB_RISKY = frozenset({"publish", "lish", "upload", "token", "global"})
+# … the subcommands that may take a word built at run time (not compile,
+# doc or build, which write where they're told: `-o "$D/settings.json"`)
+_DART_ARG_SUBCOMMANDS = frozenset({"test", "analyze", "format", "run"})
+
+
+def _pub_risk(cmd):
+    """Why a dart/flutter command publishes a package, handles pub
+    credentials or installs global tools (`pub publish|lish|upload|token|
+    global`, also after global options, `flutter pub pub …` and wrappers like
+    `xargs`), or None. A word the shell builds at run time after `pub`
+    counts too."""
+    for words in (_command_line(cmd)[0], _shlex_split_safe(_resolve_through_wrappers(cmd))):
+        tool = os.path.basename(words[0]).lower() if words else ""
+        if tool not in ("dart", "flutter"):
+            continue
+        rest = [a.lower() for a in words[1:]]
+        sub = next((a for a in words[1:] if not a.startswith("-")), "")
+        if re.search(r"[$`]", sub):
+            return f"{tool} subcommand built at run time ({sub})"
+        # A run-time word is trusted only after a subcommand it can't turn
+        # into a publish (an option's value can pass for the subcommand:
+        # `flutter --device-id pixel $S publish`).
+        dynamic = next((a for a in words[1:] if re.search(r"[$`]", a)), None)
+        if dynamic and sub not in _DART_ARG_SUBCOMMANDS and not sub.endswith(".dart"):
+            return f"{tool} with a word built at run time ({dynamic})"
+        pub =next((j for j, a in enumerate(rest) if a in ("pub", "packages")), None)
+        if pub is not None:
+            hit = next((a for a in rest[pub + 1:] if a in _PUB_RISKY or re.search(r"[$`]", a)), None)
+            if hit:
+                return f"{tool} pub {hit} (publishes a package, or changes pub credentials or global tools)"
+    return None
+
+
+# xargs options that take a value word, and those that put input in place of
+# a word of the command (`-I X`, BSD `-J X`, GNU `-i`/`--replace`)
+_XARGS_VALUE_OPTS = frozenset({"-I", "-J", "-n", "--max-args", "-L", "-P", "--max-procs", "-s",
+                               "--max-chars", "-a", "--arg-file", "-E", "-d", "--delimiter",
+                               "-R", "-S"})
+_XARGS_REPLACE_RE = re.compile(r"-[^-]*[IJi]|--replace")
+
+
+def _xargs_replace_risk(cmd):
+    """Why `cmd` runs xargs with a replace string, or None: xargs then puts
+    its input in place of words of the command, the subcommand too
+    (`printf pub | xargs -I X dart X publish`), so the words read here are
+    not the ones that run."""
+    seen = []
+    _resolve_through_wrappers(cmd, seen)
+    for tokens in seen:
+        if os.path.basename(tokens[0]) != "xargs":
+            continue
+        j = 1
+        while j < len(tokens) and tokens[j].startswith("-") and tokens[j] not in ("-", "--"):
+            if _XARGS_REPLACE_RE.match(tokens[j]):
+                return "xargs with a replace string (its input becomes words of the command)"
+            j += 2 if tokens[j] in _XARGS_VALUE_OPTS else 1
+    return None
+
+
+def _dart_script(cmd):
+    """True for `dart [--opt=value…] FILE.dart …`: dart runs the script as
+    `dart run FILE.dart` would. An option with a separate value word could
+    take FILE as that value, so only `=`-attached options may come first."""
+    tokens = _shlex_split_safe(_strip_leading_redirections(cmd))
+    while tokens and _ASSIGNMENT_RE.match(tokens[0]):
+        tokens = tokens[1:]
+    for t in tokens[1:]:
+        if t.startswith("-") and ("=" in t or t == "--enable-asserts"):
+            continue
+        return t.endswith(".dart") and not re.search(r"[$`]", t)
+    return False
+
+
 def _expand_home(word):
     """`word` with a leading ~ / $HOME / ${HOME} spelled out."""
     for prefix in ("${HOME}", "$HOME", "~"):
@@ -5957,7 +6326,7 @@ def _risky_operation(cmd):
               else _upload_risk(name, args) if name in ("curl", "wget")
               else _chmod_risk(args) if name == "chmod"
               else _docker_risk(name, args) if name in ("docker", "docker-compose")
-              else None)
+              else _xargs_replace_risk(cmd) or _pub_risk(cmd))
     if isinstance(reason, tuple):
         return reason  # a steer
     if reason:
@@ -6993,6 +7362,10 @@ def matches_safe_command(first_word, cmd):
         candidates = _build_candidates(words, longest_only=(mode == "include"))
         if _check_candidates(basename, candidates, wordwise=(mode == "stop")):
             return True
+
+    # `dart tool/x.dart` is `dart run tool/x.dart`: trusted as far as that is
+    if basename == "dart" and _dart_script(cmd) and _check_candidates(basename, ["dart run"]):
+        return True
 
     # Fall back to single-word exact match
     return basename in SAFE_COMMANDS or first_word in SAFE_COMMANDS

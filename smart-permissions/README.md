@@ -44,6 +44,7 @@ Tool call
   │  rm -r target on a possibly-empty $VAR          ──→  DENY + rewrite│
   │  Permission-config write? (settings, this cfg)  ──→  ASK (C9)      │
   │  Plain force push (not main)                    ──→  DENY + rewrite│
+  │  rm -r of /tmp/x, or __pycache__ under cwd      ──→  ALLOW         │
   │  Other recursive delete (rm -r, find -delete)   ──→  LLM           │
   │  Risky pattern? (rm *, find / -delete)          ──→  LLM           │
   │  Known-safe command/subcommand?                 ──→  ALLOW         │
@@ -253,6 +254,25 @@ folder there may also go to `$NAME` (CDABLE_VARS). When the command sets
 each of its folders' `NAME`, and it fails only when none of them exists;
 zsh's `cdpath=(…)` array isn't followed, so there it lands anywhere.
 
+Two kinds of recursive `rm` are allowed by rule, because they only clear
+scratch space: a folder at least one level below `/tmp` or `/private/tmp`
+(`rm -rf /tmp/build-1`, not `/tmp` itself), and a Python, pytest, mypy, ruff
+or Dart cache (`__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`,
+`.dart_tool`) inside the working directory, when that directory and the cache,
+as written and with symlinks resolved, are under a `safe_write_paths` folder
+other than `/var/folders`. Every target has to be spelled out: no `$`, glob,
+brace, `..`, space or flag from a variable, and no `cd` to a variable earlier
+in the command. A symlink is followed (`/tmp/link/sub` with `link` → `/usr` is
+not scratch). Because a command earlier in the same call could plant a link
+(`ln -s ~ /tmp/x && rm -rf /tmp/x/Documents`), a temp path deeper than
+`/tmp/NAME`, a cache in a subfolder, or a target ending in `/`, counts only
+when every other command in the call is one that can't create or move a link
+(`ls`, `mkdir`, `echo`, `cd`, `grep`, …), named plainly and with no way to
+change which program a name runs (`./mkdir`, `export`, `printf -v` and a call
+that mentions `PATH` don't count). `/var/folders`, `build`, `dist`, `node_modules` and `target` are
+not on the list, and one target off the list sends the whole delete to the LLM.
+The protected-folder deny still comes first.
+
 Every other recursive or bulk delete (`rm -r`, `find -delete`, `find -exec rm`,
 `xargs rm`) goes to the LLM on every call. It is never auto-allowed by rule,
 and its verdict covers only that call. The LLM sees the working directory and your
@@ -279,6 +299,9 @@ auto-allowed: they reach the LLM like any other recursive delete.
 - **WebFetch** to allowed domains — GitHub, StackOverflow, language docs, etc.
 - **MCP tools** matching `safe_mcp_tools` patterns — configure per-server with globs
 - **Global flags** before subcommands — `docker --context prod build`, `npm --prefix /tmp run dev`, etc.
+- **Dart** development commands — `dart test`, `analyze`, `format`, `fix --dry-run`, `pub get`/`upgrade`/`downgrade`/`deps`/`outdated`, `run`, `compile`, `doc`, `--version`, and `dart tool/x.dart` (a script, like `python3 x.py`)
+- **macOS status reads** — `vm_stat`, `pmset -g`, `memory_pressure -Q`, `ioreg`, `iostat`, `diskutil list`/`info`, `scutil --get`, `csrutil status`, `sw_vers`, `sysctl`, `code --version`/`--list-extensions`
+- **Scratch deletes** — a recursive `rm` of a folder below `/tmp`, or of a Python/Dart cache in the working directory (see [Recursive deletes](#recursive-deletes))
 
 ### What gets blocked
 
@@ -297,7 +320,7 @@ A dangerous pattern counts only where it can run. When it appears only in text p
 
 ### What gets prompted
 
-- **Dangerous subcommands** — `npm publish`, `docker run`, `docker exec`, `docker push`, `gh pr create`, `gh pr merge`, `cargo publish`, `pip uninstall`
+- **Dangerous subcommands** — `npm publish`, `docker run`, `docker exec`, `docker push`, `gh pr create`, `gh pr merge`, `cargo publish`, `pip uninstall`, `dart`/`flutter pub publish`, `pub token` and `pub global` (also behind global options or a wrapper: `dart --verbosity=all pub publish`, `xargs flutter pub publish`), and a `dart`/`flutter` subcommand built at run time (`flutter $S publish`), or any word built at run time unless the subcommand is `test`, `analyze`, `format`, `run` or a `.dart` script (`dart compile exe x -o "$OUT"`)
 - `bash -c`, `sh -c`, `fish --command`, `osascript -e` (inline interpreter execution)
 - **Code run by another command** — code a shell reads from a heredoc or here-string is checked like a top-level command: `bash <<'EOF'` with `ls` in it is allowed, with an unknown command it prompts. A shell fed from a pipe or a file (`… | sh`, `bash < f`), heredoc code with `$…` expansions, a login shell, an rc file or `BASH_ENV` (also when exported earlier in the command), fish code (its `-c` and `-C` init code are still read for denies and C9), an unknown command in a `trap` handler or `find -exec`, and an awk program that runs commands (`system()`, `print | "cmd"`) prompt
 - `rm *` or `rm .*` (wildcard deletion)
@@ -306,7 +329,7 @@ A dangerous pattern counts only where it can run. When it appears only in text p
 - **Sensitive paths read** — Read, Glob or Grep of a `sensitive_paths` entry (also a file glob that can match one, like `**/.ssh*` or `*.env`), and a Bash command naming one (`cat ~/.ssh/id_rsa`, `cat .env`, `git show HEAD:.env`)
 - Archive extraction to system roots (`tar -C /usr/`)
 - **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
-- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / log / LLM-flag files, and Bash commands that write to them (`tee`, `>`, `sed -i`, `mv`, `ln`, or a `cp`/`install`/`rsync` whose destination is one; copying one of them elsewhere is a read) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
+- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / log / LLM-flag files, and Bash commands that write to them (`tee`, `>`, `sed -i`, `mv`, `ln`, a `dart`/`flutter` command that names one (`dart compile exe x -o …`), or a `cp`/`install`/`rsync` whose destination is one; copying one of them elsewhere is a read) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
 - WebFetch to domains not in the allow list
 - MCP tools not matching any `safe_mcp_tools` pattern
 - Anything else the rules can't settle (a novel CLI tool, a write outside the safe folders), when no LLM is configured
@@ -407,7 +430,9 @@ for f in *.txt; do echo "$f"; done
 # → recognizes shell keywords (for, do, done, echo)
 ```
 
-The parser handles compound operators (`&&`, `||`, `;`, `|`, `|&`, and a lone `&` that backgrounds a job — `2>&1`, `&>` and `>&` stay redirections), quoting, backslash escapes, heredocs, subshells and `{ }` groups (also with redirections after them), line continuations, `case...esac`, function definitions, loops, and variable assignments. Redirections before the command word (`< /dev/null cmd`, `2>/dev/null cmd`) are skipped, so `cmd` is what gets checked. Transparent runners (`env`, `timeout`, `nohup`, `xargs`, `command`, …) are peeled so the *inner* command is what gets checked (`xargs docker run` is evaluated as `docker run`, not auto-allowed as `xargs`), and indirect command words — `$VAR`, `\docker`, and meta-execution builtins (`eval`, `source`, `.`) — are treated as unknown rather than trusted.
+The parser handles compound operators (`&&`, `||`, `;`, `|`, `|&`, and a lone `&` that backgrounds a job — `2>&1`, `&>` and `>&` stay redirections), quoting, backslash escapes, heredocs, subshells and `{ }` groups (also with redirections after them), line continuations, `case...esac`, function definitions, loops, and variable assignments. Redirections before the command word (`< /dev/null cmd`, `2>/dev/null cmd`) are skipped, so `cmd` is what gets checked. Transparent runners (`env`, `timeout`, `nohup`, `xargs`, `command`, …) are peeled so the *inner* command is what gets checked (`xargs docker run` is evaluated as `docker run`, not auto-allowed as `xargs`), also after leading assignments (`TMPDIR=/tmp/x timeout 300 dart test`), and indirect command words — `$VAR`, `\docker`, and meta-execution builtins (`eval`, `source`, `.`) — are treated as unknown rather than trusted.
+
+One exception for `$VAR`: when the command sets the variable exactly once, unconditionally and at top level, to a literal (`PY=.venv/bin/python; $PY -I x.py`), the command word is read as that value and checked like any other command (`K=kubectl; $K delete …` still goes to the LLM). Every read of such a variable is written in, inside a word too (`G=git; F=hard; $G reset --$F` is `git reset --hard`), and a command that still holds a word built at run time after that (`$PY x.py $R`, `--${F:-hard}`, an unquoted brace or glob) goes to the LLM. A `~/…` value is read as the home path it expands to on assignment. Anything that could change or split the value turns the exception off: a second assignment, a read before the assignment, an assignment inside `if`, a loop, a group or after `cd x &&`, `read`/`eval`/`source`/`declare`/`printf -v`/`unset`/`export NAME`, a function, `trap`, a heredoc, a comment, a line continuation, `IFS`, or a special name like `PATH`. A control word or bracket anywhere before the assignment turns it off too, even as an argument (`echo fi`). The protected-delete guard and the permission-config check also read the command with the value written in, so `R=rm; cd ~ && $R -rf Documents` is denied and `C=cp; $C x ~/.claude/settings.json` goes to you. An `xargs` with a replace string (`-I`, `-J`, `-i`) goes to the LLM, since its input fills in words of the command.
 
 If **any** sub-command in a compound command is unknown, the entire command falls through to the permission prompt.
 
@@ -573,6 +598,7 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
   - Groups after a prefix are read (`! ( … )`, `> f ( … )`, `then ( … )`), `<>` counts as a write for C9, and `>|` no longer splits the command.
   - The inline-Python checker rejects more write paths (`gzip.GzipFile(…).write`, `sys.modules[…]` through an alias, `from os import …`, module attributes like `gzip.os`).
   - A command nested too deeply to read, or any internal error, now prompts (PreToolUse) or falls through to the prompt (PermissionRequest) instead of crashing the hook.
+  - Fewer LLM calls: `dart` development commands, macOS status reads (`vm_stat`, `pmset -g`, `diskutil list`, …), recursive deletes of folders below `/tmp` and of Python/Dart caches in the working directory, and a `$VAR` command word set once to a literal are allowed by rule. Runners after leading assignments are peeled (`TMPDIR=/tmp/x timeout 300 dart test`); this also stops `X=1 xargs kubectl delete` from being rule-allowed. `dart`/`flutter pub publish`, `pub token` and `pub global` go to the LLM, and so does an `xargs` with a replace string (`-I`/`-J`/`-i`), which was rule-allowed before.
 - **2026-10-29 — auto-learning removed.** Approvals are no longer written to your config. Without an LLM, unknown Bash commands, home/temp writes and WebFetch to new domains now prompt instead of being approved and learned. `SAFETY_HOOK_AUTO_LEARN`, `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored. Previously learned entries stay in your config. See [the upgrade note](#smart-permissions) at the top.
 
 ## License

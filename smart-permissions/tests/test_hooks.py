@@ -2411,7 +2411,7 @@ def test_protected_delete_guard():
     llm_b64 = [
         'cm0gLXJmIGJ1aWxk',
         'cm0gLXJmIH4vRGV2L3Byb2ovYnVpbGQ=',
-        'Y2QgL3RtcCAmJiBybSAtcmYgRGV2',
+        'Y2QgL29wdCAmJiBybSAtcmYgRGV2',  # cd /opt && …
         'ZmluZCAuIC1uYW1lICcqLnB5YycgLWRlbGV0ZQ==',
         'ZmluZCAuIC1uYW1lIG5vZGVfbW9kdWxlcyAtZXhlYyBybSAtcmYge30gKw==',
         'bHMgfCB4YXJncyBybSAtcmY=',
@@ -3129,7 +3129,7 @@ def test_unguarded_delete_steer():
                 'cd "$HOME"; IFS=" "; D="-L /tmp"; cd $D && rm -rf Desktop',
                 'cd "$HOME"; D="-L ~"; cd $D && rm -rf Desktop',
                 'cd /tmp; D="-P /tmp/.."; cd $D; rm -rf "$PWD"',
-                'cd /tmp; F=-P; cd $F /tmp/..; rm -rf "$PWD"',
+                'cd /tmp; F=-L; F=-P; cd $F /tmp/..; rm -rf "$PWD"',
                 'cd /tmp; D="-n $HOME"; pushd $D; rm -rf Desktop',
                 'cd /tmp; D="/tmp $HOME"; pushd $D; popd; rm -rf Desktop',
                 'cd /tmp; echo ${#IFS}; X="sp:$HOME/Dev"; rm -rf $X',
@@ -3137,7 +3137,23 @@ def test_unguarded_delete_steer():
                 'cd /tmp; unset -v IFS; X="sp:$HOME/Dev"; rm -rf $X',
                 'cd "$HOME"; CDPATH=/; cd tmp; rm -rf Desktop'):
         check(f'not a protected deny: {cmd[:40]}', hook(PRETOOL, cmd)[0] != 'deny', True)
+    # Phase 3: a flag set once to a literal is a constant the guard reads as
+    # written, so `cd -P /tmp/..` lands in /private (macOS) or / (Linux),
+    # above this test's home.
+    check('constant cd flag is followed',
+          hook(PRETOOL, 'cd /tmp; F=-P; cd $F /tmp/..; rm -rf "$PWD"')[0], 'deny')
+    # Phase 3: a delete of a folder below /tmp is scratch, allowed by rule
+    scratch = {'nice -n 5 rm -rf /tmp/sp-x/build',
+               'cd /tmp && rm -rf sp-build',
+               'cd /tmp; pushd ~; pushd /var; popd; popd; rm -rf Desktop',
+               'cd /tmp >/dev/null 2>&1 && rm -rf Dev',
+               'cd /tmp; cd {/tmp,/tmp}; rm -rf Desktop',
+               "cd /tmp; echo $'a\\0b' c; rm -rf sp-build"}
+    check('scratch cases are in the list', scratch <= set(llm_review), True)
     for cmd in llm_review:
+        if cmd in scratch:
+            check(f'not steered, scratch allowed by rule: {cmd[:40]}', hook(PRETOOL, cmd)[0], 'allow')
+            continue
         check(f'not steered, no LLM falls through: {cmd[:40]}', hook(PRETOOL, cmd), ('ask', None))
         check(f'not steered, LLM approves: {cmd[:40]}', hook(PRETOOL, cmd, llm={'safe': True})[0], 'allow')
     for cmd in ('rm -f "$D/$k"', 'git rm -r --cached "$X/foo"', 'echo "rm -rf $X"',
@@ -3897,10 +3913,10 @@ def test_root_delete_without_regex():
     weaker = [c for c, r in zip(cmds, res) if (r[0], r[2]) != ('deny', 'deny')]
     check('every root / protected delete denied by both hooks', weaker, [])
     # The old `rm -rf … /` regex also denied a later, unrelated `/`.
-    ok = [f'{_RM} -rf /tmp/a /tmp/b; df -h / | tail -1', f'{_RM} -rf build; ls /',
-          f'{_RM} -rf /tmp/sp-x && cd /']
-    for cmd, r in zip(ok, _both_hooks(ok)):
-        check(f'a `/` elsewhere no longer denies: {cmd!r}', (r[0], r[2]), ('ask', 'consult'))
+    ok = [(f'{_RM} -rf /tmp/a /tmp/b; df -h / | tail -1', 'allow'),   # scratch (Phase 3)
+          (f'{_RM} -rf build; ls /', 'ask'), (f'{_RM} -rf /tmp/sp-x && cd /', 'allow')]
+    for (cmd, want), r in zip(ok, _both_hooks([c for c, _ in ok])):
+        check(f'a `/` elsewhere no longer denies: {cmd!r}', (r[0], r[2]), (want, 'consult'))
 
 
 def test_force_push_steer():
@@ -4321,6 +4337,264 @@ def test_phase1b_review_fixes():
     check('prefixed group at the depth limit → ask', (r[0], r[2]), ('ask', 'ask'))
 
 
+def _phase3_check(label, denies, asks, allows, files=()):
+    res = _both_hooks(denies + asks + allows, files=files)
+    for cmd, r in zip(denies, res):
+        check(f'{label} → deny: {cmd!r}', (r[0], r[2]), ('deny', 'deny'))
+    res = res[len(denies):]
+    for cmd, r in zip(asks, res):
+        check(f'{label} → ask: {cmd!r}', (r[0], r[2]), ('ask', 'consult'))
+    for cmd, r in zip(allows, res[len(asks):]):
+        check(f'{label} → allow: {cmd!r}', (r[0], r[2]), ('allow', 'consult'))
+
+
+def test_phase3_dart_and_macos():
+    print('\n--- Phase 3: dart development commands and macOS status reads ---')
+    allows = [
+        'dart test', 'dart test -j 2 test/a_test.dart', 'dart analyze lib',
+        'dart format --set-exit-if-changed .', 'dart fix --dry-run', 'dart pub get',
+        'dart pub upgrade --major-versions', 'dart pub downgrade', 'dart pub deps',
+        'dart pub outdated', 'dart run tool/x.dart --q', 'dart compile exe bin/x.dart -o out/x',
+        'dart doc', 'dart --version', 'dart tool/x.dart --q', 'dart --enable-asserts tool/x.dart',
+        'dart --define=A=1 tool/x.dart', 'flutter test', 'flutter pub get',
+        'TMPDIR=/tmp/x timeout 300 dart test a.dart 2>&1 | tail -20',
+        'vm_stat', 'vm_stat 1', 'ioreg -l', 'iostat -w 1', 'memory_pressure -Q',
+        'pmset -g', 'pmset -g therm', 'diskutil list', 'diskutil info disk0',
+        'scutil --get ComputerName', 'csrutil status', 'sysctl -n hw.ncpu', 'sw_vers',
+        'code --version', 'code --list-extensions', 'code --list-extensions --show-versions',
+    ]
+    asks = [
+        # publishing, credentials and global tools go to the LLM, however spelled
+        'dart pub publish', 'dart pub publish --force', 'dart pub lish', 'dart pub upload',
+        'dart pub token add https://pub.example', 'dart pub global activate x',
+        'dart pub global run x:y', 'flutter pub publish', 'flutter pub pub publish',
+        'flutter packages pub publish', 'dart "pu""b" "pu""blish"', 'xargs flutter pub publish',
+        'X=1 timeout 5 dart pub publish', 'dart --verbosity=all pub publish',
+        'dart --packages x.dart pub publish', 'dart pub get && dart pub publish',
+        '/usr/local/bin/dart pub publish', 'command dart pub publish', 'dart pub $CMD',
+        'Dart pub publish',
+        # subcommands that are not on the list
+        'dart fix', 'dart fix --apply', 'dart pub add x', 'dart pub cache clean',
+        'dart create app', 'dart $X.dart', 'dart tool/x.py',
+        # changes, not reads
+        'memory_pressure', 'memory_pressure -l warn', 'pmset -a sleep 0', 'pmset sleepnow',
+        'diskutil eraseDisk APFS X disk9', 'diskutil unmount disk2',
+        'scutil --set HostName x', 'csrutil disable',
+        'code --install-extension x', 'code --list-extensions --install-extension x',
+        'code --uninstall-extension x',
+        # xargs puts its input in place of words, the subcommand too
+        'printf pub | xargs -I test dart test publish', 'xargs -0I{} dart {} publish',
+        'xargs -n 1 -J % dart % publish',
+        'printf pub | env -S "xargs -I test dart test publish"',
+        'printf pub | env "-Sxargs -I test dart test publish"', 'X=1 timeout 5 xargs -I{} ls {}',
+        # a subcommand built at run time
+        'flutter $S publish', 'C=flutter; S=pub; $C $S publish', 'G=git; S=reset; $G $S --hard',
+        'flutter --device-id pixel $S publish',        # a global option's value is no subcommand
+        'C=flutter; S=pu; $C --device-id pixel ${S}b publish',
+        'flutter --device-id pixel ${S:-pub} ${P:-publish}',
+        # writers whose output a run-time word may name
+        'dart compile exe bin/main.dart -o "$D/settings.json"', 'dart doc -o $X',
+        'flutter build web -o $X',
+        # status reads take no further flags or words
+        'pmset -g -a sleep 0', 'pmset -g batt -a', 'scutil --get ComputerName --set HostName y',
+    ]
+    allows += ['echo dart pub publish', 'xargs -n 1 grep -i foo', 'echo xargs -I test',
+               'flutter test $F', 'pmset -g batt', 'scutil --get LocalHostName']
+    allows += ['dart tool/x.dart $X', 'dart test --name $X', 'dart compile exe bin/x.dart -o out/x']
+    _phase3_check('Phase 3 dart/macOS', [], asks, allows)
+    r = _both_hooks(['dart pub publish'])[0]
+    check('dart pub publish names the reason', 'publish' in (r[1] or ''), True)
+    c9 = ['dart compile exe bin/main.dart -o ~/.claude/settings.json']
+    for cmd, r in zip(c9, _both_hooks(c9)):
+        check(f'C9 through dart compile -o: {cmd!r}', r, ['ask', _C9, 'ask', _C9])
+
+
+def test_phase3_wrappers_after_assignments():
+    print('\n--- Phase 3: wrappers are peeled after leading assignments ---')
+    rmrf = d('cm0gLXJm')
+    denies = [f'X=1 timeout 5 {rmrf} ~/Documents', f'(X=1 nohup {rmrf} ~/Documents)']
+    asks = [
+        'TMPDIR=/tmp/x timeout 300 kubectl delete ns prod',
+        'X=1 timeout 5 docker run x',
+        'X=1 xargs kubectl delete',
+        "PYTHONPATH=/tmp/e timeout 5 python3 -c 'print(1)'",
+        'BASH_ENV=/tmp/x timeout 5 bash s.sh',
+        "X=1 timeout 5 bash -c 'kubectl delete ns x'",
+        'X=1 nice git push --force',
+        '(X=1 timeout 3 kubectl delete ns x; pwd) | tail -1',
+    ]
+    allows = [
+        'TMPDIR=/tmp/x timeout 300 ls',
+        'TMPDIR=/tmp/x time ls -la',
+        'A=1 B=2 nohup ls',
+        'X=1 env Y=2 timeout 5 ls',
+        '(TMPDIR=/tmp/x timeout 300 ls)',
+        '(X=1 ls; pwd) | tail -1',
+        '(X=1 timeout 3 ls; pwd) | tail -1',
+        'X=1 xargs ls',
+        "X=1 timeout 5 python3 -c 'print(1)'",
+    ]
+    _phase3_check('Phase 3 wrapper after assignment', denies, asks, allows)
+
+
+def test_phase3_scratch_deletes():
+    print('\n--- Phase 3: recursive deletes of temp folders and caches are rule-allowed ---')
+    rmrf = d('cm0gLXJm')
+    tmp = f'/tmp/sp-t3-{os.getpid()}'
+    link = tmp + '-link'
+    os.makedirs(tmp, exist_ok=True)
+    if not os.path.lexists(link):
+        os.symlink('/usr', link)
+    atexit.register(shutil.rmtree, tmp, ignore_errors=True)
+    atexit.register(lambda: os.path.islink(link) and os.unlink(link))
+    denies = [f'{rmrf} ~/Documents', f'{rmrf} {tmp}/a ~/Documents',
+              f"bash -c '{rmrf} {tmp}/a ~/Documents'",
+              # an unguarded variable in a delete target is steered, as before
+              f'{rmrf} $T/x', f'{rmrf} /tmp/$x', f'{rmrf} "/tmp/$x"', f'{rmrf} /tmp/`id`']
+    asks = [
+        f'{rmrf} /tmp', f'{rmrf} /tmp/', f'{rmrf} /private/tmp', f'{rmrf} /tmp/.',
+        f'{rmrf} /tmp/*', f'{rmrf} {tmp}*', f'{rmrf} {tmp}?', f'{rmrf} /tmp/{{a,b}}',
+        f'{rmrf} /tmp/../Users/x', f'{rmrf} {tmp}/a/../../../etc',
+        f'{rmrf} /var/folders/ab/x', f'{rmrf} build', f'{rmrf} dist node_modules target',
+        f'{rmrf} src/__pycache__x', f'{rmrf} {tmp}/a src', f'{rmrf} {tmp}/a ~/Dev/other',
+        f'{rmrf} ~/Dev/other/__pycache__', f'{rmrf} ../__pycache__',
+        f'cd / && {rmrf} __pycache__', f'cd /usr && {rmrf} .dart_tool',
+        f'cd $X && {rmrf} __pycache__',
+        f'cd "$X" && {rmrf} __pycache__', f'cd `pwd` && {rmrf} __pycache__',
+        f'{rmrf} =ls', f'{rmrf} {tmp}/a\\ b', f"{rmrf} '{tmp}/a b'", f'{rmrf} /TMP/x',
+        f'xargs {rmrf} < list', f'find {tmp}/a -delete',
+        f'find . -name __pycache__ -prune -exec {rmrf} {{}} +',
+        f'F=-rf; rm $F {tmp}/a', f'{rmrf} {link}/sub', f'{rmrf} {link}/',
+        # a link planted before the delete, where rm would follow it
+        f'ln -s ~ {tmp}-nl && {rmrf} {tmp}-nl/Documents', f'ln -s ~ {tmp}-nl && {rmrf} {tmp}-nl/',
+        f'cp -R x {tmp}/a && {rmrf} {tmp}/a/b', f'{rmrf} {tmp}/a/b; git status',
+        f'git status; {rmrf} __pycache__/',
+        # helpers that start another program can plant one too
+        f'rg --pre ./plant needle input; {rmrf} {tmp}-nl/Documents',
+        f'sort --compress-program=./plant f; {rmrf} {tmp}-nl/Documents',
+        # a local program named like a harmless one, or a changed PATH
+        f'./mkdir; {rmrf} {tmp}-nl/Documents', f'export PATH=.; mkdir x; {rmrf} {tmp}-nl/Documents',
+        f'export PA""TH=.:/bin; mkdir; {rmrf} {tmp}-nl/Documents',
+        f'path=(. $path); mkdir; {rmrf} {tmp}-nl/Documents',
+        f'N=PA; printf -v "${{N}}TH" .; mkdir; {rmrf} {tmp}-nl/Documents',
+        f'./tool; {rmrf} sub/__pycache__',
+        # the cwd itself, as written and resolved, must be under a safe write path
+        f'cd /var && {rmrf} folders/x/.dart_tool', f'cd {link} && {rmrf} __pycache__',
+        f'cd /var/folders/x && {rmrf} __pycache__',
+    ]
+    allows = [
+        f'{rmrf} {tmp}/a', f'{rmrf} /private{tmp}/b {tmp}/c',
+        f'{rmrf} __pycache__ .pytest_cache sub/.mypy_cache .ruff_cache .dart_tool',
+        f'{rmrf} ./__pycache__', f'cd {tmp} && {rmrf} x y/z', f'rm -r {tmp}/a',
+        f'rm -rf -- {tmp}/a', f"{rmrf} '{tmp}/a'",
+        f'mkdir -p {tmp}/a && {rmrf} {tmp}/a && mkdir -p {tmp}/a',
+        f'{rmrf} {tmp}/a; ls',
+        f'ln -s ~ {tmp}-nl && {rmrf} {tmp}-nl',      # rm removes the link itself
+        f'{rmrf} {tmp}/a/b; ls', f'git status; {rmrf} {tmp}', f'touch a; {rmrf} __pycache__/',
+    ]
+    _phase3_check('Phase 3 scratch delete', denies, asks, allows)
+
+
+def test_phase3_constant_command_word():
+    print('\n--- Phase 3: a $VAR command word set once to a literal is read as that value ---')
+    rmrf = d('cm0gLXJm')
+    rm = rmrf.split()[0]
+    denies = [f'D={rm}; $D -rf ~/Documents',
+              f'R={rm}; cd ~ && $R -rf Documents',       # the guard reads the value with its cd
+              f'D=~/Documents; {rmrf} "$D"']             # a tilde value is expanded on assignment
+    asks = [
+        # a constant that names a setter; a keyword word that is only an argument
+        "P=printf; K=ls; $P -v \"$(printf '\\113')\" '%s' kubectl; $K delete ns prod",
+        'C=command; K=ls; $C read K; $K x',
+        "P=printf; F=v; K=ls; $P -$F \"$(printf '\\113')\" %s kubectl; $K delete ns prod",
+        'i\\\nf false; th\\\nen\nSHELL=ls;\nfi; $SHELL -c "kubectl delete ns prod"',
+        'echo fi; if false; then\nSHELL=ls;\nfi; $SHELL -c "kubectl delete ns prod"',
+        "P=~/Dev/x/python; $P -c 'import os; os.system(\"x\")'",
+        'K=kubectl; $K delete ns prod',
+        # a constant read inside a word is written out too
+        'G=git; F=hard; $G reset --$F', 'G=git; S=re; $G ${S}set --hard',
+        'G=git; S=re; $G "${S}set" --hard',
+        # only a fully written command counts
+        'G=git; F=hard; $G reset --${F:-hard}', 'PY=/usr/bin/python3; $PY -I x.py $R',
+        'PY=/usr/bin/python3; for a in 1 2; do $PY -I x.py $a; done',
+        'G=git; $G reset --h{a..a}rd', 'G=git; $G reset --h?rd', 'C=flutter; $C {pub,} {publish,}',
+        # anything that could change or split the value bails out
+        'PY=/usr/bin/python3; PY=/bin/sh; $PY x',
+        '$PY x; PY=/usr/bin/python3',
+        'PY=/usr/bin/python3; $PY x; PY=/bin/sh; $PY y',
+        'cd x && PY=/usr/bin/python3; $PY -I x.py',
+        'cd x || PY=/usr/bin/python3; $PY -I x.py',
+        '(PY=/usr/bin/python3); $PY -I x.py',
+        '{ PY=/usr/bin/python3; }; $PY -I x.py',
+        'if true; then PY=/usr/bin/python3; fi; $PY -I x.py',
+        'for i in 1; do PY=/usr/bin/python3; done; $PY x.py',
+        'PY=/usr/bin/python3; read PY; $PY x',
+        'PY=/usr/bin/python3; read -r Q; $PY x',
+        'PY=/usr/bin/python3; eval x; $PY x',
+        'PY=/usr/bin/python3; source f; $PY x',
+        'PY=/usr/bin/python3; . f; $PY x',
+        'PY=/usr/bin/python3; printf -v PY x; $PY x',
+        'PY=/usr/bin/python3; printf -v "P""Y" x; $PY x',
+        'PY=/usr/bin/python3; "dec""lare" "P""Y=x"; $PY x',
+        'PY=/usr/bin/python3; : ${PY:=x}; $PY x',
+        'PY=/usr/bin/python3; unset PY; $PY x',
+        'PY=/usr/bin/python3; export PY; $PY x',
+        'PY=/usr/bin/python3; set -A PY x; $PY x',
+        'PY=/usr/bin/python3; f() { PY=x; }; f; $PY x',
+        "PY=/usr/bin/python3; trap 'PY=x' DEBUG; $PY x",
+        'PY=/usr/bin/python3; $(echo declare) x; $PY x',
+        'PY=/usr/bin/python3; n=PY; $PY x',
+        'IFS=/; PY=/usr/bin/python3; $PY x',
+        'PY=/usr/bin/python3 # c\n$PY x',
+        'echo a # ;PY=/usr/bin/python3\n$PY x',
+        'echo "a;PY=/usr/bin/python3;"; $PY x',
+        'cd x \\\nPY=/usr/bin/python3; $PY x',
+        'PY=/usr/bin/python3 &\n$PY x',
+        'PY=/usr/bin/python3 | cat; $PY x',
+        'PY="/usr/bin/py thon"; $PY x',
+        'PY=$(which python3); $PY x',
+        'K=ls; echo $(K=kubectl; $K delete ns x)',          # the inner value is read inside
+        'K=kubectl; echo $(K=ls; $K x); $K delete ns x',
+        "bash -c 'PY=/usr/bin/python3; $PY x'",
+        "PY=/usr/bin/python3; bash -c '$PY x'",
+        'PY=/usr/bin/python3; wait -p PY; $PY x',
+        'PY=/usr/bin/python3; zstyle -s a b PY; $PY x',
+        'PY=/usr/bin/python3; select PY in a; do :; done; $PY x',
+        'case x in a) PY=/usr/bin/python3;; esac; $PY x',
+        'PY=/usr/bin/python3; cat <<EOF\nx\nEOF\n$PY x',
+        'PATH=/tmp; $PATH x',
+        'PY=/usr/bin/python3; timeout $T $PY x',
+        'PY=/usr/bin/python3; $PY$X x',
+    ]
+    allows = [
+        'PY=/usr/bin/python3; $PY -I x.py',
+        'PY=/usr/bin/python3\n$PY -I x.py',
+        'cd /tmp; PY=/usr/bin/python3; time $PY -I x.py > o.log 2>&1; sed -n 1,2p o.log',
+        'PY=/usr/bin/python3; R=twin; $PY -I f.py $R/a.json',
+        'export OMP_NUM_THREADS=1 V=1 && PY=/usr/bin/python3 && time $PY -W ignore cv.py',
+        'mkdir -p out && PY=/usr/bin/python3 && $PY -I a.py && $PY -I b.py',
+        'PY=/usr/bin/python3; "$PY" -I x.py',
+        'PY=/usr/bin/python3; ${PY} -I x.py',
+        "PY='/usr/bin/python3'; $PY -I x.py",
+        'PY=/usr/bin/python3; for a in 1 2; do $PY -I x.py; done',
+        'PY=/usr/bin/python3; X=1 timeout 5 $PY -I x.py',
+        "PY=/usr/bin/python3; $PY -c 'print(1)'",
+        'PY=/usr/bin/python3 && $PY a.py; $PY b.py',   # a literal assignment cannot fail
+        'printf "%s\\n" "$X"; PY=/usr/bin/python3; $PY -I x.py',   # an operand, not an option
+    ]
+    _phase3_check('Phase 3 constant command word', denies, asks, allows)
+    c9 = ['C=cp; $C /tmp/a ~/.claude/settings.json',
+          'D=~/.claude; dart compile exe bin/main.dart -o "$D/settings.json"']
+    for cmd, r in zip(c9, _both_hooks(c9)):
+        check(f'C9 through a constant command word: {cmd!r}', r, ['ask', _C9, 'ask', _C9])
+    code = ('import sys\nsys.path.insert(0, %r)\nimport pretool_safety as p\n'
+            'print(p.human_required_reason("Bash", {"command": %r}))\n') % (SCRIPT_DIR, c9[0])
+    env = dict(os.environ, SMART_PERMISSIONS_CONFIG=_fresh_cfg()[1])
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                         env=env).stdout.strip()
+    check('C9 through a constant reaches the human', out, _C9)
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -4432,6 +4706,10 @@ if __name__ == '__main__':
     test_prefix_groups_and_deep_nesting()
     test_sensitive_reads_and_python_repairs()
     test_phase1b_review_fixes()
+    test_phase3_dart_and_macos()
+    test_phase3_wrappers_after_assignments()
+    test_phase3_scratch_deletes()
+    test_phase3_constant_command_word()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
