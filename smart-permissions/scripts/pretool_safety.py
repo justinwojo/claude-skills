@@ -1085,8 +1085,14 @@ _SAFE_PY_FLAGS = frozenset({"-I", "-u", "-B", "-E", "-s", "-S", "-q", "-O", "-OO
 _PYTHON_BASENAME_RE = re.compile(r"^python(3(\.\d+)?)?$")
 _PY_SHELL_VAR_RE = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})")
 _PY_SHELL_VAR_PLACEHOLDER = "zzshellvarzz"
-# Env overrides that change what `import json` loads or what runs at startup
-_PY_HIJACK_ENV_RE = re.compile(r"(^|\s)(PYTHON\w*|LD_\w+|DYLD_\w+)=")
+# Env overrides that change what `import json` loads or what runs at startup.
+# Any mention counts, quotes dropped: `export 'PYTHONPATH'=…`, `PYTHONPATH+=…`,
+# `: ${PYTHONPATH:=…}`, `read PYTHONPATH` all set one.
+_PY_HIJACK_ENV_RE = re.compile(r"(?<!\w)(PYTHON\w*|LD_\w+|DYLD_\w+)(?!\w)")
+
+
+def _mentions_hijack_env(text):
+    return bool(_PY_HIJACK_ENV_RE.search(re.sub(r"[\"'\\]", "", text)))
 
 
 def _safe_python_code(code):
@@ -1164,12 +1170,12 @@ def _is_safe_inline_python(basename, cmd, outer=None):
     """True if `cmd` is `python[3] [safe flags] -c CODE [args…]` with CODE
     passing _safe_python_code. Any other interpreter or form → False.
 
-    `outer` is the original command when `cmd` was peeled from a wrapper
-    (`env PYTHONPATH=… python -c …`); import-hijacking env vars there fail it.
+    `outer` is the whole command (`export PYTHONPATH=…; python -c …`, `env
+    PYTHONPATH=… python -c …`); import-hijacking env vars there fail it.
     """
     if not _PYTHON_BASENAME_RE.match(basename):
         return False
-    if outer is not None and _PY_HIJACK_ENV_RE.search(outer):
+    if outer is not None and _mentions_hijack_env(outer):
         return False
     try:
         tokens = shlex.split(cmd, posix=True)
@@ -1177,7 +1183,7 @@ def _is_safe_inline_python(basename, cmd, outer=None):
         return False
     idx = 0
     while idx < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[idx]):
-        if _PY_HIJACK_ENV_RE.search(tokens[idx]):
+        if _mentions_hijack_env(tokens[idx]):
             return False
         idx += 1
     if idx >= len(tokens) or os.path.basename(tokens[idx]) != basename:
@@ -4504,6 +4510,12 @@ def unguarded_delete_check(command):
     return None
 
 
+# The command evaluate_bash was called with at depth 0. Code it runs is read
+# one level deeper on its own, but an import path the whole command sets
+# (`export PYTHONPATH=…; trap "python3 -c …" EXIT`) still applies to it.
+_TOP_COMMAND = ""
+
+
 def evaluate_bash(command, log_unknowns=True, _depth=0):
     """Evaluate Bash commands, including compound/piped commands.
 
@@ -4522,6 +4534,9 @@ def evaluate_bash(command, log_unknowns=True, _depth=0):
     handler, a find -exec command, …) comes back through here one level
     deeper (`_depth`), so the same guard and rules judge it.
     """
+    global _TOP_COMMAND
+    if _depth == 0:
+        _TOP_COMMAND = command
     # A protected folder hit even with every unknown value non-empty is a
     # plain deny. One only an empty value reaches gets the rewrite first: the
     # agent can act on it, and the rewritten command comes back through here.
@@ -4756,11 +4771,12 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
             inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
             inner_basename = os.path.basename(inner_first) if inner_first else basename
             if (_has_interpreter_exec_flag(basename, cmd)
-                    and not _is_safe_inline_python(basename, cmd)):
+                    and not _is_safe_inline_python(basename, cmd, outer=f"{_TOP_COMMAND}\n{command}")):
                 held = ("ask", f"Inline interpreter execution: {basename}")
                 continue
             if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
-                    and not _is_safe_inline_python(inner_basename, inner_cmd, outer=cmd)):
+                    and not _is_safe_inline_python(inner_basename, inner_cmd,
+                                                   outer=f"{_TOP_COMMAND}\n{command}")):
                 held = ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
                 continue
 
@@ -5541,6 +5557,114 @@ def _printf_output(args):
             return "".join(out)
 
 
+# Options that make an interpreter print and exit, running no code. Not -v:
+# python's is verbose, ruby's prints the version and then runs the code.
+_INTERPRETER_INFO_FLAGS = frozenset({"--version", "--help"})
+_INTERPRETER_INFO_SHORT = {"python": {"-V", "-h"}, "node": {"-v", "-h"}}
+
+
+def _code_interpreter(name):
+    """True for an interpreter other than a shell that can run code from stdin."""
+    return bool(_PYTHON_BASENAME_RE.match(name)) or (
+        name in INTERPRETER_EXEC_FLAGS and name not in _SHELL_NAMES)
+
+
+def _stream_path(word, raw):
+    """True unless `word` (`raw` as written) is one plain file path: not a
+    stream (/dev/stdin, //dev/fd/0, /proc/self/fd/0, `<(…)`, a relative name
+    with no extension, which may be one after a `cd`), and either literal or
+    one double-quoted scalar with a literal file name after it
+    (`"$S/fit.py"`), which can't split into other words."""
+    if word.startswith(("<(", ">(")):
+        return True
+    if re.fullmatch(r"[\w./~+-]+", word):
+        if re.search(_FILE_NAME_TAIL, word):
+            return False  # no stdin stream has a name with an extension
+        path = re.sub(r"/+", "/", word)
+        if not path.startswith("/"):  # `cd /dev; python3 stdin`
+            return True
+        return bool(re.match(r"/(?:dev|proc)(?:/|$)", os.path.normpath(path), re.I))
+    return not re.fullmatch(r'"\$(?:\{\w+\}|\w+)(?:/[\w.+-]+)*/[\w+-][\w.+-]*\.[A-Za-z0-9]+"', raw)
+
+
+_FILE_NAME_TAIL = r"(?:^|/)[\w+-][\w.+-]*\.[A-Za-z0-9]+$"
+
+
+def _stays_one_word(raw):
+    """True if the shell passes `raw` on as exactly one word: literal, with
+    nothing unquoted that a shell may expand (`$`, a glob, a brace list, zsh's
+    `(a|b)` or `+(…)`), or one double-quoted scalar (`"$A"`)."""
+    return (_raw_is_literal(raw) and bool(re.fullmatch(r"~?[\w./:=,%@+-]*", _outside_quotes(raw)))
+            or bool(re.fullmatch(r'"\$(?:\{\w+\}|\w+)"', raw)))
+
+
+def _interpreter_stdin_verdict(part):
+    """An ask when `part` runs an interpreter other than a shell (python, node,
+    ruby, perl, …) on code from stdin rather than a script file: a heredoc or
+    here-string (`python3 - <<'EOF'`), a pipe (`… | python3`) or a stream
+    (`< <(…)`, `/dev/stdin`). That code goes to the LLM, as `-c`/`-e` code
+    does. None otherwise: a script file (stdin is then its data), a module,
+    or an option that only prints."""
+    words, stdin, _hazard = _parse_simple_command(part)
+    if not words:
+        return None
+    peeled = _peel_words(words)
+    if peeled is None:  # can't line the wrappers up with the words (env -S)
+        text = " ".join(words)
+        tokens = _shlex_split_safe(_resolve_through_wrappers(text))
+        name = os.path.basename(tokens[0]) if tokens else ""
+        # env -S has escapes (`\_` is a space) and `${VAR}` that shlex doesn't read
+        if _code_interpreter(name) or re.search(r"[\\$]", text):
+            return ("ask", f"Interpreter code not readable here: {name}")
+        return None
+    k, tokens = peeled
+    name = os.path.basename(tokens[k])
+    if not _code_interpreter(name):
+        return None
+    python = bool(_PYTHON_BASENAME_RE.match(name))
+    family = "python" if python else name
+    where = ("a pipe" if stdin is None else "a stream" if stdin[0] == "file"
+             else "a heredoc or here-string")
+    ask = ("ask", f"Interpreter reads its code from {where}: {name}")
+    # Everything up to the interpreter reaches it as written (`env -u $A` may split)
+    if not all(_stays_one_word(w) for w in words[:k + 1]):
+        return ask
+    args, raws = tokens[k + 1:], words[k + 1:]
+    if name == "deno" and args[:1] == ["run"]:
+        args, raws = args[1:], raws[1:]  # only `deno run SCRIPT` names a file
+    elif name == "deno" and args and not args[0].startswith("-"):
+        return ask  # `repl`, `eval`, …
+    exec_name = name if name in INTERPRETER_EXEC_FLAGS or not python else "python3"
+    info = _INTERPRETER_INFO_FLAGS | _INTERPRETER_INFO_SHORT.get(family, set())
+    # One pass, left to right, over options known word by word: one this
+    # doesn't know, or one not written plainly, may take the next word as its
+    # value or be something else, so the call goes to the LLM.
+    j = 0
+    while j < len(args):
+        a, raw = args[j], raws[j]
+        if a == "-" or not a.startswith("-"):
+            break
+        if raw != a or not _stays_one_word(raw):  # quoted, escaped (`-''c`) or expanded
+            return ask
+        if a == "--":
+            j += 1
+            break
+        if a in info or _has_interpreter_exec_flag(exec_name, f"{exec_name} {a}"):
+            return None  # it only prints; or `-c`/`-e` code, which the inline check reads
+        if python and a == "-m":
+            return None  # runs a module, as a script file runs
+        if python and a in ("-X", "-W") and j + 1 < len(args) and _stays_one_word(raws[j + 1]):
+            j += 2
+        elif python and a in _SAFE_PY_FLAGS or name == "node" and re.fullmatch(r"--[\w-]+=[\w./:,@%+-]*", a):
+            j += 1
+        else:
+            return ask
+    if j < len(args) and args[j] != "-" and not _stream_path(args[j], raws[j]):
+        return None  # a script file; stdin is its data
+    # `python3 < x.py` too: zsh (MULTIOS) adds a piped stdin to the file
+    return ask
+
+
 def _nested_verdict(text, depth, log_unknowns):
     """evaluate_bash for code a command runs, one level deeper."""
     if depth >= _MAX_SUBSTITUTION_DEPTH:
@@ -5581,7 +5705,7 @@ def _exec_bearing_verdict(cmd, depth, log_unknowns):
         if verdict[0] != "allow":
             return ("ask", f"In {shell} code: {verdict[1]}")
         return None
-    held = None  # the first ask, held while later code is read for a deny
+    held = _interpreter_stdin_verdict(cmd)  # the first ask, held while later code is read for a deny
     for label, text, literal in _exec_texts(cmd):
         verdict = _nested_verdict(text, depth, log_unknowns) if text is not None else None
         if verdict and verdict[0] == "deny":
