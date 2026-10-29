@@ -12,7 +12,9 @@ Decision flow:
   4. If "ask"   → fall through to built-in Bash(cmd:*) rules
   5. If built-in rules don't match → user prompt (or LLM eval if configured)
   An LLM flag gets a second pass; if that confirms it, the hook emits an
-  explicit "ask" so a human decides, even in auto mode.
+  explicit "ask" so a human decides, even in auto mode. A permission-config
+  write (C9) gets the same explicit "ask", never the LLM, so neither a
+  native allow rule nor auto mode can approve it.
 
 Configuration:
   - Defaults loaded from config/defaults.json (ships with plugin)
@@ -919,13 +921,18 @@ def _resolve_through_wrappers(cmd, _seen=None):
                     return _resolve_through_wrappers(inner_cmd, _seen)
                 return cmd
             # Wrappers with value-flags we care about
-            if first == "env" and tok in ("-u", "--unset"):
+            # GNU -C/--chdir DIR; BSD -P PATH and -L USER: each takes a value,
+            # which the generic skip below would mistake for the command.
+            if first == "env" and tok in ("-u", "--unset", "-C", "--chdir", "-P", "-L"):
                 idx += 2
                 continue
             if first == "timeout" and tok in ("-s", "-k", "--signal", "--kill-after"):
                 idx += 2
                 continue
             if first == "exec" and tok in ("-a",):
+                idx += 2
+                continue
+            if first == "time" and tok in ("-o", "--output", "-f", "--format"):
                 idx += 2
                 continue
             if first == "stdbuf" and tok in ("-i", "-o", "-e",
@@ -1507,14 +1514,17 @@ def _main():
 
     # C9: a permission-config write goes to the human, whatever else the rules
     # said short of a deny — an LLM cannot vouch for an edit to the hook's own
-    # permission rules. The learner applies the same check.
+    # permission rules. The learner applies the same check. The ask is
+    # explicit: a silent exit would let a native allow rule or auto mode's
+    # classifier approve it without a human.
     if decision != "deny":
         human = human_required_reason(tool, tool_input)
         if human:
             log_decision("pretool", tool, tool_input, "ask", "rule",
                          reason if decision == "ask" else human,
                          duration_ms=_elapsed_ms(start))
-            sys.exit(0)
+            output_decision("ask", human)
+            return
 
     # If local rules can't decide, hand off to LLM (if configured).
     if decision == "ask":
@@ -1822,11 +1832,45 @@ def bash_writes_to_config_path(command):
     Every command the shell may run is checked (_iter_commands): inside
     if/for/while bodies, groups, functions, case arms and substitutions too.
     A command that names a config path but can't be parsed counts as a write.
+    So does one whose brace expansion spells one (`tee ~/.{c..c}laude/settings.json`).
     """
     if not command:
         return False
     alt = _constant_text(command)  # `C=cp; $C x ~/.claude/settings.json`
-    return _bash_writes_config(command) or bool(alt) and _bash_writes_config(alt)
+    if _bash_writes_config(command) or bool(alt) and _bash_writes_config(alt):
+        return True
+    for text in filter(None, (command, alt)):
+        braced = _brace_text(text)
+        if braced == "":  # a path with too many words to write out: fail closed for a writer
+            return bool(">" in text or _WRITER_WORD_RE.search(text))
+        if braced and _bash_writes_config(braced):
+            return True
+    return False
+
+
+_WRITER_WORD_RE = re.compile(r"(?<![\w.-])(?:%s)(?![\w.-])" % "|".join(sorted(_FILE_WRITER_COMMANDS)))
+
+
+def _brace_text(command):
+    """`command` with each word's brace expansion written out (`cp x
+    ~/.{c..c}laude/s.json` → `cp x ~/.claude/s.json`), None when it has
+    none, "" when a path (a word with `/` or `~`) makes too many words; any
+    other word that does stays as written (`for i in {1..5000}`). Quoted
+    braces expand here too: that only over-checks."""
+    if "{" not in command or "}" not in command:
+        return None
+    out, changed = [], False
+    for chunk in re.split(r"(\s+)", command):
+        if "{" in chunk and "}" in chunk:
+            words = _brace_expand(chunk)
+            if words is None:
+                if re.search(r"[/~]", chunk):
+                    return ""
+                words = [chunk]
+            if words != [chunk]:
+                chunk, changed = " ".join(words), True
+        out.append(chunk)
+    return "".join(out) if changed else None
 
 
 def _bash_writes_config(command):
@@ -1870,7 +1914,10 @@ def _writes_config(cmd):
 # install's GNU and BSD letters together, so an unsure one fails closed)
 _COPY_VALUE_LETTERS = {"cp": "tS", "install": "BDfghlMmoSTt", "rsync": "efTBM@"}
 # Long options that make a copy write every operand; a unique prefix counts
-_COPY_EVERY_OPTS = ("--remove-source-files", "--link", "--symbolic-link", "--directory")
+# (`cp --parents` and `rsync --relative` keep each source's folders under the
+# destination, so a config source lands at a config path there too)
+_COPY_EVERY_OPTS = ("--remove-source-files", "--remove-sent-files", "--link", "--symbolic-link",
+                    "--directory", "--parents", "--relative")
 
 
 def _copy_writes_config(cmd):
@@ -1878,9 +1925,10 @@ def _copy_writes_config(cmd):
     path. A copy writes its destination (the last operand, or `-t DIR`), and
     a file under a folder destination (`cp settings.json ~/.claude/`); a
     config path that is only a source is read. mv moves its sources, ln and
-    `cp -l/-s` link them, `rsync --remove-source-files` deletes them, and
-    `install -d` creates every operand: all of those write each operand. A
-    config path that may be an option's value counts as written."""
+    `cp -l/-s` link them, `rsync --remove-source-files` deletes them,
+    `install -d` creates every operand, and `cp --parents`/`rsync -R` copy
+    each source's folders too: all of those write each operand. A config
+    path that may be an option's value counts as written."""
     words, _targets, _reads = _command_line(cmd)
     if not words:
         return _references_always_ask_path(cmd)
@@ -1911,7 +1959,8 @@ def _copy_writes_config(cmd):
                 if _references_always_ask_path(nxt):
                     return True
             for k, ch in enumerate(a[1:]):
-                every = every or name == "cp" and ch in "ls" or name == "install" and ch in "dl"
+                every = every or name == "cp" and ch in "ls" or name == "install" and ch in "dl" \
+                    or name == "rsync" and ch == "R"
                 no_target = no_target or ch == "T" and name in ("cp", "mv", "ln")
                 if ch in values and (a[k + 2:] or not nxt.startswith("-")):
                     val = a[k + 2:] or nxt  # (`-S -M x`: BSD -S takes no value)
@@ -1939,7 +1988,7 @@ def _copy_writes_config(cmd):
         if any(_references_always_ask_path(v) or is_always_ask_write_path(_resolve_written(v))
                for v in (w, w.rstrip("/") + "/")):
             return True
-        if named and (re.search(r"[$`*?\[]", w) or any(
+        if named and (re.search(r"[$`*?\[{]", w) or any(
                 _resolve_written(w) == h or _resolve_written(w).startswith(h + os.sep)
                 for h in homes)):
             return True  # a config path named, and this lands where config lives
@@ -2091,19 +2140,22 @@ _PRIVILEGE_VALUE_FLAGS = frozenset({"-u", "-g", "-h", "-C", "-p", "-D", "-r", "-
 _RECURSIVE_DELETE_REASON = "Risky recursive or bulk delete — LLM review"
 
 
-def _unwrap_command(words):
+def _unwrap_command(words, seen=None):
     """The words of the command that keywords and wrappers end up running.
 
     `do rm …`, `env rm …`, `nice -n 5 rm …`, `time -p rm …`, `builtin rm …`
     and `sudo -u me rm …` all run `rm …`. Wrapper flags are peeled the way
     the allowlist peels them (_resolve_through_wrappers), so whatever inner
     command the rules judge, the delete guards judge too. xargs is left on:
-    it adds arguments, so its callers handle it.
+    it adds arguments, so its callers handle it. `seen`, a list, collects
+    the words of each wrapper peeled (see _resolve_through_wrappers).
     """
     for _ in range(len(words) + 1):
         if not words:
             return words
         first = os.path.basename(words[0])
+        if seen is not None and (first == "builtin" or first in _PRIVILEGE_WRAPPERS):
+            seen.append(words[:1])  # its name, which may be a path (`./builtin`)
         if words[0] in _SEGMENT_KEYWORDS or first == "builtin" or words[0] in _ZSH_MODIFIERS:
             words = words[1:]
         elif words[0] == "repeat":  # zsh `repeat 3 rm …`
@@ -2117,7 +2169,7 @@ def _unwrap_command(words):
                 i += 2 if words[i] in _PRIVILEGE_VALUE_FLAGS else 1
             words = words[i:]
         elif first in _INTERPRETER_WRAPPERS and first != "xargs" or first in _PASSTHROUGH_WRAPPERS:
-            inner = _shlex_split_safe(_resolve_through_wrappers(shlex.join(words)))
+            inner = _shlex_split_safe(_resolve_through_wrappers(shlex.join(words), seen))
             words = words[1:] if inner == words else inner
         else:
             return words
@@ -2773,7 +2825,8 @@ def _link_inert(command):
         if cmd is None:
             return False
         words = _command_line(cmd)[0]
-        if words and (words[0] not in _LINK_INERT_COMMANDS or _sets_variables(cmd)):
+        if words and (words[0] not in _LINK_INERT_COMMANDS or _sets_variables(cmd)
+                      or _wrapper_doubt(cmd)):
             return False
     return True
 
@@ -4670,8 +4723,11 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
                 continue
 
             # Code the command runs (shell -c/heredoc, trap, find -exec, awk,
-            # eval), and risky uses of allowed commands
-            result = _exec_bearing_verdict(cmd, _depth, log_unknowns) or _risky_operation(cmd)
+            # eval), and risky uses of allowed commands; a steer beats an ask
+            result = _exec_bearing_verdict(cmd, _depth, log_unknowns)
+            if not result or result[0] != "deny":
+                risky = _risky_operation(cmd)
+                result = risky if risky and risky[0] == "deny" else result or risky
             if result:
                 if result[0] == "deny":
                     return result
@@ -5525,21 +5581,22 @@ def _exec_bearing_verdict(cmd, depth, log_unknowns):
         if verdict[0] != "allow":
             return ("ask", f"In {shell} code: {verdict[1]}")
         return None
+    held = None  # the first ask, held while later code is read for a deny
     for label, text, literal in _exec_texts(cmd):
         verdict = _nested_verdict(text, depth, log_unknowns) if text is not None else None
         if verdict and verdict[0] == "deny":
             return verdict
-        if label == "eval":
-            continue  # eval is not a safe word: the unknown-command ask follows
+        if held or label == "eval":
+            continue  # (eval is not a safe word: the unknown-command ask follows)
         if text is None:
-            return ("ask", f"Runs code not readable here: {label}")
-        if not literal:
-            return ("ask", f"Code built at run time: {label}")
-        if label.startswith("awk"):
-            return ("ask", f"awk program runs commands: {text}")
-        if verdict[0] != "allow":
-            return ("ask", f"In {label}: {verdict[1]}")
-    return None
+            held = ("ask", f"Runs code not readable here: {label}")
+        elif not literal:
+            held = ("ask", f"Code built at run time: {label}")
+        elif label.startswith("awk"):
+            held = ("ask", f"awk program runs commands: {text}")
+        elif verdict[0] != "allow":
+            held = ("ask", f"In {label}: {verdict[1]}")
+    return held
 
 
 def _piped_code_sources(command):
@@ -6091,14 +6148,22 @@ _XARGS_VALUE_OPTS = frozenset({"-I", "-J", "-n", "--max-args", "-L", "-P", "--ma
 _XARGS_REPLACE_RE = re.compile(r"-[^-]*[IJi]|--replace")
 
 
+def _wrapper_chain(cmd):
+    """The words of each wrapper on the way to what `cmd` runs, peeled the
+    way the rules peel it (`builtin`, keywords and sudo too), xargs included."""
+    seen = []
+    words = _command_line(cmd, seen)[0]
+    if words and os.path.basename(words[0]) == "xargs":
+        _resolve_through_wrappers(shlex.join(words), seen)
+    return seen
+
+
 def _xargs_replace_risk(cmd):
     """Why `cmd` runs xargs with a replace string, or None: xargs then puts
     its input in place of words of the command, the subcommand too
     (`printf pub | xargs -I X dart X publish`), so the words read here are
     not the ones that run."""
-    seen = []
-    _resolve_through_wrappers(cmd, seen)
-    for tokens in seen:
+    for tokens in _wrapper_chain(cmd):
         if os.path.basename(tokens[0]) != "xargs":
             continue
         j = 1
@@ -6106,6 +6171,76 @@ def _xargs_replace_risk(cmd):
             if _XARGS_REPLACE_RE.match(tokens[j]):
                 return "xargs with a replace string (its input becomes words of the command)"
             j += 2 if tokens[j] in _XARGS_VALUE_OPTS else 1
+    return None
+
+
+# Wrapper options read with certainty: those taking no value, those taking the
+# next word, and attached-value spellings. _resolve_through_wrappers peels any
+# other option as if it took no value (so the delete guards still find a
+# wrapped `rm`), but then the word it takes for the command may be that
+# option's value (`env -iu cat ln …`, `time -o cat ln …`): see _wrapper_doubt.
+_WRAPPER_FLAGS = {
+    "env": ({"-i", "-0", "-v", "-", "--ignore-environment", "--null", "--debug"},
+            {"-u", "--unset"}, r"-u.+|--unset=.*"),
+    "timeout": ({"--foreground", "--preserve-status", "-v", "--verbose", "-f", "-p"},
+                {"-s", "-k", "--signal", "--kill-after"}, r"-[sk].+|--(signal|kill-after)=.*"),
+    "exec": ({"-c", "-l", "-cl", "-lc"}, {"-a"}, None),
+    "command": ({"-p", "-v", "-V", "-pv", "-pV"}, set(), None),
+    "time": ({"-p", "-l", "-a", "-h", "-q", "-v", "--portability", "--quiet", "--verbose",
+              "--append"}, {"-f", "--format"}, r"-f.+|--format=.*"),
+    "nohup": (set(), set(), None),
+    "stdbuf": (set(), {"-i", "-o", "-e", "--input", "--output", "--error"},
+               r"-[ioe].+|--(input|output|error)=.*"),
+    "nice": (set(), {"-n", "--adjustment"}, r"-n?-?\d+|--adjustment=-?\d+"),
+    "ionice": ({"-t", "--ignore"}, {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid"},
+               r"-[cnpPu].+|--(class|classdata|pid)=.*"),
+    "taskset": ({"-a", "--all-tasks"}, {"-p", "--pid", "-c", "--cpu-list"}, None),
+    "chrt": ({"-o", "-f", "-r", "-b", "-i", "-d", "-a", "-m", "-v", "-R", "--other", "--fifo",
+              "--rr", "--batch", "--idle", "--deadline", "--all-tasks", "--max", "--verbose",
+              "--reset-on-fork"}, {"-p", "--pid"}, None),
+    "setsid": ({"-c", "-f", "-w", "--ctty", "--fork", "--wait"}, set(), None),
+    "unbuffer": ({"-p"}, set(), None),
+    "xargs": ({"-0", "-r", "-t", "-p", "-x", "-o", "--null", "--no-run-if-empty", "--verbose",
+               "--interactive", "--exit", "--open-tty"}, _XARGS_VALUE_OPTS,
+              r"-[IJnLPsaEdiRSl].*|--(max-args|max-procs|max-chars|arg-file|delimiter|replace|eof|max-lines)(=.*)?"),
+}
+
+
+_SYSTEM_BIN_DIRS = frozenset({"/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin",
+                              "/opt/homebrew/bin"})
+
+
+def _wrapper_doubt(cmd):
+    """Why the inner command of a wrapper in `cmd` is uncertain, or None: a
+    wrapper option this table does not know (its value may be the word taken
+    for the command), or one that changes where or as whom the command runs
+    (`env -C DIR`, `env -P PATH`, `env -L USER`) or writes a file
+    (`time -o FILE`), which the rules for the inner command don't see. A
+    wrapper named by a path outside the system's bin folders (`./env`) is
+    whatever program is there, not the wrapper."""
+    for tokens in _wrapper_chain(cmd):
+        if "/" in tokens[0] and os.path.dirname(tokens[0]) not in _SYSTEM_BIN_DIRS:
+            return f"program named like a wrapper: {tokens[0]} (what it runs is uncertain)"
+        name = os.path.basename(tokens[0])
+        bools, values, attached = _WRAPPER_FLAGS.get(name, (set(), set(), None))
+        j = 1
+        while j < len(tokens):
+            t = tokens[j]
+            if name == "env" and _ASSIGNMENT_RE.match(t):
+                j += 1
+                continue
+            if t == "--" or not t.startswith("-") or (t == "-" and name != "env"):
+                break
+            if name == "env" and t.startswith(("-S", "--split-string")):
+                break  # the split string is the next wrapper in `seen`
+            if t in bools:
+                j += 1
+            elif t in values:
+                j += 2
+            elif attached and re.fullmatch(attached, t):
+                j += 1
+            else:
+                return f"wrapper option {name} {t} (what it runs is uncertain)"
     return None
 
 
@@ -6133,14 +6268,32 @@ def _expand_home(word):
 
 def _written_operands(name, args):
     """The paths a file-writing command writes (tee's files, a copy's
-    destination, dd's of=, sed -i's files)."""
+    destination, dd's of=, sed -i's files, any option value of dart or
+    flutter: `-o`, `--output`, `--depfile`, …, and `dart format`'s files)."""
     operands = [a for a in args if not a.startswith("-")]
     if name == "tee":
         return operands
     if name in _COPY_COMMANDS:
         dirs = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "-t"]
         dirs += [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
-        return dirs + operands[-1:]
+        # a copy into the home folder writes each source's name there (`cp x/.zshrc ~`)
+        into_home = [d.rstrip("/") + "/" + os.path.basename(s.rstrip("/"))
+                     for d in dirs + operands[-1:] if _expand_home(d).rstrip("/") == HOME_DIR
+                     for s in (operands if dirs else operands[:-1])]
+        return dirs + operands[-1:] + into_home
+    if name.lower() in ("dart", "flutter"):
+        values = []
+        for i, a in enumerate(args):
+            if a.startswith("-") and a != "-":
+                if "=" in a:
+                    values.append(a.split("=", 1)[1])
+                elif not a.startswith("--") and len(a) > 2:
+                    values.append(a[2:])  # `-oFILE`
+                values += args[i + 1:i + 2]  # the next word may be its value
+        # `dart format FILE…` rewrites its file arguments in place
+        if name.lower() == "dart" and "format" in operands:
+            values += operands[operands.index("format") + 1:]
+        return values
     if name == "dd":
         return [a[3:] for a in args if a.startswith("of=")]
     if name == "sed" and any(a.startswith(("-i", "--in-place")) for a in args):
@@ -6185,9 +6338,10 @@ def _sensitive_operand(word):
 
 
 @_memo
-def _command_line(cmd):
+def _command_line(cmd, seen=None):
     """(words of the command `cmd` runs, unquoted and unwrapped; the files
-    its redirections write; the files they read)."""
+    its redirections write; the files they read). `seen`, a list, collects
+    the words of each wrapper peeled."""
     tokens = _shell_words(cmd)
     words, targets, reads, i = [], [], [], 0
     while i < len(tokens):
@@ -6205,7 +6359,7 @@ def _command_line(cmd):
         i += 1
     while words and _ASSIGNMENT_RE.match(words[0]):
         words = words[1:]
-    return _unwrap_command(words), targets, reads
+    return _unwrap_command(words, seen), targets, reads
 
 
 # git subcommands whose risk _git_risk reads from their words
@@ -6261,19 +6415,25 @@ def _risky_operation(cmd):
               else _upload_risk(name, args) if name in ("curl", "wget")
               else _chmod_risk(args) if name == "chmod"
               else _docker_risk(name, args) if name in ("docker", "docker-compose")
-              else _xargs_replace_risk(cmd) or _pub_risk(cmd))
+              else _pub_risk(cmd))
+    if not isinstance(reason, tuple):  # whatever the inner command is
+        reason = _wrapper_doubt(cmd) or _xargs_replace_risk(cmd) or reason
     if isinstance(reason, tuple):
         return reason  # a steer
     reason = reason or _built_word_risk(cmd)
     if reason:
         return ("ask", f"Risky {reason} — LLM review")
     for path in targets + _written_operands(name, args):
-        full = _expand_home(path)
-        if _RAW_DEVICE_RE.match(full):
-            return ("ask", f"Risky write to a raw device: {path} — LLM review")
-        if os.path.basename(full.rstrip("/")) in _STARTUP_FILES \
-                or "Library/LaunchAgents" in full or "Library/LaunchDaemons" in full:
-            return ("ask", f"Risky write to a shell startup file or launch agent: {path} — LLM review")
+        # each word a brace makes of it (`~/.z{s,s}hrc`)
+        paths = _brace_expand(path)
+        if paths is None:
+            return ("ask", f"Risky write to a path with too many brace words: {path[:60]} — LLM review")
+        for full in map(_expand_home, paths):
+            if _RAW_DEVICE_RE.match(full):
+                return ("ask", f"Risky write to a raw device: {path} — LLM review")
+            if os.path.basename(full.rstrip("/")) in _STARTUP_FILES \
+                    or "Library/LaunchAgents" in full or "Library/LaunchDaemons" in full:
+                return ("ask", f"Risky write to a shell startup file or launch agent: {path} — LLM review")
     for word in words + targets + reads:
         hit = _sensitive_operand(word)
         if hit:

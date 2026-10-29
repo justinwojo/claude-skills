@@ -4674,6 +4674,116 @@ def test_phase4_bodies_built_words_env():
            {'safe': 'yes'}])
 
 
+def test_final_review_fixes():
+    print('\n--- Final review: brace and folder-keeping copies, dart outputs, nested denies, explicit C9 ask ---')
+    S, P = '~/.claude/settings.json', './.claude/settings.json'
+    c9 = [
+        # F1: a destination spelled by brace expansion
+        f'cp {S} ~/.{{c..c}}laude/settings.local.json', 'cp /tmp/evil.json ~/.{c..c}laude/settings.json',
+        'cp /tmp/evil.json ~/.cl{a,a}ude/settings.json', 'tee ~/.{c..c}laude/settings.json',
+        'echo x > ~/.cl{a,a}ude/hooks/x', 'mv /tmp/x ~/.{c..c}laude/settings.json',
+        'sed -i s/a/b/ ~/.{c..c}laude/settings.json',
+        # F2: copies that keep each source's folders under the destination
+        f'cp --parents -- {P} /tmp/project/', f'cp --par -- {P} /tmp/project/',
+        f'rsync -R -- {P} /tmp/project/', f'rsync -aR -- {P} /tmp/project/',
+        f'rsync --relative -- {P} /tmp/project/', f'rsync --rel -- {P} /tmp/project/',
+        # F3: rsync's older spelling of --remove-source-files, and a prefix of it
+        f'rsync --remove-sent-files -- {S} /tmp/bak/', f'rsync --remove-sent -- {S} /tmp/bak/',
+    ]
+    res = _both_hooks(c9)
+    for cmd, r in zip(c9, res):
+        check(f'final review C9: {cmd!r}', r, ['ask', _C9, 'ask', _C9])
+    # copies out of config, brace words that name no config path, and a brace
+    # range too long to write out that is no path stay as they were
+    reads = [f'cp {S} /tmp/x', 'cp {a,b}.txt /tmp/', 'cp src/{a,b}.dart lib/',
+             'for i in {1..5000}; do cp a b$i; done', 'cp --parents src/a.txt /tmp/out/',
+             'find . -name x -exec cp {} /tmp/ \\;', 'cp -r proj ~', 'cp .zshrc /tmp/bk/']
+    not_c9 = [f'rsync -a {S} /tmp/bk/', f'rsync -a --no-relative -- {P} /tmp/bk/']
+    res = _both_hooks(reads + not_c9)
+    for cmd, r in zip(reads, res):
+        check(f'final review copy stays allowed: {cmd!r}', (r[0], r[2]), ('allow', 'consult'))
+    for cmd, r in zip(not_c9, res[len(reads):]):
+        check(f'final review rsync read is not C9: {cmd!r}', (r[0], r[2], r[1] == _C9),
+              ('ask', 'consult', False))
+    # F4: a dart/flutter output option (and a brace or a copy into ~) that
+    # writes a startup file or launch agent goes to the LLM
+    asks = ['dart compile js tool.dart -o ~/.zshrc', 'dart compile exe tool.dart --output ~/.zshrc',
+            'dart compile exe tool.dart --output=~/.bashrc', 'dart compile exe tool.dart -o~/.zshrc',
+            'dart compile exe tool.dart -o ~/Library/LaunchAgents/x.plist',
+            'flutter build web --output ~/.zshrc', 'dart doc --output ~/.zshrc',
+            'dart compile exe x.dart --depfile=~/.profile', 'cp a ~/.z{s,s}hrc',
+            'echo x >> ~/.z{s,s}hrc', 'cp /tmp/evil/.zshrc ~/', 'cp /tmp/evil/.zshrc ~']
+    allows = ['dart compile exe bin/x.dart -o out/x', 'dart compile exe bin/x.dart --output=out/x',
+              'flutter build web --output build/web', 'dart doc --output doc/api',
+              'dart run tool/x.dart --out build/x', 'dart test --name foo', 'cp x ~/notes.txt']
+    _phase3_check('Final review F4', [], asks, allows)
+    r = _both_hooks(['dart compile js tool.dart -o ~/.zshrc'])[0]
+    check('dart output names the startup-file reason', 'startup file' in (r[1] or ''), True)
+    # Round 2 F10: `dart format FILE` rewrites its file arguments in place
+    _phase3_check('Final review F10', [], ['dart format ~/.zshrc', 'dart format lib/a.dart ~/.bash_profile'],
+                  ['dart format lib/a.dart test/b.dart', 'dart format .'])
+    # Round 2 F9, round 3 F11–F14: a wrapper option the table doesn't know may
+    # take the word read as the command, and env -C/-P/-L and time -o change
+    # where, as whom or with what side effect it runs, so none is rule-allowed
+    rf = d('cm0gLXJmIA==')
+    link = 'mkdir -p test && env -C test ln -s ~ /tmp/sp-r2-link && ' + rf + '/tmp/sp-r2-link/Documents'
+    _phase3_check('Final review F9/F11-F14', [d('L3Vzci9iaW4vdGltZSAtbyB4IHJtIC1yZiB+'), 'env -Z ' + rf + '~'],
+                  [link, 'env -C test kubectl delete ns prod', 'env --chdir test kubectl delete ns prod',
+                   'env -P /usr/bin kubectl delete ns prod', 'env -L test kubectl delete ns prod',
+                   'env -C sub git status', 'env --chdir=sub ls', 'env -Csub ls',
+                   'env -iu cat /bin/ln -s ~ /tmp/link && ' + rf + '/tmp/link/Documents',
+                   '(exec -ca cat /bin/ln -s ~ /tmp/link) && ' + rf + '/tmp/link/Documents',
+                   '/usr/bin/time -o cat /bin/ln -s ~ /tmp/link && ' + rf + '/tmp/link/Documents',
+                   'env -P ./tools ls && ' + rf + '/tmp/sp-r3-link/Documents',
+                   'env -C /Users/wojo ' + rf + '__pycache__', '/usr/bin/time -o out.txt ls',
+                   # round 4 F15: `builtin` before the wrappers hides none of them
+                   '(builtin exec -ca cat /bin/ln -s ~ /tmp/link) && ' + rf + '/tmp/link/Documents',
+                   'builtin command /usr/bin/time -ao cat /bin/ln -s ~ /tmp/link && ' + rf + '/tmp/link/Documents',
+                   'builtin command env -P ./tools ls && ' + rf + '/tmp/link/Documents',
+                   'builtin command env -C /Users/wojo ' + rf + '__pycache__',
+                   'printf x | builtin command xargs -I X git X',
+                   # and xargs -I is seen whatever command a wrapper hands it
+                   'printf x | env xargs -I X git X', 'printf x | command xargs -I X curl X',
+                   # round 5 F16: a program named like a wrapper is not the wrapper
+                   './env ls && ' + rf + '/tmp/link/Documents', './command ls', './builtin ls',
+                   '/tmp/env ls', 'env ./timeout 5 ls'],
+                  ['env FOO=1 ls', 'env -i PATH=/usr/bin ls', 'env -u FOO ls', 'timeout 5 ls',
+                   'timeout -k 5 10 ls', 'timeout --signal=KILL 5 ls', 'nice -n 5 ls', 'nice -5 ls',
+                   'xargs -n1 echo', 'stdbuf -oL ls', 'time -p ls', 'command -v git', 'nohup ls',
+                   '/usr/bin/env FOO=1 ls', 'builtin command ls',
+                   rf + '__pycache__'])
+    # F5: a deny in a later find -exec action beats an ask in an earlier one
+    push = d('Z2l0IHB1c2ggLS1mb3JjZSBvcmlnaW4gZmVhdHVyZQ==')  # the plain force push
+    steer = [f'find . -exec unknowncmd \\; -o -exec {push} \\;',
+             f'find . -exec frob {{}} + -exec {push} \\;',
+             f"bash -c 'find . -exec frob \\; -o -exec {push} \\;'",
+             f'find . -exec frob \\; -o -exec sh -c "{push}" \\;']
+    res = _both_hooks(steer + ['find . -exec unknowncmd \\; -o -exec ls \\;'])
+    for cmd, r in zip(steer, res):
+        check(f'later nested deny wins: {cmd!r}',
+              (r[0], r[2], '--force-with-lease' in (r[1] or '')), ('deny', 'deny', True))
+    check('earlier nested ask still asks', (res[-1][0], res[-1][2]), ('ask', 'consult'))
+    # F8: PreToolUse emits an explicit ask for C9 (a silent exit would let a
+    # native allow rule approve it); the learner still leaves it to the human,
+    # and other asks without an LLM still fall through silently
+    home = os.path.expanduser('~')
+    for label, call in (('Write', {'tool_name': 'Write',
+                                   'tool_input': {'file_path': f'{home}/.claude/settings.json'}}),
+                        ('Bash', _bash_call('cp /tmp/x ~/.{c..c}laude/settings.json'))):
+        cfg, cp = _fresh_cfg()
+        check(f'C9 {label}: PreToolUse emits an explicit ask (LLM-allow ignored)',
+              _run_cfg(PRETOOL, call, cp, llm={'safe': True}, full=True), ('ask', True))
+        recs = [r for r in _decision_records(cfg) if r.get('hook') == 'pretool']
+        check(f'C9 {label}: PreToolUse logs one rule ask',
+              [(r.get('decision'), r.get('source')) for r in recs], [('ask', 'rule')])
+        cfg, cp = _fresh_cfg()
+        check(f'C9 {label}: learner leaves it to the human',
+              _run_cfg(LEARNER, call, cp, llm={'safe': True}, full=True), ('ask', False))
+    cfg, cp = _fresh_cfg()
+    check('a non-C9 ask without an LLM still falls through silently',
+          _run_cfg(PRETOOL, _bash_call('frobnicate x'), cp, full=True), ('ask', False))
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -4790,6 +4900,7 @@ if __name__ == '__main__':
     test_phase3_scratch_deletes()
     test_phase3_constant_command_word()
     test_phase4_bodies_built_words_env()
+    test_final_review_fixes()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
