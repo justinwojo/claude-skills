@@ -41,9 +41,9 @@ Tool call
   │  Dangerous pattern? (sudo, rm -rf /, curl|sh)   ──→  DENY          │
   │  Recursive delete of a protected folder (~/Dev) ──→  DENY          │
   │  rm -r target on a possibly-empty $VAR          ──→  DENY + rewrite│
+  │  Permission-config write? (settings, this cfg)  ──→  ASK (C9)      │
   │  Other recursive delete (rm -r, find -delete)   ──→  LLM (no cache)│
   │  Risky pattern? (rm *, find / -delete)          ──→  ASK (no cache)│
-  │  Permission-config write? (settings, this cfg)  ──→  ASK (C9)      │
   │  Known-safe command/subcommand?                 ──→  ALLOW         │
   │  MCP tool in safe list? (glob patterns)         ──→  ALLOW         │
   │  Otherwise (unknown)                            ──→  LLM eval      │
@@ -53,8 +53,8 @@ Tool call
                           │ still undecided ("ask")
                           ▼
   ┌─ PermissionRequest (learner) ────────────────────────────────────┐
-  │  Re-check dangerous/risky patterns              ──→  DENY / ASK    │
-  │  Permission-config write                        ──→  ASK           │
+  │  Re-run PreToolUse's rules: what they deny      ──→  DENY          │
+  │  Permission-config write, unreadable command    ──→  ASK           │
   │  LLM configured?  ── yes ─→ LLM eval (+ cache)   ──→  ALLOW / ASK  │
   │                   └─ no                         ──→  ASK           │
   └───────────────────────────────────────────────────────────────────┘
@@ -82,6 +82,9 @@ upload needs explicit authorization.
   calibration session reads as normal work. Tool results, assistant text and
   harness notices are never sent, so file or web content can't argue its way
   past the judge.
+- **Strict verdicts.** Only an answer whose `safe` is the boolean `true`
+  approves. A string (`"true"`), a number, or a missing or malformed verdict
+  goes to you.
 - **Second pass.** A flagged call is judged again at
   `SAFETY_HOOK_RECHECK_REASONING_EFFORT` (default `high`), with the first
   verdict attached. If the recheck clears it, the call runs (`source:
@@ -278,7 +281,7 @@ auto-allowed: they reach the LLM like any other recursive delete.
 - `find / -delete` or `find / -exec rm` (recursive deletion from root)
 - Archive extraction to system roots (`tar -C /usr/`)
 - **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
-- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files. These *always* prompt — never auto-allowed, never LLM-vouched — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. This guard is not subtractable.
+- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files, and Bash commands that write to them (`cp`, `tee`, `>` …) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
 - WebFetch to domains not in the allow list
 - MCP tools not matching any `safe_mcp_tools` pattern
 - Anything else the rules can't settle (a novel CLI tool, a write outside the safe folders), when no LLM is configured
@@ -385,7 +388,7 @@ for f in *.txt; do echo "$f"; done
 # → recognizes shell keywords (for, do, done, echo)
 ```
 
-The parser handles compound operators (`&&`, `||`, `;`, `|`), quoting, heredocs, subshells, line continuations, `case...esac`, function definitions, loops, and variable assignments. Transparent runners (`env`, `timeout`, `nohup`, `xargs`, `command`, …) are peeled so the *inner* command is what gets checked (`xargs docker run` is evaluated as `docker run`, not auto-allowed as `xargs`), and indirect command words — `$VAR`, `\docker`, and meta-execution builtins (`eval`, `source`, `.`) — are treated as unknown rather than trusted.
+The parser handles compound operators (`&&`, `||`, `;`, `|`, `|&`, and a lone `&` that backgrounds a job — `2>&1`, `&>` and `>&` stay redirections), quoting, backslash escapes, heredocs, subshells and `{ }` groups (also with redirections after them), line continuations, `case...esac`, function definitions, loops, and variable assignments. Redirections before the command word (`< /dev/null cmd`, `2>/dev/null cmd`) are skipped, so `cmd` is what gets checked. Transparent runners (`env`, `timeout`, `nohup`, `xargs`, `command`, …) are peeled so the *inner* command is what gets checked (`xargs docker run` is evaluated as `docker run`, not auto-allowed as `xargs`), and indirect command words — `$VAR`, `\docker`, and meta-execution builtins (`eval`, `source`, `.`) — are treated as unknown rather than trusted.
 
 If **any** sub-command in a compound command is unknown, the entire command falls through to the permission prompt.
 
@@ -532,6 +535,11 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 ## Changelog
 
+- **Unreleased — hardening.**
+  - The LLM approves only with a boolean `safe: true`; a string, number or missing verdict goes to you.
+  - A Bash write to a permission-config path (C9) prompts from anywhere in the command (inside `if`/`for` bodies, functions, groups, `$(…)`, after a risky part), in both hooks, without asking the LLM.
+  - A lone `&` now separates commands (`sleep 1 & kubectl delete …` checks `kubectl`), backslash escapes no longer hide a `;`, redirections before the command word (`< /dev/null kubectl …`) are skipped, and a group with redirections after it (`( … ) > /dev/null`) is checked command by command. Each of these was rule-allowed before.
+  - The PermissionRequest hook now runs the same Bash rules as PreToolUse instead of its own copy; its log reasons are PreToolUse's (`Unknown command(s): docker` instead of `Restricted command family …`).
 - **2026-10-29 — auto-learning removed.** Approvals are no longer written to your config. Without an LLM, unknown Bash commands, home/temp writes and WebFetch to new domains now prompt instead of being approved and learned. `SAFETY_HOOK_AUTO_LEARN`, `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored. Previously learned entries stay in your config. See [the upgrade note](#smart-permissions) at the top.
 
 ## License

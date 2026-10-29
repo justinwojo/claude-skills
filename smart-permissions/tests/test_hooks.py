@@ -328,8 +328,10 @@ def test_learner_unknown_commands():
     """Without an LLM, an unknown command goes to the normal prompt. Earlier
     versions approved it here and wrote it to the config."""
     print('\n--- PermissionRequest: Unknown commands, no LLM (ask) ---')
-    for cmd in ['flutter build ios', 'flyctl deploy', 'znovel plan']:
-        check(f'{cmd} → ask, unknown', _learner_run(_bash_call(cmd)), ('ask', 'Unknown command'))
+    for cmd, reason in [('flutter build ios', 'All commands in safe list'),
+                        ('flyctl deploy', 'Unknown command(s): flyctl'),
+                        ('znovel plan', 'Unknown command(s): znovel')]:
+        check(f'{cmd} → ask', _learner_run(_bash_call(cmd)), ('ask', reason))
 
 
 def test_learner_dangerous_denied():
@@ -1440,7 +1442,10 @@ def test_c1_log_rotation():
 
 # ---- C0: restricted-base matrix ---------------------------------------
 
-_RESTRICTED = 'Restricted command family — LLM or manual approval'
+def _unknown(word):
+    """The learner's logged reason for an unknown command word (PreToolUse's
+    reason, minus the "(logged)" — the learner doesn't log it a second time)."""
+    return f'Unknown command(s): {word}'
 
 
 def test_c0_restricted_base_matrix():
@@ -1448,12 +1453,12 @@ def test_c0_restricted_base_matrix():
 
     restricted = ['docker run x', 'npm publish', 'gh pr create x',
                   'terraform apply', 'kubectl delete pod x']
-    # No LLM: everything asks; the logged reason still tells a restricted
-    # family from a plain unknown.
+    # No LLM: everything asks, named as the unknown command word.
     for cmd in restricted:
-        check(f'no-LLM restricted asks: {cmd}', _learner_run(_bash_call(cmd)), ('ask', _RESTRICTED))
+        check(f'no-LLM restricted asks: {cmd}', _learner_run(_bash_call(cmd)),
+              ('ask', _unknown(cmd.split()[0])))
     check('no-LLM non-restricted asks as unknown: flyctl deploy',
-          _learner_run(_bash_call('flyctl deploy')), ('ask', 'Unknown command'))
+          _learner_run(_bash_call('flyctl deploy')), ('ask', _unknown('flyctl')))
 
     # LLM allow / confirmed flag drive the verdict for restricted families.
     cfg, cp = _fresh_cfg()
@@ -1471,13 +1476,13 @@ def test_c0_restricted_base_matrix():
     check('C0: docker stays restricted under remove_from_defaults',
           _learner_run(_bash_call('docker run x'),
                        {'remove_from_defaults': {'safe_commands': ['docker run *', 'docker build *']}}),
-          ('ask', _RESTRICTED))
+          ('ask', _unknown('docker')))
 
     # Subtracting a single-word safe command makes that base restricted (C0
     # component 3 — a removal means "ask me", never "unknown → allow").
     check('C0: subtracted single-word base is restricted',
           _learner_run(_bash_call('git status'), {'remove_from_defaults': {'safe_commands': ['git']}}),
-          ('ask', _RESTRICTED))
+          ('ask', _unknown('git')))
 
 
 def test_c0_pretool_restricted():
@@ -1601,10 +1606,11 @@ def test_no_config_writes_on_llm_allow():
 
 
 def test_learner_classification_unchanged():
-    print('\n--- Retired auto-learn: learner verdicts and reasons unchanged ---')
+    print('\n--- Retired auto-learn: learner verdicts unchanged ---')
     H = os.path.expanduser('~')
-    # Pinned from the classifier before auto-learn was removed. Only its third
-    # field (the no-LLM fallback) is gone; deny, steer and C9 are untouched.
+    # Verdicts pinned from the classifier before auto-learn was removed. Only
+    # its third field (the no-LLM fallback) is gone; deny, steer and C9 are
+    # untouched. Consult reasons are now PreToolUse's own (evaluate_bash).
     rows = [
         ('dangerous', 'Bash', {'command': d('c3VkbyBpZA==')}, 'deny', "Blocked dangerous pattern"),
         ('protected delete', 'Bash', {'command': d('cm0gLXJmIH4=')}, 'deny', "Blocked recursive delete of protected folder ~"),
@@ -1612,13 +1618,13 @@ def test_learner_classification_unchanged():
         ('risky', 'Bash', {'command': 'rm *'}, 'consult', "Risky command pattern — confirm before running"),
         ('C9 bash write', 'Bash', {'command': f'echo x >> {H}/.claude/settings.json'}, 'ask', "Bash write to permission-config path"),
         ('ambiguous parse', 'Bash', {'command': 'echo "unterminated'}, 'ask', "Ambiguous parse — unbalanced quotes or incomplete heredoc"),
-        ('compound unsafe', 'Bash', {'command': 'f() { bash -c x; }; f'}, 'consult', "Unsafe command in compound block"),
+        ('compound unsafe', 'Bash', {'command': 'f() { bash -c x; }; f'}, 'consult', "Interpreter execution in compound block: bash"),
         ('interpreter', 'Bash', {'command': 'bash -c whoami'}, 'consult', "Inline interpreter execution: bash"),
-        ('wrapped', 'Bash', {'command': 'env evil-tool --wipe'}, 'consult', "Wrapped non-safe command: evil-tool"),
-        ('variable', 'Bash', {'command': '$DOCKER run alpine'}, 'consult', "Variable/indirect command word"),
-        ('meta', 'Bash', {'command': 'eval docker run'}, 'consult', "Meta-execution command word"),
-        ('restricted', 'Bash', {'command': 'docker run x'}, 'consult', _RESTRICTED),
-        ('unknown', 'Bash', {'command': 'flyctl deploy'}, 'consult', "Unknown command"),
+        ('wrapped', 'Bash', {'command': 'env evil-tool --wipe'}, 'consult', "Unknown command(s): evil-tool"),
+        ('variable', 'Bash', {'command': '$DOCKER run alpine'}, 'consult', "Unknown command(s): $DOCKER"),
+        ('meta', 'Bash', {'command': 'eval docker run'}, 'consult', "Unknown command(s): eval"),
+        ('restricted', 'Bash', {'command': 'docker run x'}, 'consult', "Unknown command(s): docker"),
+        ('unknown', 'Bash', {'command': 'flyctl deploy'}, 'consult', "Unknown command(s): flyctl"),
         ('C9 write', 'Edit', {'file_path': f'{H}/.claude/settings.json'}, 'ask', "Permission-config path requires confirmation"),
         ('sensitive write', 'Write', {'file_path': f'{H}/.ssh/config'}, 'deny', "Sensitive path: /.ssh/"),
         ('home write', 'Write', {'file_path': f'{H}/zz-new/x.txt'}, 'consult', "Home/temp directory write"),
@@ -2018,14 +2024,14 @@ def test_m2_wrapped_nonsafe_inner():
               _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
               'ask')
     for cmd in ['env evil-tool --wipe', 'timeout 5 evil-tool run']:
-        check(f'M2: {cmd} classed as wrapped',
-              _learner_run(_bash_call(cmd))[1], 'Wrapped non-safe command: evil-tool')
-    # A wrapper hiding a genuinely SAFE inner is not classed as wrapped
-    # (not over-tightened), and neither is a bare unknown.
-    check('M2: wrapped safe inner not classed as wrapped (env git status)',
-          _learner_run(_bash_call('env git status'))[1], 'Unknown command')
+        check(f'M2: {cmd} names the inner command',
+              _learner_run(_bash_call(cmd))[1], _unknown('evil-tool'))
+    # A wrapper hiding a genuinely SAFE inner passes the rules (not
+    # over-tightened); it reached the learner, so it still goes to a human.
+    check('M2: wrapped safe inner passes the rules (env git status)',
+          _learner_run(_bash_call('env git status')), ('ask', 'All commands in safe list'))
     check('M2: bare unknown classed as unknown (flyctl deploy)',
-          _learner_run(_bash_call('flyctl deploy'))[1], 'Unknown command')
+          _learner_run(_bash_call('flyctl deploy'))[1], _unknown('flyctl'))
 
 
 # ---- H6: type-confusion fail-open on safety keys -----------------------
@@ -2095,15 +2101,14 @@ def test_h4_indirect_command_words():
         check(f'H4: {cmd!r} → ask',
               _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': cmd}}, cp),
               'ask')
-    check('H4: eval classed as meta-execution',
-          _learner_run(_bash_call('eval docker run'))[1], 'Meta-execution command word')
-    check('H4: $VAR classed as indirect',
-          _learner_run(_bash_call("$'docker' run"))[1], 'Variable/indirect command word')
-    check('H4: \\docker classed as restricted',
-          _learner_run(_bash_call('\\docker run alpine'))[1], _RESTRICTED)
-    # A plain unknown (no indirection) is classed as unknown.
+    check('H4: eval is not trusted',
+          _learner_run(_bash_call('eval docker run'))[1], _unknown('eval'))
+    check('H4: $VAR is not trusted',
+          _learner_run(_bash_call("$'docker' run"))[1], _unknown("$'docker'"))
+    check('H4: \\docker is not trusted',
+          _learner_run(_bash_call('\\docker run alpine'))[1], _unknown('\\docker'))
     check('H4: plain unknown classed as unknown (spotread -v)',
-          _learner_run(_bash_call('spotread -v'))[1], 'Unknown command')
+          _learner_run(_bash_call('spotread -v'))[1], _unknown('spotread'))
 
 
 # ---- H3: xargs runner peel exposes restricted inner --------------------
@@ -2114,14 +2119,14 @@ def test_h3_xargs_peel():
     check('H3: xargs docker run → ask (pretool, unknown/restricted inner)',
           _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'xargs docker run alpine'}}, cp),
           'ask')
-    check('H3: xargs docker run → ask (learner, wrapped restricted inner)',
-          _learner_run(_bash_call('xargs docker run alpine')), ('ask', 'Wrapped non-safe command: docker'))
+    check('H3: xargs docker run → ask (learner, restricted inner)',
+          _learner_run(_bash_call('xargs docker run alpine')), ('ask', _unknown('docker')))
     # With a value-flag consuming a token, the inner is still reached.
     check('H3: xargs -n 1 docker run → ask (flag value skipped)',
-          _learner_run(_bash_call('xargs -n 1 docker run alpine')), ('ask', 'Wrapped non-safe command: docker'))
-    # A safe inner through xargs is not classed as wrapped (not over-tightened).
-    check('H3: xargs git status not classed as wrapped',
-          _learner_run(_bash_call('xargs git status'))[1], 'Unknown command')
+          _learner_run(_bash_call('xargs -n 1 docker run alpine')), ('ask', _unknown('docker')))
+    # A safe inner through xargs passes the rules (not over-tightened).
+    check('H3: xargs git status passes the rules',
+          _learner_run(_bash_call('xargs git status'))[1], 'All commands in safe list')
 
 
 # ---- their-M1: fail CLOSED when defaults can't load --------------------
@@ -2197,11 +2202,10 @@ def test_fix1_nested_nonlist_exec_flags():
 def test_fix2_restricted_base_case_insensitive():
     print('\n--- FIX 2: restricted base case-folded (learner) ---')
     for cmd in ['docker run alpine', 'Docker run alpine', 'DOCKER run alpine']:
-        check(f'FIX2: {cmd!r} → learner ask, restricted',
-              _learner_run(_bash_call(cmd)), ('ask', _RESTRICTED))
-    # An unrelated (non-restricted) command is not over-tightened.
+        check(f'FIX2: {cmd!r} → learner ask',
+              _learner_run(_bash_call(cmd)), ('ask', _unknown(cmd.split()[0])))
     check('FIX2: spotread -v classed as unknown',
-          _learner_run(_bash_call('spotread -v'))[1], 'Unknown command')
+          _learner_run(_bash_call('spotread -v'))[1], _unknown('spotread'))
 
 
 # ---- FIX 3: dispatchers tolerate a non-dict tool_input -----------------
@@ -3478,6 +3482,243 @@ def test_anthropic_provider():
     check('proxy URL → OpenAI format', bool(reqs) and 'response_format' in reqs[0]['body'], True)
 
 
+# ---- Phase 1a: verdict invariants -----------------------------------------
+
+def _both_hooks(cmds):
+    """[(evaluate_bash verdict, reason, classify_bash verdict, reason)] for each
+    command, in one process: PreToolUse's rules and the learner's, side by
+    side, with a scratch config and a scratch HOME holding ~/Documents."""
+    home = tempfile.mkdtemp(prefix='sp-home-')
+    atexit.register(shutil.rmtree, home, ignore_errors=True)
+    for sub in ('Dev/proj', 'Documents'):
+        os.makedirs(os.path.join(home, sub))
+    _, cp = _fresh_cfg()
+    env = os.environ.copy()
+    for k in ('SAFETY_HOOK_API_KEY', 'ANTHROPIC_API_KEY', 'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_API_URL'):
+        env.pop(k, None)
+    env['SMART_PERMISSIONS_CONFIG'] = cp
+    env['HOME'] = home
+    code = ("import sys, json\nsys.path.insert(0, %r)\n"
+            "import pretool_safety as p, permission_learner as l\n"
+            "p.log_unknown = lambda *a: None\n"
+            "p.HOOK_CWD = %r\n"
+            "out = []\n"
+            "for c in json.loads(sys.stdin.read()):\n"
+            "    out.append(list(p.evaluate_bash(c)) + list(l.classify_bash(c)))\n"
+            "print(json.dumps(out))\n") % (SCRIPT_DIR, os.path.join(home, 'Dev', 'proj'))
+    r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
+                       input=json.dumps(cmds))
+    return json.loads(r.stdout) if r.returncode == 0 else [[None] * 4 for _ in cmds]
+
+
+_C9 = 'Bash write to permission-config path'
+
+
+def test_llm_verdict_must_be_boolean():
+    print('\n--- Phase 1a: the LLM approves only with a real boolean true ---')
+    call = _bash_call('docker run alpine')
+    for script, name in ((PRETOOL, 'pretool'), (LEARNER, 'learner')):
+        for bad in ({'safe': 'false'}, {'safe': 'true'}, {'safe': 1}, {'safe': None},
+                    {'reason': 'no verdict'}):
+            cfg, cp = _fresh_cfg()
+            log = os.path.join(cfg, 'requests.jsonl')
+            check(f'{name}: {bad} → ask', _run_cfg(script, call, cp, llm=bad, requests_log=log),
+                  'ask')
+            check(f'{name}: {bad} gets no recheck', len(_requests(log)), 1)
+        cfg, cp = _fresh_cfg()
+        check(f'{name}: {{"safe": true}} → allow', _run_cfg(script, call, cp, llm={'safe': True}),
+              'allow')
+        # A malformed recheck verdict can't clear a first-pass flag either.
+        cfg, cp = _fresh_cfg()
+        check(f'{name}: flag, then recheck "true" → ask',
+              _run_cfg(script, call, cp, llm=[_FLAG, {'safe': 'true'}]), 'ask')
+        cfg, cp = _fresh_cfg()
+        check(f'{name}: flag, then recheck true → allow',
+              _run_cfg(script, call, cp, llm=[_FLAG, {'safe': True}]), 'allow')
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    check('anthropic: {"safe": "true"} → ask', _run_anthropic(
+        {'tool_name': 'Bash', 'tool_input': {'command': 'docker run alpine'}}, cp,
+        [_anthropic_reply({'safe': 'true'})], log), 'ask')
+
+
+def test_c9_outranks_other_asks():
+    print('\n--- Phase 1a: a C9 write goes to the human from anywhere in the command ---')
+    cfg_path = '~/.claude/settings.json'
+    writes = [
+        f'rm * ; cp /tmp/x {cfg_path}',
+        f'echo $(cp /tmp/x {cfg_path})',
+        f'echo $(kubectl get x) $(cp /tmp/x {cfg_path})',
+        f'f() {{ cp /tmp/x {cfg_path}; }}; f',
+        f'f() ( cp /tmp/x {cfg_path} ); f',
+        f'if true; then cp /tmp/x {cfg_path}; fi',
+        f'for i in 1; do tee {cfg_path} < /tmp/x; done',
+        f'case a in a) cp /tmp/x {cfg_path};; esac',
+        f'( cp /tmp/x {cfg_path} ) > /dev/null',
+        f'( echo x ) > {cfg_path}',
+        f'{{ echo x; }} >> {cfg_path}',
+        f'{{ echo x; }} > ${{HOME}}/.claude/settings.json',
+        f'f() {{ echo x; }} > {cfg_path}; f',
+        f"case x in y) echo ok;; x) printf 'case x' > {cfg_path};; esac",
+        f'(echo x; case x in x) ls;; esac) > {cfg_path}',
+        f'case x in x) echo ok;; esac > {cfg_path} # )',
+        f'case x in x) echo ok;; esac>{cfg_path}',
+        f'sleep 1 & cp /tmp/x {cfg_path}',
+        f'< /dev/null cp /tmp/x {cfg_path}',
+        f'> /tmp/o env cp /tmp/x {cfg_path}',
+        f"echo 'unbalanced {cfg_path}",  # can't be read with confidence
+    ]
+    reads = [
+        f'cat {cfg_path}',
+        f'jq . {cfg_path} | head -5',
+        f'( cat {cfg_path} ) > /tmp/x',
+        f'if [ -f {cfg_path} ]; then cat {cfg_path}; fi',
+        f'f() {{ jq . {cfg_path}; }}; f',
+        f'echo $(cat {cfg_path})',
+        f'wc -l < {cfg_path} > /tmp/count',
+    ]
+    res = _both_hooks(writes + reads)
+    for cmd, r in zip(writes, res):
+        check(f'C9 both hooks: {cmd!r}', r, ['ask', _C9, 'ask', _C9])
+    for cmd, r in zip(reads, res[len(writes):]):
+        check(f'C9 read stays allowed: {cmd!r}', (r[0], r[2]), ('allow', 'consult'))
+
+    # End to end: neither hook asks the LLM, even one that would approve.
+    payload = _bash_call(f'rm * ; cp /tmp/x {cfg_path}')
+    for script, name in ((PRETOOL, 'pretool'), (LEARNER, 'learner')):
+        cfg, cp = _fresh_cfg()
+        log = os.path.join(cfg, 'requests.jsonl')
+        check(f'{name}: risky + C9 → ask', _run_cfg(script, payload, cp, llm={'safe': True},
+                                                    requests_log=log), 'ask')
+        check(f'{name}: risky + C9 never reaches the LLM', _requests(log), [])
+    # A deny still outranks C9 (base64: privilege escalation + a C9 write).
+    deny = d('c3VkbyBpZDsgY3AgL3RtcC94IH4vLmNsYXVkZS9zZXR0aW5ncy5qc29u')
+    for script, name in ((PRETOOL, 'pretool'), (LEARNER, 'learner')):
+        cfg, cp = _fresh_cfg()
+        check(f'{name}: deny outranks C9', _run_cfg(script, _bash_call(deny), cp), 'deny')
+
+
+def test_background_and_escapes_split():
+    print('\n--- Phase 1a: a lone & separates commands; escapes stay literal ---')
+    asks = [
+        'sleep 1 & kubectl delete ns prod',
+        'ls & docker run x',
+        'ls&docker run x',
+        '( sleep 1 & kubectl delete ns prod )',
+        '{ sleep 1 & kubectl delete ns prod; }',
+        'echo $(sleep 1 & kubectl delete ns prod)',
+        'ls |& kubectl delete ns prod',
+        'echo hi &> /dev/null & kubectl delete ns prod',
+        'echo \\\\; kubectl delete ns prod',
+        "echo \\'; kubectl delete ns prod; echo \\'",
+        # A case pattern's `)` inside a group is not the group's end.
+        '(echo x; case x in x) kubectl delete ns prod;; esac)',
+        'case x in a) ls;; b) case y in c) kubectl delete ns prod;; esac;; esac',
+        'case esac/x in a) ls;; esac/x) kubectl delete ns prod;; esac',
+        'case esac /x in a) ls;; esac /x) kubectl delete ns prod;; esac',
+        'case esac\r/x in a) ls;; esac\r/x) kubectl delete ns prod;; esac',
+    ]
+    allows = [
+        'echo x &',
+        'git log --oneline | head -5 &',
+        'git status 2>&1 | tail -1',
+        'ls &> /dev/null',
+        'ls &>> /tmp/sp-log',
+        'ls >& /dev/null',
+        'ls 2>&1 >&2',
+        'ls 0<&0',
+        "echo 'a & b'",
+        'echo "a & b"',
+        'echo a \\& kubectl',
+        'echo a\\;kubectl',
+        "echo it\\'s fine",
+        'x=$((1 & 2)); echo $x',
+        '[[ -n a && -n b ]] && echo ok',
+        'case x in a) ls;& b) ls;; esac',
+        'case x in x) ' * 1000 + 'echo ok' + ';; esac' * 1000,  # no RecursionError
+    ]
+    res = _both_hooks(asks + allows)
+    for cmd, r in zip(asks, res):
+        check(f'& / escape → ask: {cmd!r}', (r[0], r[2]), ('ask', 'consult'))
+    for cmd, r in zip(asks, res):
+        check(f'& / escape names the hidden command: {cmd!r}',
+              any(w in (r[1] or '') for w in ('kubectl', 'docker')), True)
+    for cmd, r in zip(allows, res[len(asks):]):
+        check(f'& / escape still allowed: {cmd!r}', (r[0], r[2]), ('allow', 'consult'))
+
+    # The protected-delete guard still sees through a background job.
+    rmrf = d('cm0gLXJm')
+    for cmd in (f'sleep 1 & {rmrf} ~/Documents', f'cd ~ & {rmrf} Documents'):
+        r = _both_hooks([cmd])[0]
+        check(f'& keeps the protected-delete deny: {cmd!r}', (r[0], r[2]), ('deny', 'deny'))
+
+
+def test_leading_redirections_skipped():
+    print('\n--- Phase 1a: redirections before the command word are skipped ---')
+    asks = [
+        '< /dev/null kubectl delete ns prod',
+        '> /tmp/sp-o kubectl delete ns prod',
+        '2>/dev/null kubectl delete ns prod',
+        '2> /dev/null kubectl delete ns prod',
+        'FOO=1 >/tmp/sp-o kubectl delete ns prod',
+        '{fd}>/tmp/sp-o kubectl delete ns prod',
+        '< /dev/null env kubectl delete ns prod',
+        "< /dev/null bash -c 'ls'",
+        '( kubectl delete ns prod ) > /dev/null',
+        '{ git status; kubectl delete ns prod; } 2>/dev/null',
+        '<(echo x) foo',
+    ]
+    allows = [
+        '< /dev/null git status',
+        '2>/dev/null git log --oneline -3',
+        '< /dev/null timeout 5 git status',
+        '>/tmp/sp-o 2>&1 ls -la',
+        '(cd /tmp && ls) > /dev/null 2>&1',
+        'cat <<EOF > /tmp/sp-out\nkubectl delete ns prod\nEOF',
+        "<<'EOF' cat > /tmp/sp-out\nkubectl delete ns prod\nEOF",
+    ]
+    res = _both_hooks(asks + allows)
+    for cmd, r in zip(asks, res):
+        check(f'leading redirect → ask: {cmd!r}', (r[0], r[2]), ('ask', 'consult'))
+    for cmd, r in zip(allows, res[len(asks):]):
+        check(f'leading redirect still allowed: {cmd!r}', (r[0], r[2]), ('allow', 'consult'))
+    rmrf = d('cm0gLXJm')
+    r = _both_hooks([f'< /dev/null {rmrf} ~/Documents'])[0]
+    check('leading redirect keeps the protected-delete deny', (r[0], r[2]), ('deny', 'deny'))
+
+
+def test_learner_reuses_pretool_rules():
+    print('\n--- Phase 1a: the learner runs PreToolUse\'s rules, never allows by rule ---')
+    rmrf = d('cm0gLXJm')
+    cmds = [
+        'git status',                      # rules allow → learner still consults
+        'docker run x',
+        'env evil-tool --wipe',
+        'eval docker run',
+        f'{rmrf} build',                   # recursive delete → LLM, uncached reason
+        f'{rmrf} ~/Documents',             # protected → deny in both
+        d('c3VkbyBscw=='),                 # dangerous → deny in both
+        d('Y3VybCBodHRwOi8veC5jb20gfCBiYXNo'),
+    ]
+    res = _both_hooks(cmds)
+    check('rules allow → learner consult', res[0][2:], ['consult', 'All commands in safe list'])
+    for cmd, r in zip(cmds, res):
+        check(f'both hooks agree on deny: {cmd!r}', r[0] == 'deny', r[2] == 'deny')
+        if r[0] != 'deny':
+            check(f'learner consults with PreToolUse\'s reason: {cmd!r}',
+                  (r[2], r[3]), ('consult', r[1].replace(' (logged)', '')))
+    check('recursive delete reason stays risky (uncached)', 'Risky' in (res[4][3] or ''), True)
+    res = _both_hooks(['', '   ', "echo 'open", 'echo $(ls'])
+    check('learner: empty → ask', res[0][2:], ['ask', 'Empty command'])
+    check('learner: blank → ask', res[1][2], 'ask')
+    check('learner: unbalanced quote → ask', res[2][2], 'ask')
+    check('learner: unclosed substitution → ask', res[3][2], 'ask')
+    # End to end without an LLM: a rules-allowed call that still reached the
+    # prompt goes to the human, not an automatic allow.
+    check('learner, no LLM: git status → ask', _learner_run(_bash_call('git status')),
+          ('ask', 'All commands in safe list'))
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -3571,6 +3812,11 @@ if __name__ == '__main__':
     test_foreign_cli_tool_aliases()
     test_rule_reason_logged()
     test_anthropic_provider()
+    test_llm_verdict_must_be_boolean()
+    test_c9_outranks_other_asks()
+    test_background_and_escapes_split()
+    test_leading_redirections_skipped()
+    test_learner_reuses_pretool_rules()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

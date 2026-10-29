@@ -1037,9 +1037,10 @@ def _resolve_through_wrappers(cmd):
 
     Uses shlex so quoted env values like `env FOO="bar baz" python -c …`
     are tokenized correctly. Wrapper chains (`env timeout 5 python -c …`)
-    are handled by tail-calling.
+    are handled by tail-calling. Redirections before the wrapper
+    (`< /dev/null env …`) are skipped.
     """
-    tokens = _shlex_split_safe(cmd)
+    tokens = _shlex_split_safe(_strip_leading_redirections(cmd))
     if not tokens:
         return cmd
     first = os.path.basename(tokens[0])
@@ -1538,7 +1539,8 @@ def _llm_request(user_prompt, reasoning_effort, budget):
     """One safety-evaluation call; returns the parsed decision dict.
 
     Raises on transport errors and timeouts; returns None if the response
-    can't be parsed as a decision.
+    can't be parsed as a decision. A decision always carries a real boolean
+    `safe`: `"false"`, `1` or a missing key is no verdict (→ the human).
     """
     req = _build_llm_http_request(user_prompt, reasoning_effort)
     result = _llm_post_with_deadline(req, budget)
@@ -1553,7 +1555,7 @@ def _llm_request(user_prompt, reasoning_effort, budget):
         decision = json.loads(content)
     except (json.JSONDecodeError, ValueError):
         decision = _extract_json_decision(content)
-    if not isinstance(decision, dict):
+    if not isinstance(decision, dict) or not isinstance(decision.get("safe"), bool):
         # Always log — this indicates a real problem
         print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
         return None
@@ -1625,9 +1627,9 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True,
         print(f"LLM error: {e}", file=sys.stderr)
         return ("ask", f"LLM unavailable ({e}) — manual approval required", info("llm"))
     if first is None:
-        return ("ask", "LLM response could not be parsed as JSON", info("llm"))
+        return ("ask", "LLM response had no valid verdict (boolean `safe`)", info("llm"))
 
-    if first.get("safe"):
+    if first["safe"] is True:
         if DEBUG:
             print(f"LLM APPROVED: {tool}", file=sys.stderr)
         if cacheable:
@@ -1649,7 +1651,7 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True,
     if second is None:
         return ("ask", f"LLM flagged ({flag}); recheck unparseable", info("llm"))
 
-    if second.get("safe"):
+    if second["safe"] is True:
         if DEBUG:
             print(f"LLM RECHECK CLEARED: {tool}", file=sys.stderr)
         return ("allow", f"LLM recheck cleared first-pass flag ({flag})",
@@ -1684,23 +1686,20 @@ def main():
     llm_ms = None
     rule_reason = None
 
+    # C9: a permission-config write goes to the human, whatever else the rules
+    # said short of a deny — an LLM cannot vouch for an edit to the hook's own
+    # permission rules. The learner applies the same check.
+    if decision != "deny":
+        human = human_required_reason(tool, tool_input)
+        if human:
+            log_decision("pretool", tool, tool_input, "ask", "rule",
+                         reason if decision == "ask" else human,
+                         duration_ms=_elapsed_ms(start))
+            sys.exit(0)
+
     # If local rules can't decide, hand off to LLM (if configured). Skip the
     # cache for risky-class asks — an LLM override there must not become sticky.
     if decision == "ask":
-        # C9: permission-config writes NEVER consult the LLM
-        # — an LLM cannot vouch for an edit to the hook's own permission rules.
-        # Mirrors the learner, which routes these to a definite "ask".
-        if tool in ("Write", "Edit", "NotebookEdit"):
-            _p = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
-            if is_always_ask_write_path(_p):
-                log_decision("pretool", tool, tool_input, "ask", "rule", reason,
-                             duration_ms=_elapsed_ms(start))
-                sys.exit(0)
-        # H1: same guard for a Bash command that writes to a config/state path.
-        if tool == "Bash" and bash_writes_to_config_path(tool_input.get("command", "")):
-            log_decision("pretool", tool, tool_input, "ask", "rule", reason,
-                         duration_ms=_elapsed_ms(start))
-            sys.exit(0)
         cacheable = not _reason_is_risky(reason)
         rule_reason = reason
         decision, reason, info = llm_evaluate(
@@ -1940,23 +1939,55 @@ def bash_writes_to_config_path(command):
     (after wrapper peel) is a known file-writer. `jq/cat/grep <log>` with no
     redirect is not flagged; neither is a quoted `>` (`python3 -c "a>b"`),
     `2>&1`, or `>/dev/null`.
+
+    Every command the shell may run is checked (_iter_commands): inside
+    if/for/while bodies, groups, functions, case arms and substitutions too.
+    A command that names a config path but can't be parsed counts as a write.
     """
     if not command or not _references_always_ask_path(command):
         return False
     try:
-        commands, _unc = split_compound_command(command)
+        if bash_parse_uncertain(command):
+            return True
+        for cmd in _iter_commands(command):
+            if cmd is None or _writes_config(cmd):
+                return True
     except Exception:
-        commands = None
-    for cmd in (commands or [command]):
-        if not _references_always_ask_path(cmd):
-            continue
-        if _has_output_redirect(cmd) and _redirect_writes_config(cmd):
-            return True
-        inner = _resolve_through_wrappers(cmd)
-        first = get_first_command_word(inner) or get_first_command_word(cmd)
-        if first and os.path.basename(first) in _FILE_WRITER_COMMANDS:
-            return True
+        return True  # fail closed: the command names a config path
     return False
+
+
+def _writes_config(cmd):
+    """C9 for one simple command (see bash_writes_to_config_path)."""
+    if not _references_always_ask_path(cmd):
+        return False
+    if _has_output_redirect(cmd) and _redirect_writes_config(cmd):
+        return True
+    inner = _resolve_through_wrappers(cmd)
+    first = get_first_command_word(inner) or get_first_command_word(cmd)
+    return bool(first and os.path.basename(first) in _FILE_WRITER_COMMANDS)
+
+
+_C9_BASH_REASON = "Bash write to permission-config path"
+
+
+def human_required_reason(tool, tool_input):
+    """Why this call must go to the human with no LLM in the loop, or None.
+
+    The one "human required" class both hooks honor (C9): a write to a
+    permission-config path, by Write/Edit/NotebookEdit or by any command a
+    Bash call may run. It outranks every verdict but a deny.
+    """
+    if not isinstance(tool_input, dict):
+        return None
+    if tool in ("Write", "Edit", "NotebookEdit"):
+        path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
+        if is_always_ask_write_path(path):
+            return "Permission-config path requires confirmation"
+    elif tool == "Bash":
+        if bash_writes_to_config_path(tool_input.get("command", "")):
+            return _C9_BASH_REASON
+    return None
 
 
 def evaluate_file_path(file_path):
@@ -4247,7 +4278,7 @@ def unguarded_delete_check(command):
     return None
 
 
-def evaluate_bash(command):
+def evaluate_bash(command, log_unknowns=True):
     """Evaluate Bash commands, including compound/piped commands.
 
     The protected-delete guard runs first: a recursive delete of a protected
@@ -4255,6 +4286,11 @@ def evaluate_bash(command):
     from a rules allow so the LLM judges it (the "Risky" reason skips the cache).
     A recursive delete whose target leans on a possibly-empty variable is
     denied with a guarded rewrite for the agent to run instead.
+
+    A permission-config write (C9) outranks every verdict but a deny, wherever
+    in the command it sits. Both hooks call this: the PermissionRequest hook
+    with `log_unknowns=False`, since PreToolUse already logged the call's
+    unknown command words.
     """
     # A protected folder hit even with every unknown value non-empty is a
     # plain deny. One only an empty value reaches gets the rewrite first: the
@@ -4268,7 +4304,11 @@ def evaluate_bash(command):
     guard = protected_delete_check(command, HOOK_CWD)
     if guard and guard[0] == "deny":
         return guard
-    result = _evaluate_bash_rules(command)
+    result = _evaluate_bash_rules(command, log_unknowns=log_unknowns)
+    if result[0] == "deny":
+        return result
+    if bash_writes_to_config_path(command):
+        return ("ask", _C9_BASH_REASON)
     if guard and result[0] == "allow":
         return guard
     return result
@@ -4277,7 +4317,7 @@ def evaluate_bash(command):
 _MAX_SUBSTITUTION_DEPTH = 6
 
 
-def _evaluate_bash_rules(command, _depth=0):
+def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
     """The pattern and allowlist rules behind evaluate_bash."""
     if not command or not command.strip():
         return ("ask", "Empty command")
@@ -4296,11 +4336,8 @@ def _evaluate_bash_rules(command, _depth=0):
         if re.search(pattern, command):
             return ("ask", "Risky command pattern — confirm before running")
 
-    # C9/H1: a Bash command that WRITES to a permission-config/state path is a
-    # self-escalation vector (rewrite settings, plant a cache allow-entry).
-    # Reads of the same paths (jq/cat the log) stay allowed.
-    if bash_writes_to_config_path(command):
-        return ("ask", "Bash write to permission-config path")
+    # (A C9 permission-config write is caught by evaluate_bash, which ranks
+    # it above every answer here but a deny.)
 
     # Command/process substitutions run too: `X=$(touch f)`, `echo \`id\``,
     # `diff <(a) <(b)`. Judge each body as a full command of its own.
@@ -4312,7 +4349,7 @@ def _evaluate_bash_rules(command, _depth=0):
             continue
         if _depth >= _MAX_SUBSTITUTION_DEPTH:
             return ("ask", "Command substitution nested too deeply")
-        decision, reason = _evaluate_bash_rules(body, _depth + 1)
+        decision, reason = _evaluate_bash_rules(body, _depth + 1, log_unknowns)
         if decision != "allow":
             if reason.startswith("In command substitution: "):
                 return (decision, reason)
@@ -4375,13 +4412,14 @@ def _evaluate_bash_rules(command, _depth=0):
                     return inner_result
             continue
 
+        # `< in cmd …`, `2>/dev/null cmd …`: the command word follows them.
+        cmd = _strip_leading_redirections(cmd)
         first_word = get_first_command_word(cmd)
         if first_word is None:
             # Command substitution as the command itself (e.g. `$(which
             # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
             # statically and is a known interpreter-hiding bypass — ask.
-            stripped = cmd.lstrip()
-            if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
+            if _is_substitution_word(cmd):
                 return ("ask", "Command substitution as command word")
             continue
 
@@ -4452,6 +4490,8 @@ def _evaluate_bash_rules(command, _depth=0):
         unknown_words.append(first_word)
 
     if unknown_words:
+        if not log_unknowns:
+            return ("ask", f"Unknown command(s): {', '.join(unknown_words)}")
         for word in unknown_words:
             log_unknown("command", word)
         return ("ask", f"Unknown command(s): {', '.join(unknown_words)} (logged)")
@@ -4486,13 +4526,13 @@ def _check_inner_commands(body_text, defined_functions):
             if re.search(pattern, cmd):
                 return ("ask", "Risky pattern in compound block")
 
+        cmd = _strip_leading_redirections(cmd)
         first_word = get_first_command_word(cmd)
         if first_word is None:
             # Command substitution as the command itself (e.g. `$(which
             # bash) -c "…"` or `` `python -c "…"` ``) is unresolvable
             # statically and is a known interpreter-hiding bypass — ask.
-            stripped = cmd.lstrip()
-            if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
+            if _is_substitution_word(cmd):
                 return ("ask", "Command substitution as command word")
             continue
 
@@ -4541,6 +4581,44 @@ def _check_inner_commands(body_text, defined_functions):
         return ("ask", f"Unknown command in compound block: {first_word}")
 
     return None
+
+
+_FUNCTION_HEAD_RE = re.compile(r"^(?:function\s+)?[A-Za-z_][\w-]*\s*(?:\(\s*\))?")
+
+
+def _iter_commands(command, _depth=0):
+    """Every simple command `command` may run, at any depth of nesting.
+
+    Yields each part of its lists and pipelines with leading reserved words
+    dropped (`then cp …` → `cp …`), the commands of function bodies and case
+    arms, and those of every command/process substitution. Yields None where
+    the nesting runs past _MAX_SUBSTITUTION_DEPTH, for callers to fail closed.
+    """
+    if _depth > _MAX_SUBSTITUTION_DEPTH:
+        yield None
+        return
+    parts, _ = split_compound_command(command)
+    for part in merge_case_blocks(parts):
+        part = _strip_leading_keywords(part).strip()
+        if not part:
+            continue
+        if get_function_definition_name(part):
+            # The body with what follows it: `f() { …; } > out` and
+            # `f() ( … )` split like any group, keeping the redirection.
+            yield from _iter_commands(part[_FUNCTION_HEAD_RE.match(part).end():], _depth + 1)
+        elif _contains_case_start(part):
+            for arm in _extract_case_arm_bodies(part):
+                yield from _iter_commands(arm, _depth + 1)
+        else:
+            yield part
+    for body in extract_substitutions(command)[0]:
+        yield from _iter_commands(body, _depth + 1)
+
+
+def bash_parse_uncertain(command):
+    """True when the parser can't trust its reading of `command`: unbalanced
+    quotes or brackets, or an unclosed heredoc or substitution."""
+    return split_compound_command(command)[1] or extract_substitutions(command)[1]
 
 
 # ============================================================
@@ -4641,8 +4719,9 @@ def _parse_heredoc_marker(command, i):
     return marker, strip_tabs, quoted, j
 
 
-def _find_closing_paren(s, start):
-    """Index of the `)` that closes a `(` whose body begins at s[start].
+def _find_closing_paren(s, start, open_ch="(", close_ch=")"):
+    """Index of the `)` that closes a `(` whose body begins at s[start]
+    (or of the `close_ch` closing an `open_ch`).
 
     Quote-aware; returns -1 if unbalanced.
     """
@@ -4659,9 +4738,9 @@ def _find_closing_paren(s, start):
         elif c == '"' and not sq:
             dq = not dq
         elif not sq and not dq:
-            if c == "(":
+            if c == open_ch:
                 depth += 1
-            elif c == ")":
+            elif c == close_ch:
                 depth -= 1
                 if depth == 0:
                     return i
@@ -4758,7 +4837,10 @@ def extract_substitutions(command, quotes=True):
 def split_compound_command(command):
     """
     Split a compound command into individual commands.
-    Handles: &&, ||, ;, | (pipe), and newlines.
+    Handles: &&, ||, ;, | and |& (pipes), a lone & (background job), and
+    newlines; `2>&1`, `&>` and `>&` are redirections, and a backslash-escaped
+    character is literal. A ( ) or { } group, with any redirections after it,
+    comes out as its commands plus the redirections as a part of their own.
     Conservative: if it encounters complex quoting/heredocs, returns
     the parts it can parse.
     """
@@ -4795,6 +4877,15 @@ def split_compound_command(command):
 
     while i < len(command):
         c = command[i]
+
+        # An escaped character outside quotes is literal: `\;`, `\&`, `\'`
+        # neither separate commands nor open a quote. (A backslash-newline is
+        # a line continuation, handled at the newline below.)
+        if (c == "\\" and not in_single_quote and not in_double_quote
+                and i + 1 < len(command) and command[i+1] != "\n"):
+            current.append(command[i:i+2])
+            i += 2
+            continue
 
         # Heredoc operator: record the marker and keep scanning the rest of
         # the line as shell (`cat <<EOF > f; next_cmd` runs next_cmd). The
@@ -4938,16 +5029,16 @@ def split_compound_command(command):
                     current = []
                     i += 3 if command[i:i+3] == ";;&" else 2
                     continue
-                if c in (";", "|"):
-                    if c == ";" and current and current[-1] == "\\":
-                        current.append(c)
-                        i += 1
-                        continue
+                # `;`, `|`, `|&` (a pipe that carries stderr too), and a lone
+                # `&` that runs the command before it in the background. `&`
+                # after `>`/`<` (`2>&1`, `<&3`) or before `>` (`&>f`) redirects.
+                if c in (";", "|") or (c == "&" and command[i+1:i+2] != ">"
+                                        and not (current and current[-1] in (">", "<"))):
                     part = "".join(current).strip()
                     if part:
                         parts.append(part)
                     current = []
-                    i += 1
+                    i += 2 if command[i:i+2] == "|&" else 1
                     continue
 
         current.append(c)
@@ -4963,18 +5054,30 @@ def split_compound_command(command):
 
     parts = [piece for p in parts for piece in _split_short_bodies(p)]
 
-    # Post-process: unwrap top-level subshells/groups
+    # Post-process: unwrap top-level subshells/groups. Redirections after
+    # the group (`( a; b ) > out 2>&1`) come out as a part of their own, so
+    # a write check still sees where the output goes.
     final_parts = []
     for p in parts:
         stripped = p.strip()
-        if ((stripped.startswith('(') and stripped.endswith(')'))
-                or (stripped.startswith('{') and stripped.endswith('}'))):
-            inner = stripped[1:-1].strip()
+        rest = None
+        if stripped[:1] in ("(", "{"):
+            closer = ")" if stripped[0] == "(" else "}"
+            close = _find_closing_paren(stripped, 1, stripped[0], closer)
+            rest = stripped[close + 1:].strip() if close > 0 else None
+            if (rest is None or _strip_leading_redirections(rest)) and stripped.endswith(closer):
+                # A case pattern's `)` closed the match early; the group
+                # still spans the whole part (`(a; case x in x) b;; esac)`).
+                close, rest = len(stripped) - 1, ""
+        if rest is not None and (not rest or not _strip_leading_redirections(rest)):
+            inner = stripped[1:close].strip()
             if inner:
                 inner_parts, inner_uncertain = split_compound_command(inner)
                 final_parts.extend(inner_parts if inner_parts else [inner])
                 if inner_uncertain:
                     uncertain = True
+            if rest:
+                final_parts.append(rest)
         else:
             final_parts.append(p)
 
@@ -4984,7 +5087,63 @@ def split_compound_command(command):
 def _word_starts(text):
     """(offset, word) for each word of `text`, with quotes, $( ), ${ },
     `( )` and backticks kept inside one word."""
-    words, i, n = [], 0, len(text)
+    return list(_iter_word_starts(text))
+
+
+# A redirection word: optional fd (`2`, `{fd}`), then the operator; its file
+# operand is attached (`2>/dev/null`) or the next word (`< in`).
+_REDIRECTION_RE = re.compile(r"(?:\d+|\{[A-Za-z_]\w*\})?(&>>?|[<>]&|>>|>\||<<<|<<-?|<>|<|>)")
+
+
+def _strip_leading_redirections(cmd):
+    """`cmd` without the redirections before its command word: `< in kubectl …`
+    and `2>/dev/null kubectl …` → `kubectl …`; `X=1 >out cmd` → `X=1 cmd`.
+    Assignments and the rest stay verbatim. Empty when no command word
+    follows (`> f`, or a heredoc with only its body after it)."""
+    if "<" not in cmd and ">" not in cmd:
+        return cmd
+    cuts = []  # (start, end) of each redirection word and operand dropped
+    end = len(cmd)
+    op = None  # the operator still waiting for its operand word
+    heredoc = False  # the last word dropped ends a heredoc's `<<MARKER`
+    for start, word in _iter_word_starts(cmd):
+        if heredoc and "\n" in cmd[cuts[-1][1]:start]:
+            end = cuts[-1][1]  # no command word: what follows is the body
+            break
+        heredoc = False
+        if op:
+            cuts.append((start, start + len(word)))
+            heredoc, op = op in ("<<", "<<-"), None
+            continue
+        if _ASSIGNMENT_RE.match(word):
+            continue
+        m = _REDIRECTION_RE.match(word)
+        if not m or word[m.end():].startswith("("):  # `<(cmd)` is a word
+            break
+        cuts.append((start, start + len(word)))
+        if m.end() == len(word):
+            op = m.group(1)
+        else:
+            heredoc = m.group(1) in ("<<", "<<-")
+    if not cuts:
+        return cmd
+    kept, pos = [], 0
+    for a, b in cuts:
+        kept.append(cmd[pos:a])
+        pos = b
+    kept.append(cmd[pos:end])
+    return "".join(kept).strip()
+
+
+def _is_substitution_word(cmd):
+    """True if `cmd` starts with a `$(…)`/backtick/`<(…)` command word."""
+    stripped = cmd.lstrip()
+    return stripped.startswith(("$(", "`", "\\`", "<(", ">("))
+
+
+def _iter_word_starts(text):
+    """_word_starts, lazily (callers that stop early skip the rest)."""
+    i, n = 0, len(text)
     while i < n:
         if text[i].isspace():
             i += 1
@@ -5008,8 +5167,7 @@ def _word_starts(text):
             elif not closers and c.isspace():
                 break
             i += 1
-        words.append((start, text[start:i]))
-    return words
+        yield start, text[start:i]
 
 
 def _split_short_bodies(part):
@@ -5124,13 +5282,19 @@ def _extract_case_arm_bodies(cmd):
     bodies = []
     # Split on ;; to get individual arms
     arms = cmd.split(';;')
-    for arm in arms:
+    for idx, arm in enumerate(arms):
         arm = arm.strip()
         if arm == 'esac' or not arm:
             continue
-        # The first segment may contain the 'case WORD in' header followed
-        # by the first arm's pattern) body — strip the header
-        if 'case ' in arm:
+        if re.match(r'esac(?=$|[ \t\n;&|<>])', arm) and arm[4:].strip():
+            # What follows `esac` applies to the whole block: `esac > out`.
+            # Checked in addition to, never instead of, the arm reading
+            # below, so a pattern word like `esac/x)` still has its body seen.
+            bodies.append(arm[4:].strip())
+        # The first segment holds the 'case WORD in' header followed by the
+        # first arm's pattern) body — strip the header. Later arms keep
+        # their text even when it mentions `case` (`x) printf 'case x' …`).
+        if idx == 0 and 'case ' in arm:
             in_match = re.search(r'\bin\b', arm)
             if in_match:
                 arm = arm[in_match.end():].strip()
@@ -5138,15 +5302,22 @@ def _extract_case_arm_bodies(cmd):
                 continue
         if not arm:
             continue
-        # Strip the pattern prefix: 'pattern) body' → 'body'
+        # Strip the pattern prefix: 'pattern) body' → 'body'. No pattern
+        # prefix — could be continuation; check anyway.
         paren_idx = arm.find(')')
-        if paren_idx >= 0:
-            body = arm[paren_idx + 1:].strip()
-            if body:
-                bodies.append(body)
-        else:
-            # No pattern prefix — could be continuation; check anyway
-            bodies.append(arm)
+        body = arm[paren_idx + 1:].strip() if paren_idx >= 0 else arm
+        # A case nested in a later arm (`b) case y in c) cmd`): its first
+        # arm's body (its later arms are segments of their own). A loop, not
+        # recursion: each pass strips at least one header.
+        while body and _contains_case_start(body):
+            in_match = re.search(r'\bin\b', body)
+            if not in_match:
+                break
+            body = body[in_match.end():].strip()
+            paren_idx = body.find(')')
+            body = body[paren_idx + 1:].strip() if paren_idx >= 0 else body
+        if body:
+            bodies.append(body)
     return bodies
 
 
@@ -5176,7 +5347,7 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
     if not cmd:
         return []
 
-    cmd = cmd.strip()
+    cmd = _strip_leading_redirections(cmd.strip())
     if cmd.startswith("#"):
         return []
 
@@ -5433,7 +5604,7 @@ def get_first_command_word(cmd):
     if not cmd:
         return None
 
-    cmd = cmd.strip()
+    cmd = _strip_leading_redirections(cmd.strip())
 
     if cmd.startswith("#"):
         return None
