@@ -9,7 +9,7 @@ The plugin evaluates in a strict **trust order — rules → LLM → human**. Lo
 > **Upgrading from an earlier version — auto-learning is gone.** Earlier versions wrote approved commands, write folders, web domains and MCP tool names into your config. That has been removed, and two behaviors change:
 >
 > - **Without an LLM configured**, calls the rules can't settle now show the normal Claude prompt. They used to be approved silently and learned: unknown Bash commands, writes under your home or temp folders, and WebFetch to new domains. To keep things quiet, configure an LLM (`SAFETY_HOOK_MODEL=claude-haiku-5-5` plus a key, see [LLM environment variables](#llm-environment-variables)), add your own entries to the config, or use the prompt's "Always allow".
-> - **With an LLM**, nothing it approves is saved to your config. An exact repeat within 7 days reuses the [cached verdict](#llm-decision-cache); any other call gets a fresh, context-aware judgment.
+> - **With an LLM**, nothing it approves is saved to your config. Every call gets a fresh, context-aware judgment; nothing is cached. A `smart-permissions-llm-cache.json` left in `~/.claude/hooks/` by an earlier version is ignored and can be deleted.
 >
 > `SAFETY_HOOK_AUTO_LEARN` and the config keys `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored; you can delete them. Entries earlier versions learned stay in your config as ordinary entries. Look through `safe_commands`, `safe_write_paths`, `allowed_web_domains` and `safe_mcp_tools` and prune anything you don't want trusted permanently. `/smart-permissions:setup` can walk you through it.
 
@@ -38,16 +38,17 @@ LLM-consulting pass before Claude ever shows you a prompt:
 ```
 Tool call
   ┌─ PreToolUse ─────────────────────────────────────────────────────┐
-  │  Dangerous pattern? (sudo, rm -rf /, curl|sh)   ──→  DENY          │
+  │  Dangerous pattern in code? (sudo, curl|sh)     ──→  DENY          │
+  │  …only in data (echo, commit message)           ──→  LLM           │
   │  Recursive delete of a protected folder (~/Dev) ──→  DENY          │
   │  rm -r target on a possibly-empty $VAR          ──→  DENY + rewrite│
   │  Permission-config write? (settings, this cfg)  ──→  ASK (C9)      │
-  │  Other recursive delete (rm -r, find -delete)   ──→  LLM (no cache)│
-  │  Risky pattern? (rm *, find / -delete)          ──→  ASK (no cache)│
+  │  Plain force push (not main)                    ──→  DENY + rewrite│
+  │  Other recursive delete (rm -r, find -delete)   ──→  LLM           │
+  │  Risky pattern? (rm *, find / -delete)          ──→  LLM           │
   │  Known-safe command/subcommand?                 ──→  ALLOW         │
   │  MCP tool in safe list? (glob patterns)         ──→  ALLOW         │
   │  Otherwise (unknown)                            ──→  LLM eval      │
-  │                                                     (+ cache, opt) │
   │  LLM flagged it and the recheck confirmed       ──→  ASK (human)   │
   └───────────────────────────────────────────────────────────────────┘
                           │ still undecided ("ask")
@@ -55,7 +56,7 @@ Tool call
   ┌─ PermissionRequest (learner) ────────────────────────────────────┐
   │  Re-run PreToolUse's rules: what they deny      ──→  DENY          │
   │  Permission-config write, unreadable command    ──→  ASK           │
-  │  LLM configured?  ── yes ─→ LLM eval (+ cache)   ──→  ALLOW / ASK  │
+  │  LLM configured?  ── yes ─→ LLM eval            ──→  ALLOW / ASK   │
   │                   └─ no                         ──→  ASK           │
   └───────────────────────────────────────────────────────────────────┘
                           │ still "ask"
@@ -81,14 +82,19 @@ upload needs explicit authorization.
   tell it what task is underway, so a raw socket to a projector during a
   calibration session reads as normal work. Tool results, assistant text and
   harness notices are never sent, so file or web content can't argue its way
-  past the judge.
+  past the judge. It also sees why the local rules sent the call (`Unknown
+  command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
+  a hint about what to check.
+- **No cache.** Every call is judged afresh, so a verdict always reflects the
+  current context. A timeout or error reports the total time spent
+  (`LLM unavailable (…; 6.2s in all)`) and goes to you.
 - **Strict verdicts.** Only an answer whose `safe` is the boolean `true`
   approves. A string (`"true"`), a number, or a missing or malformed verdict
   goes to you.
 - **Second pass.** A flagged call is judged again at
   `SAFETY_HOOK_RECHECK_REASONING_EFFORT` (default `high`), with the first
   verdict attached. If the recheck clears it, the call runs (`source:
-  llm-recheck`; never cached). If the recheck confirms it, the hook
+  llm-recheck`). If the recheck confirms it, the hook
   emits an explicit `ask`, so you decide — even in auto mode, where a silent
   fall-through would go to Claude's classifier instead. The PermissionRequest
   hook that fires for that prompt leaves it to you rather than asking the LLM a
@@ -249,7 +255,7 @@ zsh's `cdpath=(…)` array isn't followed, so there it lands anywhere.
 
 Every other recursive or bulk delete (`rm -r`, `find -delete`, `find -exec rm`,
 `xargs rm`) goes to the LLM on every call. It is never auto-allowed by rule,
-and never cached. The LLM sees the working directory and your
+and its verdict covers only that call. The LLM sees the working directory and your
 recent messages. It approves build output, caches and temp files, and flags a
 whole project or data the task doesn't cover. Without an LLM configured, these
 fall through to the normal prompt. The guard reads only the command text: a
@@ -277,12 +283,17 @@ auto-allowed: they reach the LLM like any other recursive delete.
 ### What gets blocked
 
 - `sudo` anything
-- `rm -rf /` (caught by both regex and token-based analysis for flag reordering)
+- `rm -rf /`, and a recursive delete of anything above home, by the protected-delete guard (any flag order or spelling, inside `$(…)` too)
 - Recursive deletes of home or its top-level folders (see [Recursive deletes](#recursive-deletes))
 - `curl | sh`, `wget | bash`, and other remote code execution chains
 - Writes to device files (`> /dev/sda`), fork bombs, `mkfs`, `dd` to devices
 - Write/Edit to sensitive paths (`~/.ssh/`, `~/.aws/`, `.env`). Reading them goes to the LLM (see below)
 - Any of these inside code another command runs: `bash -c '…'`, `sh <<'EOF'`, `echo '…' | bash`, `trap '…' EXIT`, `find -exec sh -c '…'`, `eval`, awk's `system()`
+- A plain force push to a branch other than `main`/`master` (`git push --force`, `-f`, `+branch`) is denied with a rewrite: push with `--force-with-lease` instead, which git refuses if someone else pushed in the meantime. A lease push is allowed.
+
+Each deny says what to do instead: `sudo` asks the user to run the step themselves (`! sudo …`), `curl … | sh` to download the script to a file and show it first, a device write to use a regular file. Both hooks show the same message.
+
+A dangerous pattern counts only where it can run. When it appears only in text passed on as data, the call goes to the LLM instead of being denied: an `echo`/`printf` argument, a `git commit`/`git tag` `-m` message, a `gh` `--body`/`--title`, or a quoted heredoc copied by `cat`/`tee` (`git commit -m 'drop sudo from the setup script'`). It is never allowed by rule. Anything else is code and is denied: any match in a command with a pipe, a group or a substitution (`echo '…' | sh`, `( … )`, `<(…)`), text written to a file in a command that also does something else (`echo '…' > a.sh; sh a.sh`), `printf -v`, a word with `$…` or a backtick, an unquoted heredoc with expansions, a heredoc fed to an interpreter, `trap`, `git log --grep`, or a parse the splitter is unsure of. To write such text to a file, use the Write tool or a heredoc on its own.
 
 ### What gets prompted
 
@@ -291,11 +302,11 @@ auto-allowed: they reach the LLM like any other recursive delete.
 - **Code run by another command** — code a shell reads from a heredoc or here-string is checked like a top-level command: `bash <<'EOF'` with `ls` in it is allowed, with an unknown command it prompts. A shell fed from a pipe or a file (`… | sh`, `bash < f`), heredoc code with `$…` expansions, a login shell, an rc file or `BASH_ENV` (also when exported earlier in the command), fish code (its `-c` and `-C` init code are still read for denies and C9), an unknown command in a `trap` handler or `find -exec`, and an awk program that runs commands (`system()`, `print | "cmd"`) prompt
 - `rm *` or `rm .*` (wildcard deletion)
 - `find -delete` or `find -exec rm` with a filter (`find / -name tmp -delete`)
-- **Risky operations of allowed tools** (always to the LLM, never cached) — `git reset --hard`, `git clean -f`, `git checkout` of a file or `.` (an operand that is a glob, has a file extension or exists in the folder counts as a file), `git checkout -f`/`git switch -f`, `git restore` of the work tree, `git stash drop`/`clear`, `git branch -D`, `git filter-branch`, a force push to `main`/`master` or with no branch named, a push that deletes a remote branch, `git -c` settings that run a command (an `alias.*` that isn't `!cmd` is read as the git command it stands for); `curl` uploads of local files (`-d @file`, `-F f=@file`, `-T`, `-K`) and `wget --post-file`; `chmod -R` that makes a tree world-writable; `docker volume rm`/`prune`, `docker system prune`, `docker compose down -v`; writes to raw disks (`/dev/disk*`, `/dev/sd*`); writes to shell startup files (`~/.zshrc`, `~/.bashrc`, …) and `~/Library/LaunchAgents`
+- **Risky operations of allowed tools** (always to the LLM) — `git reset --hard`, `git clean -f`, `git checkout` of a file or `.` (an operand that is a glob, has a file extension or exists in the folder counts as a file), `git checkout -f`/`git switch -f`, `git restore` of the work tree, `git stash drop`/`clear`, `git branch -D`, `git filter-branch`, a force push to `main`/`master` or with no branch named, a push that deletes a remote branch, `git -c` settings that run a command (an `alias.*` that isn't `!cmd` is read as the git command it stands for; a pager or editor that is `less`, `more` or a plain allowed command, like `core.pager=cat`, is fine); `curl` uploads of local files (`-d @file`, `-F f=@file`, `-T`, `-K`) and `wget --post-file`; `chmod -R` that makes a tree world-writable; `docker volume rm`/`prune`, `docker system prune`, `docker compose down -v`; writes to raw disks (`/dev/disk*`, `/dev/sd*`); writes to shell startup files (`~/.zshrc`, `~/.bashrc`, …) and `~/Library/LaunchAgents`
 - **Sensitive paths read** — Read, Glob or Grep of a `sensitive_paths` entry (also a file glob that can match one, like `**/.ssh*` or `*.env`), and a Bash command naming one (`cat ~/.ssh/id_rsa`, `cat .env`, `git show HEAD:.env`)
 - Archive extraction to system roots (`tar -C /usr/`)
 - **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
-- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files, and Bash commands that write to them (`cp`, `tee`, `>` …) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
+- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / log / LLM-flag files, and Bash commands that write to them (`tee`, `>`, `sed -i`, `mv`, `ln`, or a `cp`/`install`/`rsync` whose destination is one; copying one of them elsewhere is a read) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
 - WebFetch to domains not in the allow list
 - MCP tools not matching any `safe_mcp_tools` pattern
 - Anything else the rules can't settle (a novel CLI tool, a write outside the safe folders), when no LLM is configured
@@ -306,13 +317,13 @@ With an LLM configured, everything in this list except permission-config writes 
 
 **This plugin is a guardrail, not a sandbox.** It reduces friction and catches obvious mistakes: it blocks plainly-dangerous commands (`sudo`, `rm -rf /`, `curl … | sh`), routes unknown commands through the LLM or the permission prompt, and auto-approves the ones you've marked (or that are obviously) safe. That is its whole job.
 
-It is **not** a security boundary against a determined adversarial agent that already has Bash access. A shell can write files through indirection that static command analysis cannot fully see — variables (`CFG=~/.claude/settings.json; cp x "$CFG"`), `cd` plus relative paths, hardlinks, script *files* whose contents aren't inspected (`bash /tmp/p.sh`), or archive extraction (`tar -C ~/.claude …`). Writes to the plugin's own config/cache/settings via those routes cannot be reliably prevented by a hook, and none of them were preventable before this plugin either. The Bash config-path write guard is **best-effort for naive/accidental cases only** — do not treat it as airtight.
+It is **not** a security boundary against a determined adversarial agent that already has Bash access. A shell can write files through indirection that static command analysis cannot fully see — variables (`CFG=~/.claude/settings.json; cp x "$CFG"`), `cd` plus relative paths, hardlinks, script *files* whose contents aren't inspected (`bash /tmp/p.sh`), or archive extraction (`tar -C ~/.claude …`). Writes to the plugin's own config/log/settings via those routes cannot be reliably prevented by a hook, and none of them were preventable before this plugin either. The Bash config-path write guard is **best-effort for naive/accidental cases only** — do not treat it as airtight.
 
 The permission-config files live in the **user trust domain** (`~/.claude/`): anything running as you can ultimately reach them. If you need a real boundary against untrusted code, use OS-level sandboxing (containers, VMs, seccomp/AppArmor) — not this plugin.
 
 - Guardrail against mistakes and unknown commands: **yes.**
 - Barrier against code actively trying to escalate its own permissions: **no** — use OS sandboxing.
-- The one new escalation surface this design introduces — the **LLM decision cache** — is mitigated: the cache only ever grants an allow when an LLM is actually configured (a planted entry can't approve anything in a no-LLM setup), and denies are never cached.
+- The plugin keeps no LLM decision cache, so there is no stored verdict to plant or go stale. Its one LLM state file (`smart-permissions-llm-flags.json`) can only turn an LLM call into a prompt, and it is a C9 path.
 
 ## Configuration
 
@@ -332,14 +343,12 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `safe_internal_tools` | string array | Claude Code / harness internal tools auto-allowed (no side effects outside the harness) |
 | `sensitive_paths` | string array | Path substrings: Write/Edit to them is denied; Read/Glob/Grep of them, and Bash commands naming them, go to the LLM |
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
-| `dangerous_patterns` | string array | Regex patterns that always deny (full command match) |
+| `dangerous_patterns` | string array | Regex patterns that deny when they match code (the whole command or one of its commands); a match only in data goes to the LLM |
 | `protected_delete_paths` | string array | Folders a recursive delete may never touch, nor anything above them (default `~`, `~/*`; globs expand on disk). **Not subtractable.** |
 | `risky_patterns` | string array | Regex patterns that prompt instead of auto-allowing |
 | `interpreter_exec_flags` | object | `{"interpreter": ["-flag"]}` — flag combos that trigger a prompt |
 | `remove_from_defaults` | object | Subtract shipped entries from allowlist keys (see [Subtracting defaults](#subtracting-defaults)) |
 | `decision_log` | bool | Log every decision to `~/.claude/hooks/smart-permissions-decisions.jsonl` (default `true`) |
-| `llm_cache` | bool | Cache LLM *allow* decisions for identical repeat calls (default `true`) |
-| `llm_cache_ttl_days` | number | How long a cached allow stays valid (default `7`) |
 
 Positive allowlists (`safe_commands`, `safe_write_paths`, `safe_script_paths`, `allowed_web_domains`, `safe_mcp_tools`, `safe_internal_tools`) merge as a union with the defaults. Scalars and objects (like `interpreter_exec_flags`) are replaced wholesale.
 
@@ -360,13 +369,9 @@ Removal is applied last, after defaults + platform overlay + your additions. Rem
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, and timing. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Calls from other agent CLIs (see below) also record the original `client_tool` name. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-recheck` / `learner`; logs from older versions also hold `llm-cache`), reason, and timing. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Calls from other agent CLIs (see below) also record the original `client_tool` name. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
-
-### LLM decision cache
-
-When an LLM approves an otherwise-unknown call, that **allow** is cached keyed on the exact tool name + full input, so identical repeats don't pay for another LLM round-trip (`source: llm-cache` in the log). Only allows are cached (a cached false-deny would stick), risky-class calls are never cached, and entries expire after `llm_cache_ttl_days` (capped at 500 entries). One consequence to be aware of: if you'd approve a command via the LLM once and then change your mind, the cached allow persists until it expires or you clear `~/.claude/hooks/smart-permissions-llm-cache.json` — a bounded stale-allow window. Disable entirely with `"llm_cache": false`.
 
 ## MCP tool permissions
 
@@ -550,12 +555,19 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 ## Changelog
 
 - **Unreleased — hardening.**
+  - The 7-day LLM allow cache is gone: every call the rules can't settle is judged afresh. Old cache files and the `llm_cache`/`llm_cache_ttl_days` keys are ignored; delete them if you like. The LLM now also sees why the local rules sent it the call, and a timeout reports the total time spent.
+  - A deny anywhere in a command wins over an ask earlier in it (`unknowncmd; sudo ls` is denied, not prompted).
+  - Dangerous patterns are judged by position: in code they deny as before; in text passed on as data (an `echo` argument, a commit message, a quoted heredoc copied to a file) they go to the LLM. Each deny says what to do instead, and the PermissionRequest hook shows that message instead of "Blocked by safety hook".
+  - The `rm -rf /` regexes are gone; the protected-delete guard covers those deletes, now also inside `$(…)` (`echo $(rm -rf ~)` was allowed before). A `/` elsewhere in a command (`rm -rf /tmp/a; df -h /`) no longer denies.
+  - A plain force push to a branch other than `main`/`master` is denied with a rewrite to `--force-with-lease`.
+  - A `cp`, `install` or `rsync` out of a permission-config file is a read; only its destination counts as written (`mv`, `ln`, `cp -l`/`-s` and `rsync --remove-source-files` still count every operand).
+  - `.envrc` no longer matches the `.env` sensitive path for reads, `git -c core.pager=less` is allowed, and fish `-C` init code of plain allowed commands is no longer a hazard.
   - The LLM approves only with a boolean `safe: true`; a string, number or missing verdict goes to you.
   - A Bash write to a permission-config path (C9) prompts from anywhere in the command (inside `if`/`for` bodies, functions, groups, `$(…)`, after a risky part), in both hooks, without asking the LLM.
   - A lone `&` now separates commands (`sleep 1 & kubectl delete …` checks `kubectl`), backslash escapes no longer hide a `;`, redirections before the command word (`< /dev/null kubectl …`) are skipped, and a group with redirections after it (`( … ) > /dev/null`) is checked command by command. Each of these was rule-allowed before.
   - The PermissionRequest hook now runs the same Bash rules as PreToolUse instead of its own copy; its log reasons are PreToolUse's (`Unknown command(s): docker` instead of `Restricted command family …`).
   - Code that a command runs is now read: a shell's heredoc, here-string or `-c` string, text echoed into `| sh`, `trap` handlers, `find -exec`, `eval` and awk's `system()`. A protected-folder delete or a C9 write in it is denied or prompts as at top level. A heredoc fed to a shell is decided by its contents, and a shell fed from a pipe or file goes to the LLM. All of these were rule-allowed before.
-  - Risky operations of allowed tools go to the LLM, uncached: destructive `git` (`reset --hard`, `clean -f`, `checkout FILE`, `checkout -f`, `branch -D`, force push to `main`, remote branch delete, …), `curl`/`wget` file uploads, `chmod -R 777`, `docker` volume deletes, raw-disk writes, and writes to shell startup files and LaunchAgents. They were rule-allowed before.
+  - Risky operations of allowed tools go to the LLM: destructive `git` (`reset --hard`, `clean -f`, `checkout FILE`, `checkout -f`, `branch -D`, force push to `main`, remote branch delete, …), `curl`/`wget` file uploads, `chmod -R 777`, `docker` volume deletes, raw-disk writes, and writes to shell startup files and LaunchAgents. They were rule-allowed before.
   - Read, Glob and Grep of a `sensitive_paths` entry (or a file glob that can match one), and Bash commands naming one, go to the LLM instead of being allowed. Write/Edit to them is still denied.
   - `find ~/Documents -delete`, `find … -exec rm` from a protected folder, `rmdir` of a protected folder and `srm -r` are denied like a recursive `rm`, also with the expression in escaped parentheses or a test after the delete (`find ~/Documents \( -delete \)`). An unfiltered `find / -exec rm {} \;` is now denied rather than prompted.
   - Groups after a prefix are read (`! ( … )`, `> f ( … )`, `then ( … )`), `<>` counts as a write for C9, and `>|` no longer splits the command.

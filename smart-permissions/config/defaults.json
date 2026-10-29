@@ -275,7 +275,6 @@
   "__ always_ask_write_paths __": "Permission-config files: Write/Edit always prompts (never auto-allow, never LLM-vouch) even when the parent is a safe_write_path. Substring match. NOT subtractable via remove_from_defaults.",
   "always_ask_write_paths": [
     "smart-permissions-config.json",
-    "smart-permissions-llm-cache",
     "smart-permissions-decisions",
     "/.claude/settings",
     "/.claude/hooks/",
@@ -287,9 +286,6 @@
 
   "dangerous_patterns": [
     "\\bsudo\\b",
-    "\\brm\\s+(-[a-zA-Z]*)?r[a-zA-Z]*f[a-zA-Z]*\\s+/(\\s|$)",
-    "\\brm\\s+(-[a-zA-Z]*)?f[a-zA-Z]*r[a-zA-Z]*\\s+/(\\s|$)",
-    "\\brm\\s+(-\\S+\\s+)*['\"]\\/(\\s|$|['\"])",
     ">\\s*/dev/(?!null)",
     "\\bmkfs\\b",
     "\\bdd\\b.*\\bof=/dev/",
@@ -330,7 +326,5 @@
   },
 
   "__ Behavior toggles (scalars — replaced, not merged) __": "",
-  "decision_log": true,
-  "llm_cache": true,
-  "llm_cache_ttl_days": 7
+  "decision_log": true
 }

@@ -33,7 +33,7 @@ Read the JSONL (one JSON object per line). Each record has these fields:
 | `tool` | tool name (`Bash`, `Write`, `WebFetch`, `mcp__…`, …) |
 | `input` | the tool input, truncated to 500 chars (command / path / url) |
 | `decision` | `allow`, `deny`, or `ask` |
-| `source` | `rule`, `llm`, `llm-cache`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules) |
+| `source` | `rule`, `llm`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules); `llm-cache` in logs from versions that cached LLM allows |
 | `reason` | human-readable decision reason |
 | `duration_ms` | hook wall-clock time (optional) |
 | `llm_ms` | LLM round-trip time, when an LLM was called (optional) |
@@ -82,7 +82,7 @@ PY
 Show the user:
 
 1. **Totals** — decisions by outcome (allow/deny/ask) and by source
-   (rule / llm / llm-cache / learner).
+   (rule / llm / llm-recheck / learner; `llm-cache` only in older logs).
 2. **What's prompting most** — the most frequent `ask` inputs. These are good
    candidates to add to `safe_commands` (or configure LLM evaluation for).
 3. **What's being denied** — the most frequent `deny` inputs, so the user can
@@ -93,8 +93,9 @@ Show the user:
    `SAFETY_HOOK_AUTO_LEARN` is set in the environment or the config has
    `auto_learn_mcp_tools` or `never_learn_commands`, mention once that the
    setting is retired and ignored.
-5. If an LLM is configured, note the average `llm_ms` and how many decisions were
-   served from the cache (`source: llm-cache`) versus a live call (`source: llm`).
+5. If an LLM is configured, note the average `llm_ms`. Older logs may hold
+   `source: llm-cache` records from the retired cache; count them with the LLM
+   decisions and say the cache is gone (its old file can be deleted).
 
 Keep the report concise. Offer to add any frequently-asked commands to the user's
 `~/.claude/smart-permissions-config.json` if they want.

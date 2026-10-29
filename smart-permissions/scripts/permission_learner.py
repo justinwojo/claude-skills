@@ -48,8 +48,6 @@ from pretool_safety import (  # noqa: E402
     log_decision,
     parse_hook_payload,
     _elapsed_ms,
-    _reason_is_risky,
-    _STEER_PREFIX,
     set_hook_cwd,
     _FAIL_CLOSED,
 )
@@ -109,8 +107,9 @@ def _main():
     if verdict == "deny":
         log_decision("permission_request", tool, tool_input, "deny", "learner",
                      reason, duration_ms=_elapsed_ms(start))
-        # A steer carries rewrite instructions the agent needs to see.
-        _emit_deny(reason if reason.startswith(_STEER_PREFIX) else "Blocked by safety hook")
+        # The reason says what to do instead (a steer's rewrite, or the
+        # alternative to a blocked pattern), as PreToolUse shows it.
+        _emit_deny(reason)
         return
 
     # A definite ask (C9 config write, empty/ambiguous), or nothing to consult:
@@ -128,10 +127,9 @@ def _main():
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
                      flagged, duration_ms=_elapsed_ms(start))
         sys.exit(0)
-    cacheable = not _reason_is_risky(reason)
     decision, llm_reason, info = llm_evaluate(
-        tool, tool_input, timeout=15, cacheable=cacheable,
-        context=build_llm_context(input_data))
+        tool, tool_input, timeout=15, context=build_llm_context(input_data),
+        rule_reason=reason)
     source = info["source"]
     llm_ms = info.get("llm_ms")
     if decision == "allow":
