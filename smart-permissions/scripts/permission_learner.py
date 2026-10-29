@@ -74,6 +74,21 @@ def _emit_deny(message="Blocked by safety hook"):
 
 
 def main():
+    """The hook. Any failure inside (a RecursionError on a deeply nested
+    command, a parser bug) falls through to the normal permission prompt:
+    never an allow, never a crash with no verdict."""
+    try:
+        _main()
+    except Exception as e:
+        try:
+            log_decision("permission_request", "", {}, "ask", "learner",
+                         f"smart-permissions could not evaluate this call ({type(e).__name__})")
+        except Exception:
+            pass
+        sys.exit(0)
+
+
+def _main():
     start = time.monotonic()
     try:
         input_data = json.loads(sys.stdin.read())

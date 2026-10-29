@@ -110,6 +110,16 @@ macOS). It looks through keywords and wrappers (`do`, `!`, `env`, `nice -n 5`,
 blocks any folder above home. Add patterns to `protected_delete_paths`; `"~/Dev/*"` protects each
 project root too.
 
+The same deny covers the other ways to delete a whole folder: `srm -r`,
+`rmdir` (with `-p`, each parent too), and `find` with `-delete` or
+`-exec rm` started at a protected folder with nothing narrowing what it
+matches (`find ~/Documents -delete`). A `find` that filters (`-name`,
+`-type f`, `-mindepth 1`, …) goes to the LLM as a bulk delete. The guard also
+reads code a command runs: a shell's `-c` string, heredoc or here-string
+(`bash <<'EOF'`), text echoed or printed into `| sh`, a `trap` handler, a
+`find -exec` command, `eval` and awk's `system()`, with any `cd` before it.
+`unlink` and `shred` remove single files, not folders, and are not covered.
+
 A recursive `rm` whose target leans on a variable that may be empty is denied
 with a rewrite for the agent to run instead. `rm -rf "$T/$k"` becomes
 `rm -rf /` when both are empty. Claude Code stops for manual approval on that
@@ -255,7 +265,7 @@ auto-allowed: they reach the LLM like any other recursive delete.
 
 ### What gets auto-allowed
 
-- **Read-only tools** — Read, Glob, Grep, WebSearch are always safe
+- **Read-only tools** — Read, Glob, Grep, WebSearch (except reads of `sensitive_paths`)
 - **File writes** to safe directories — `~/Dev/`, `/tmp/`, `~/.claude/`
 - **Bash commands** using known tools — git, dotnet, compilers, file utilities, and 100+ more
 - **Safe subcommands** of restricted tools — `npm install`, `docker build`, `gh pr view`, `cargo test`, etc.
@@ -271,14 +281,18 @@ auto-allowed: they reach the LLM like any other recursive delete.
 - Recursive deletes of home or its top-level folders (see [Recursive deletes](#recursive-deletes))
 - `curl | sh`, `wget | bash`, and other remote code execution chains
 - Writes to device files (`> /dev/sda`), fork bombs, `mkfs`, `dd` to devices
-- Reads/writes to sensitive paths (`~/.ssh/`, `~/.aws/`, `~/.env`)
+- Write/Edit to sensitive paths (`~/.ssh/`, `~/.aws/`, `.env`). Reading them goes to the LLM (see below)
+- Any of these inside code another command runs: `bash -c '…'`, `sh <<'EOF'`, `echo '…' | bash`, `trap '…' EXIT`, `find -exec sh -c '…'`, `eval`, awk's `system()`
 
 ### What gets prompted
 
 - **Dangerous subcommands** — `npm publish`, `docker run`, `docker exec`, `docker push`, `gh pr create`, `gh pr merge`, `cargo publish`, `pip uninstall`
-- `bash -c`, `sh -c`, `osascript -e` (inline interpreter execution)
+- `bash -c`, `sh -c`, `fish --command`, `osascript -e` (inline interpreter execution)
+- **Code run by another command** — code a shell reads from a heredoc or here-string is checked like a top-level command: `bash <<'EOF'` with `ls` in it is allowed, with an unknown command it prompts. A shell fed from a pipe or a file (`… | sh`, `bash < f`), heredoc code with `$…` expansions, a login shell, an rc file or `BASH_ENV` (also when exported earlier in the command), fish code (its `-c` and `-C` init code are still read for denies and C9), an unknown command in a `trap` handler or `find -exec`, and an awk program that runs commands (`system()`, `print | "cmd"`) prompt
 - `rm *` or `rm .*` (wildcard deletion)
-- `find / -delete` or `find / -exec rm` (recursive deletion from root)
+- `find -delete` or `find -exec rm` with a filter (`find / -name tmp -delete`)
+- **Risky operations of allowed tools** (always to the LLM, never cached) — `git reset --hard`, `git clean -f`, `git checkout` of a file or `.` (an operand that is a glob, has a file extension or exists in the folder counts as a file), `git checkout -f`/`git switch -f`, `git restore` of the work tree, `git stash drop`/`clear`, `git branch -D`, `git filter-branch`, a force push to `main`/`master` or with no branch named, a push that deletes a remote branch, `git -c` settings that run a command (an `alias.*` that isn't `!cmd` is read as the git command it stands for); `curl` uploads of local files (`-d @file`, `-F f=@file`, `-T`, `-K`) and `wget --post-file`; `chmod -R` that makes a tree world-writable; `docker volume rm`/`prune`, `docker system prune`, `docker compose down -v`; writes to raw disks (`/dev/disk*`, `/dev/sd*`); writes to shell startup files (`~/.zshrc`, `~/.bashrc`, …) and `~/Library/LaunchAgents`
+- **Sensitive paths read** — Read, Glob or Grep of a `sensitive_paths` entry (also a file glob that can match one, like `**/.ssh*` or `*.env`), and a Bash command naming one (`cat ~/.ssh/id_rsa`, `cat .env`, `git show HEAD:.env`)
 - Archive extraction to system roots (`tar -C /usr/`)
 - **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
 - **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files, and Bash commands that write to them (`cp`, `tee`, `>` …) anywhere in the command: after `;` or `&`, inside `if`/`for` bodies, functions, groups and `$(…)`. A Bash command that names one of those paths but can't be parsed with confidence prompts too. These *always* prompt — never auto-allowed, never LLM-vouched, whatever else the command does short of a hard deny — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. Both hooks apply the same check. This guard is not subtractable.
@@ -316,7 +330,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `allowed_web_domains` | string array | Domains auto-allowed for WebFetch (subdomains included) |
 | `safe_mcp_tools` | string array | MCP tool name patterns auto-allowed (supports glob wildcards) |
 | `safe_internal_tools` | string array | Claude Code / harness internal tools auto-allowed (no side effects outside the harness) |
-| `sensitive_paths` | string array | Path substrings that always deny for file operations |
+| `sensitive_paths` | string array | Path substrings: Write/Edit to them is denied; Read/Glob/Grep of them, and Bash commands naming them, go to the LLM |
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
 | `dangerous_patterns` | string array | Regex patterns that always deny (full command match) |
 | `protected_delete_paths` | string array | Folders a recursive delete may never touch, nor anything above them (default `~`, `~/*`; globs expand on disk). **Not subtractable.** |
@@ -540,6 +554,13 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
   - A Bash write to a permission-config path (C9) prompts from anywhere in the command (inside `if`/`for` bodies, functions, groups, `$(…)`, after a risky part), in both hooks, without asking the LLM.
   - A lone `&` now separates commands (`sleep 1 & kubectl delete …` checks `kubectl`), backslash escapes no longer hide a `;`, redirections before the command word (`< /dev/null kubectl …`) are skipped, and a group with redirections after it (`( … ) > /dev/null`) is checked command by command. Each of these was rule-allowed before.
   - The PermissionRequest hook now runs the same Bash rules as PreToolUse instead of its own copy; its log reasons are PreToolUse's (`Unknown command(s): docker` instead of `Restricted command family …`).
+  - Code that a command runs is now read: a shell's heredoc, here-string or `-c` string, text echoed into `| sh`, `trap` handlers, `find -exec`, `eval` and awk's `system()`. A protected-folder delete or a C9 write in it is denied or prompts as at top level. A heredoc fed to a shell is decided by its contents, and a shell fed from a pipe or file goes to the LLM. All of these were rule-allowed before.
+  - Risky operations of allowed tools go to the LLM, uncached: destructive `git` (`reset --hard`, `clean -f`, `checkout FILE`, `checkout -f`, `branch -D`, force push to `main`, remote branch delete, …), `curl`/`wget` file uploads, `chmod -R 777`, `docker` volume deletes, raw-disk writes, and writes to shell startup files and LaunchAgents. They were rule-allowed before.
+  - Read, Glob and Grep of a `sensitive_paths` entry (or a file glob that can match one), and Bash commands naming one, go to the LLM instead of being allowed. Write/Edit to them is still denied.
+  - `find ~/Documents -delete`, `find … -exec rm` from a protected folder, `rmdir` of a protected folder and `srm -r` are denied like a recursive `rm`, also with the expression in escaped parentheses or a test after the delete (`find ~/Documents \( -delete \)`). An unfiltered `find / -exec rm {} \;` is now denied rather than prompted.
+  - Groups after a prefix are read (`! ( … )`, `> f ( … )`, `then ( … )`), `<>` counts as a write for C9, and `>|` no longer splits the command.
+  - The inline-Python checker rejects more write paths (`gzip.GzipFile(…).write`, `sys.modules[…]` through an alias, `from os import …`, module attributes like `gzip.os`).
+  - A command nested too deeply to read, or any internal error, now prompts (PreToolUse) or falls through to the prompt (PermissionRequest) instead of crashing the hook.
 - **2026-10-29 — auto-learning removed.** Approvals are no longer written to your config. Without an LLM, unknown Bash commands, home/temp writes and WebFetch to new domains now prompt instead of being approved and learned. `SAFETY_HOOK_AUTO_LEARN`, `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored. Previously learned entries stay in your config. See [the upgrade note](#smart-permissions) at the top.
 
 ## License

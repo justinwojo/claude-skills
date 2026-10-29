@@ -1223,6 +1223,17 @@ _SAFE_PY_SYS_ATTRS = frozenset({
     "stdin", "stdout", "stderr", "argv", "exit", "version", "version_info",
     "maxsize", "platform", "byteorder",
 })
+# Attributes (and from-imports) that reach files, processes or modules
+# beyond the allowlist: the write/delete APIs, and the modules an allowed
+# one imports (`gzip.os`, `gzip.builtins`, `shlex.sys`) or holds (`sys.modules`).
+_UNSAFE_PY_ATTRS = frozenset({
+    "open", "write_text", "write_bytes", "unlink", "rmdir", "rename", "replace",
+    "system", "popen", "GzipFile", "modules", "settrace", "setprofile", "addaudithook",
+    "os", "sys", "builtins", "subprocess", "shutil", "io", "pathlib", "importlib",
+    "codecs", "ctypes", "socket", "posix", "nt", "tempfile", "glob", "pickle", "marshal",
+    "shelve", "dbm", "zipfile", "tarfile", "bz2", "lzma", "sqlite3", "multiprocessing",
+    "signal", "pty", "fcntl", "mmap",
+})
 _UNSAFE_PY_NAMES = frozenset({
     "exec", "eval", "compile", "__import__", "getattr", "setattr", "delattr",
     "globals", "locals", "vars", "breakpoint", "memoryview", "help",
@@ -1263,12 +1274,15 @@ def _safe_python_code(code):
         if isinstance(node, ast.Import):
             if any(a.name not in _SAFE_PY_MODULES for a in node.names):
                 return False
+            # `import sys as s` would take s.modules past the sys checks below
+            if any(a.name == "sys" and a.asname not in (None, "sys") for a in node.names):
+                return False
         elif isinstance(node, ast.ImportFrom):
             if node.level or node.module not in _SAFE_PY_MODULES:
                 return False
             if node.module == "sys" and any(a.name not in _SAFE_PY_SYS_ATTRS for a in node.names):
                 return False
-            if any(a.name == "*" for a in node.names):
+            if any(a.name == "*" or a.name in _UNSAFE_PY_ATTRS for a in node.names):
                 return False
         elif isinstance(node, ast.Name):
             if node.id in _UNSAFE_PY_NAMES or node.id.startswith("__"):
@@ -1281,8 +1295,7 @@ def _safe_python_code(code):
             if (isinstance(node.value, ast.Name) and node.value.id == "sys"
                     and node.attr not in _SAFE_PY_SYS_ATTRS):
                 return False
-            if node.attr in ("open", "write_text", "write_bytes", "unlink",
-                             "rmdir", "rename", "replace", "system", "popen"):
+            if node.attr in _UNSAFE_PY_ATTRS:
                 return False
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
             if "__" in node.value:
@@ -1663,6 +1676,21 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True,
 
 
 def main():
+    """The hook. Any failure inside (a RecursionError on a deeply nested
+    command, a parser bug) puts the call in front of the human: never an
+    allow, never a crash with no verdict."""
+    try:
+        _main()
+    except Exception as e:
+        reason = f"smart-permissions could not evaluate this call ({type(e).__name__}) — confirm it yourself"
+        try:
+            log_decision("pretool", "", {}, "ask", "rule", reason)
+        except Exception:
+            pass
+        output_decision("ask", reason)
+
+
+def _main():
     start = time.monotonic()
     try:
         input_data = json.loads(sys.stdin.read())
@@ -1761,8 +1789,14 @@ def evaluate(tool, tool_input):
     if _FAIL_CLOSED:
         return ("ask", "smart-permissions defaults unavailable — failing closed")
 
-    # Read-only tools — always safe
-    if tool in ("Read", "Glob", "Grep", "WebSearch"):
+    # Read-only tools — safe, except a read of a sensitive path (keys,
+    # credentials, .env), which the LLM judges
+    if tool in ("Read", "Glob", "Grep"):
+        hit = _sensitive_read(tool, tool_input)
+        if hit:
+            return ("ask", f"Risky read of a sensitive path ({hit}) — LLM review")
+        return ("allow", "Read-only tool")
+    if tool == "WebSearch":
         return ("allow", "Read-only tool")
 
     # Subagent/agent tasks — always safe
@@ -1798,6 +1832,48 @@ def evaluate(tool, tool_input):
     # Unknown tool — log and let normal permissions handle it
     log_unknown("tool", tool)
     return ("ask", f"Unknown tool: {tool} (logged)")
+
+
+def _sensitive_read(tool, tool_input):
+    """The sensitive_paths entry a Read/Glob/Grep call reaches, or None: its
+    file or search path (also resolved, case-insensitive), or a file glob
+    naming one (Glob's `**/.env*`, Grep's `glob`). Grep's `pattern` is a
+    regex over file contents, not a path."""
+    keys = {"Read": ("file_path",), "Glob": ("path", "pattern"), "Grep": ("path", "glob")}
+    for key in keys.get(tool, ()):
+        value = tool_input.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if key in ("pattern", "glob"):
+            value = _expand_home(value)
+            checks = [("" if value.startswith("/") else "/") + value]
+        else:
+            checks = _file_path_check_variants(_expand_home(value))[1]
+        checks = checks + [c + "/" for c in checks]  # the folder itself: `~/.ssh`
+        for pattern in SENSITIVE_PATHS:
+            if pattern and any(pattern.lower() in c.lower() for c in checks):
+                return pattern
+            if key in ("pattern", "glob") and pattern and _glob_reaches(value, pattern):
+                return pattern
+    return None
+
+
+def _glob_reaches(glob, entry):
+    """True if a file glob can match a sensitive_paths entry: it spells the
+    entry's name with a wildcard after it (`**/.ssh*`), or some of its parts
+    match the entry's parts and spell a letter (`*.env`, `.s?h/*`, not `*`
+    or `**/*.*`)."""
+    name = entry.strip("/").lower()
+    low = glob.lower()
+    if "/" + name in "/" + low:
+        return True
+    want, parts = name.split("/"), [g for g in low.split("/") if g]
+    for i in range(len(parts)):
+        run = parts[i:i + len(want)]
+        if all(fnmatch(w, g) for w, g in zip(want, run)) \
+                and any(re.search(r"[a-z0-9]", g) for g in run):
+            return True
+    return False
 
 
 def _file_path_check_variants(file_path):
@@ -1852,7 +1928,7 @@ def _references_always_ask_path(text):
     return False
 
 
-_REDIRECT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", ">&"})
+_REDIRECT_OPS = frozenset({">", ">>", ">|", "&>", "&>>", ">&", "<>"})
 
 
 def _has_output_redirect(cmd):
@@ -1863,7 +1939,7 @@ def _has_output_redirect(cmd):
     Unparseable input falls back to a raw `>` check (fail closed).
     """
     if ">" not in cmd:
-        return False
+        return False  # `<>` (read-write) holds a `>` too
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
         lex.whitespace_split = True
@@ -1944,16 +2020,22 @@ def bash_writes_to_config_path(command):
     if/for/while bodies, groups, functions, case arms and substitutions too.
     A command that names a config path but can't be parsed counts as a write.
     """
-    if not command or not _references_always_ask_path(command):
+    if not command:
         return False
+    names = _references_always_ask_path(command)
     try:
+        # A path only printf's output spells (`printf '~/.%s/…' claude | sh`)
+        # counts as named too.
+        if not names and not any(_references_always_ask_path(text)
+                                 for _p, text in _piped_code_sources(command)):
+            return False
         if bash_parse_uncertain(command):
             return True
         for cmd in _iter_commands(command):
             if cmd is None or _writes_config(cmd):
                 return True
     except Exception:
-        return True  # fail closed: the command names a config path
+        return names  # fail closed when the command names a config path
     return False
 
 
@@ -3028,6 +3110,90 @@ def _rm_parts(args):
     return recursive, targets
 
 
+def _find_exec_open(args):
+    """True when the last -exec/-ok action in find's args has no `;`/`+` after it."""
+    last = max((j for j, a in enumerate(args) if a in _FIND_EXEC_ACTIONS), default=-1)
+    return last >= 0 and not any(a in (";", "+") for a in args[last + 1:])
+
+
+def _find_deletes(expr):
+    """Indexes of find's deleting actions (-delete, or -exec/-ok rm). An
+    -exec command's own words are not actions."""
+    found, j = [], 0
+    while j < len(expr):
+        if expr[j] == "-delete":
+            found.append(j)
+        elif expr[j] in _FIND_EXEC_ACTIONS:
+            if j + 1 < len(expr) and os.path.basename(expr[j + 1]) in ("rm", "srm"):
+                found.append(j)
+            while j < len(expr) and expr[j] not in (";", "+"):
+                j += 1
+        j += 1
+    return found
+
+
+def _find_operands(args):
+    """(start paths, expression words) of find's arguments. Leading options
+    (-H -L -P, BSD's -E -X -d -s -x and `-f PATH`) are skipped."""
+    starts, j = [], 0
+    while j < len(args):
+        a = args[j]
+        if a == "-f" and j + 1 < len(args):  # BSD: `-f PATH` names a start
+            starts.append(args[j + 1])
+            j += 2
+        elif a in ("-H", "-L", "-P", "-E", "-X", "-d", "-s", "-x", "--") and not starts:
+            j += 1
+        elif a.startswith("-") or a in ("(", "!", ")", ","):
+            break
+        else:
+            starts.append(a)
+            j += 1
+    return starts, args[j:]
+
+
+def _find_filters_start(expr, starts):
+    """True if find's expression leaves its start folders out of a delete:
+    `-mindepth N` (N ≥ 1), a `-type` without d, or a -name/-path/-regex
+    test no start matches — with no -o / ! / -not / `,` that could run the
+    action on what a test rejected."""
+    tests, j = [], 0
+    while j < len(expr):  # an -exec command's words are not tests
+        if expr[j] in _FIND_EXEC_ACTIONS:
+            while j < len(expr) and expr[j] not in (";", "+"):
+                j += 1
+        else:
+            tests.append(expr[j])
+        j += 1
+    expr = tests
+    if any(a in ("-o", "-or", "!", "-not", ",") for a in expr):
+        return False
+    paths = [os.path.normpath(os.path.expanduser(s)) for s in starts or ["."]]
+    for j, a in enumerate(expr[:-1]):
+        value = expr[j + 1]
+        if a == "-mindepth" and value.isdigit() and int(value) >= 1:
+            return True
+        if a in ("-type", "-xtype") and "d" not in value:
+            return True
+        fold = (lambda s: s.lower()) if a.startswith("-i") else (lambda s: s)
+        if a in ("-name", "-iname"):
+            names = [os.path.basename(p) for p in paths] + [os.path.basename(s.rstrip("/")) for s in starts]
+            if not any(fnmatch(fold(n), fold(value)) for n in names):
+                return True
+        elif a in ("-path", "-ipath", "-wholename", "-iwholename"):
+            if not any(fnmatch(fold(p), fold(value)) or fnmatch(fold(s), fold(value))
+                       for p, s in zip(paths, starts or ["."])):
+                return True
+        elif a in ("-regex", "-iregex"):
+            try:
+                flags = re.I if a == "-iregex" else 0
+                if not any(re.fullmatch(value, p, flags) or re.fullmatch(value, s, flags)
+                           for p, s in zip(paths, starts or ["."])):
+                    return True
+            except re.error:
+                pass
+    return False
+
+
 def protected_delete_check(command, cwd=None, empty_side=True):
     """Classify recursive deletes in a Bash command.
 
@@ -3282,9 +3448,11 @@ def _protected_delete_check(command, cwd, empty_side, bash):
         if olds:
             fold([dict(variables)] + [dict(variables, OLDPWD=v) for v in olds])
 
-    def check_rm(args, marks, bulk=False):
+    def check_rm(args, marks, bulk=False, risky=True):
         """The deny for an rm (or `xargs rm`) whose targets reach a protected folder.
-        `marks`: the command's words with _field_marks's markers."""
+        `marks`: the command's words with _field_marks's markers. `risky=False`
+        (rmdir) only denies: a delete that reaches no protected folder isn't
+        held back for the LLM."""
         nonlocal protected, recursive_delete
         # A `~` quoted (`'~$USER'`, `\~\$U`) is a literal name, not a home;
         # in zsh `''~/x` is not (in bash it is). Every spelling must agree.
@@ -3306,7 +3474,7 @@ def _protected_delete_check(command, cwd, empty_side, bash):
         targets += [a for a in options if a.startswith("-") and a in split]
         if not (recursive or bulk or flag_words):
             return None
-        if recursive or bulk:
+        if (recursive or bulk) and risky:
             recursive_delete = True
         if not (recursive or flag_words):
             return None
@@ -3330,7 +3498,7 @@ def _protected_delete_check(command, cwd, empty_side, bash):
             nonlocal recursive_delete
             if flag_words and not any(expands_to_flag(t, where, vs) for t in flag_words):
                 return None
-            recursive_delete = True
+            recursive_delete = recursive_delete or risky
             for t in targets:
                 if cwds_overflow:
                     return (too_many[0], too_many[1].format(t))
@@ -3391,7 +3559,7 @@ def _protected_delete_check(command, cwd, empty_side, bash):
         if [[w.translate(_NO_FIELD_MARKS) for w in ws] for ws in marked] != plain:
             marked = [[(_FIELDS_MARK if re.search(r"[$`{*?\[]", w) else "") + w for w in ws]
                       for ws in plain]  # can't line them up: any expansion may be anything
-        for words, marked_words in zip(plain, marked):
+        for index, (words, marked_words) in enumerate(zip(plain, marked)):
             if not oldpwd_key_used:  # a stack entry is somewhere it has been, or unknown
                 variables[_STACK_KEY] = as_value(seen + [None])
                 variables[_TILDE_KEY] = as_value(seen + [HOME_DIR, None])
@@ -3780,8 +3948,30 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                         if not a.startswith("-"):
                             vs[a] = None
                 run(unset_step, maybe)
-            elif name == "rm":
+            elif name in ("rm", "srm"):
                 step = check_rm(args, marked_words)
+                denied = step and run(step, maybe)
+                if denied:
+                    return denied
+            elif name == "rmdir":
+                # Only an empty folder goes, but the promise stays simple: a
+                # protected folder is never a delete target. `-p` removes
+                # each parent named in the operand too.
+                ends = args.index("--") if "--" in args else len(args)
+                parents = any(a == "--parents" or re.fullmatch(r"-\w*p\w*", a)
+                              for a in args[:ends])
+                targets = []
+                for a in [a for a in args[:ends] if not a.startswith("-")] + args[ends + 1:]:
+                    targets.append(a)
+                    if parents and re.search(r"[$`*?\[{]", a):
+                        # the parents of a path built at run time can't be counted here
+                        recursive_delete = True
+                        continue
+                    while parents and "/" in a.rstrip("/"):
+                        a = a.rstrip("/").rsplit("/", 1)[0]
+                        if a:  # `-p /x/y` stops short of `/`
+                            targets.append(a)
+                step = check_rm(["-r", "--"] + targets, marked_words, risky=False)
                 denied = step and run(step, maybe)
                 if denied:
                     return denied
@@ -3789,20 +3979,43 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                 # xargs adds its input to the rm's own arguments.
                 inner = _unwrap_command(_shlex_split_safe(_resolve_through_wrappers(
                     shlex.join(words))))
-                if inner and os.path.basename(inner[0]) == "rm":
+                if inner and os.path.basename(inner[0]) in ("rm", "srm"):
                     step = check_rm(inner[1:], marked_words, bulk=True)
                     denied = step and run(step, maybe)
                     if denied:
                         return denied
-                elif any(os.path.basename(a) == "rm" for a in args):
+                elif any(os.path.basename(a) in ("rm", "srm") for a in args):
                     recursive_delete = True
             elif name == "find":
-                if "-delete" in args:
+                # The word list ends at an escaped `\;` or `\(` / `\)` (shlex
+                # can't tell them from operators), so read on through the
+                # commands after it while an -exec is open or the next one is
+                # more expression (`find D -exec echo {} \; -delete`,
+                # `find D \( -delete \)`). Those commands are still checked on
+                # their own as well.
+                k = index
+                while k + 1 < len(plain):
+                    nxt = plain[k + 1]
+                    if _find_exec_open(args):
+                        args = args + [";"] + nxt
+                    elif nxt and (nxt[0].startswith("-") or nxt[0] in ("!", ",")):
+                        args = args + ["("] + nxt
+                    else:
+                        break
+                    k += 1
+                starts, expr = _find_operands(args)
+                deletes = _find_deletes(expr)
+                if deletes:
                     recursive_delete = True
-                for j, a in enumerate(args[:-1]):
-                    if a in ("-exec", "-execdir", "-ok", "-okdir") and \
-                            os.path.basename(args[j + 1]) == "rm":
-                        recursive_delete = True
+                    # With no test before a delete that leaves the start out
+                    # (-name, -path, -mindepth, a -type other than d, …), a
+                    # start folder is deleted with the rest: `find ~/Documents
+                    # -delete` is `rm -rf ~/Documents`. An -o / ! may undo a test.
+                    if not all(_find_filters_start(expr[:at], starts) for at in deletes):
+                        step = check_rm(["-r", "--"] + (starts or ["."]), marked_words)
+                        denied = step and run(step, maybe)
+                        if denied:
+                            return denied
     if recursive_delete:
         return ("ask", _RECURSIVE_DELETE_REASON)
     return None
@@ -4278,7 +4491,7 @@ def unguarded_delete_check(command):
     return None
 
 
-def evaluate_bash(command, log_unknowns=True):
+def evaluate_bash(command, log_unknowns=True, _depth=0):
     """Evaluate Bash commands, including compound/piped commands.
 
     The protected-delete guard runs first: a recursive delete of a protected
@@ -4291,6 +4504,10 @@ def evaluate_bash(command, log_unknowns=True):
     in the command it sits. Both hooks call this: the PermissionRequest hook
     with `log_unknowns=False`, since PreToolUse already logged the call's
     unknown command words.
+
+    Code the command runs (a shell's `-c` string or heredoc, a trap
+    handler, a find -exec command, …) comes back through here one level
+    deeper (`_depth`), so the same guard and rules judge it.
     """
     # A protected folder hit even with every unknown value non-empty is a
     # plain deny. One only an empty value reaches gets the rewrite first: the
@@ -4298,19 +4515,32 @@ def evaluate_bash(command, log_unknowns=True):
     guard = protected_delete_check(command, HOOK_CWD, empty_side=False)
     if guard and guard[0] == "deny":
         return guard
+    # Code run by a part, read after everything before that part (a `cd`
+    # there moves its relative targets), and text piped into a shell.
+    for view in _guard_views(command):
+        nested = protected_delete_check(view, HOOK_CWD, empty_side=False)
+        if nested and nested[0] == "deny":
+            return nested
+    for _prefix, text in _piped_code_sources(command):
+        nested = _nested_verdict(text, _depth, log_unknowns)
+        if nested[0] == "deny":
+            return nested
     steer = unguarded_delete_check(command)
     if steer:
         return steer
     guard = protected_delete_check(command, HOOK_CWD)
     if guard and guard[0] == "deny":
         return guard
-    result = _evaluate_bash_rules(command, log_unknowns=log_unknowns)
+    result = _evaluate_bash_rules(command, _depth, log_unknowns=log_unknowns)
     if result[0] == "deny":
         return result
     if bash_writes_to_config_path(command):
         return ("ask", _C9_BASH_REASON)
     if guard and result[0] == "allow":
         return guard
+    if result[0] == "allow" and _SHELL_ENV_SET_RE.search(command) \
+            and any(part and _shell_fed(part) for part in _iter_commands(command)):
+        return ("ask", "Shell loads other code first (BASH_ENV, … set in this command)")
     return result
 
 
@@ -4399,7 +4629,8 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
         if get_function_definition_name(cmd):
             body = _extract_function_body(cmd)
             if body:
-                inner_result = _check_inner_commands(body, defined_functions)
+                inner_result = _check_inner_commands(body, defined_functions,
+                                                     _depth, log_unknowns)
                 if inner_result:
                     return inner_result
             continue
@@ -4407,10 +4638,17 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
         if _contains_case_start(cmd):
             arm_bodies = _extract_case_arm_bodies(cmd)
             for arm_body in arm_bodies:
-                inner_result = _check_inner_commands(arm_body, defined_functions)
+                inner_result = _check_inner_commands(arm_body, defined_functions,
+                                                     _depth, log_unknowns)
                 if inner_result:
                     return inner_result
             continue
+
+        # Code the command runs (shell -c/heredoc, trap, find -exec, awk, eval)
+        inner_result = _exec_bearing_verdict(cmd, _depth, log_unknowns) \
+            or _risky_operation(cmd)
+        if inner_result:
+            return inner_result
 
         # `< in cmd …`, `2>/dev/null cmd …`: the command word follows them.
         cmd = _strip_leading_redirections(cmd)
@@ -4499,7 +4737,7 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
     return ("allow", "All commands in safe list")
 
 
-def _check_inner_commands(body_text, defined_functions):
+def _check_inner_commands(body_text, defined_functions, _depth=0, log_unknowns=True):
     """Check commands extracted from function bodies and case arms.
 
     Splits the body into sub-commands and runs the same checks as the
@@ -4508,7 +4746,9 @@ def _check_inner_commands(body_text, defined_functions):
 
     Returns (decision, reason) tuple if any check fails, or None if all safe.
     """
-    inner_cmds, _ = split_compound_command(body_text)
+    inner_cmds, uncertain = split_compound_command(body_text)
+    if uncertain:
+        return ("ask", "Ambiguous parse in compound block")
     if not inner_cmds:
         return None
 
@@ -4525,6 +4765,10 @@ def _check_inner_commands(body_text, defined_functions):
         for pattern in RISKY_PATTERNS:
             if re.search(pattern, cmd):
                 return ("ask", "Risky pattern in compound block")
+        inner_result = _exec_bearing_verdict(cmd, _depth, log_unknowns) \
+            or _risky_operation(cmd)
+        if inner_result:
+            return inner_result
 
         cmd = _strip_leading_redirections(cmd)
         first_word = get_first_command_word(cmd)
@@ -4591,13 +4835,17 @@ def _iter_commands(command, _depth=0):
 
     Yields each part of its lists and pipelines with leading reserved words
     dropped (`then cp …` → `cp …`), the commands of function bodies and case
-    arms, and those of every command/process substitution. Yields None where
-    the nesting runs past _MAX_SUBSTITUTION_DEPTH, for callers to fail closed.
+    arms, those of every command/process substitution, and those of code a
+    command runs (a shell's -c string or heredoc, trap, find -exec, eval,
+    awk). Yields None where the nesting runs past _MAX_SUBSTITUTION_DEPTH or
+    the code can't be read (a shell reading a pipe), for callers to fail closed.
     """
     if _depth > _MAX_SUBSTITUTION_DEPTH:
         yield None
         return
-    parts, _ = split_compound_command(command)
+    parts, uncertain = split_compound_command(command)
+    if uncertain:
+        yield None
     for part in merge_case_blocks(parts):
         part = _strip_leading_keywords(part).strip()
         if not part:
@@ -4611,6 +4859,11 @@ def _iter_commands(command, _depth=0):
                 yield from _iter_commands(arm, _depth + 1)
         else:
             yield part
+            for _label, text, _literal in _exec_texts(part):
+                if text is None:
+                    yield None
+                else:
+                    yield from _iter_commands(text, _depth + 1)
     for body in extract_substitutions(command)[0]:
         yield from _iter_commands(body, _depth + 1)
 
@@ -4619,6 +4872,931 @@ def bash_parse_uncertain(command):
     """True when the parser can't trust its reading of `command`: unbalanced
     quotes or brackets, or an unclosed heredoc or substitution."""
     return split_compound_command(command)[1] or extract_substitutions(command)[1]
+
+
+# ============================================================
+# EXECUTION-BEARING COMMANDS
+# ============================================================
+# Some commands run text as code: a shell's `-c` string, heredoc, here-string
+# or stdin; trap's handler; find's -exec command; eval; awk's system() and
+# pipes. That text is judged by the same evaluator as a top-level command,
+# one level deeper (the _MAX_SUBSTITUTION_DEPTH budget bounds the nesting).
+# Code the shell only builds at run time (an expansion in it, code on a pipe
+# or from a file) can't be read here and goes to the LLM.
+
+_SHELL_NAMES = frozenset({"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish"})
+# Variables that make a shell source a file or run code before its own
+# (`BASH_ENV=f bash -c …`, `PS4='$(…)' bash -x …`).
+# ENV is left out: only an interactive shell (-i, a hazard already) reads it.
+_SHELL_ENV_HAZARD_RE = re.compile(r"^(?:BASH_ENV|ZDOTDIR|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND)=")
+# The same variables set anywhere in the command (`export BASH_ENV=f; bash <<…`).
+_SHELL_ENV_SET_RE = re.compile(r"(?<![\w$])(?:BASH_ENV|ZDOTDIR|SHELLOPTS|BASHOPTS|PS4|PROMPT_COMMAND)\+?=")
+_AWK_NAMES = frozenset({"awk", "gawk", "nawk", "mawk"})
+_FIND_EXEC_ACTIONS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+
+def _heredoc_split(text):
+    """(text without its heredoc bodies, [(body, quoted), …] in order,
+    orphan, missing). `missing` counts heredocs opened with no body after
+    them. The splitter leaves a heredoc's body on the part after a pipe
+    (`cat <<'EOF' | sh` gives "cat <<'EOF'" and "sh\n…\nEOF"): text after
+    a newline with no heredoc of this part pending is that `orphan` and is
+    no part of this command."""
+    out, bodies, pending = [], [], []
+    orphan = ""
+    i, n = 0, len(text)
+    sq = dq = False
+    while i < n:
+        c = text[i]
+        if c == "\\" and not sq:
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        if c == "'" and not dq:
+            sq = not sq
+        elif c == '"' and not sq:
+            dq = not dq
+        elif not sq and not dq:
+            if text.startswith("<<<", i):
+                out.append("<<<")
+                i += 3
+                continue
+            if text.startswith("<<", i) and not _in_arithmetic(text, i):
+                marker, strip_tabs, quoted, j = _parse_heredoc_marker(text, i)
+                out.append(text[i:j])
+                i = j
+                if marker:
+                    pending.append((marker, strip_tabs, quoted))
+                continue
+            if c == "\n" and not pending:
+                orphan = text[i + 1:]
+                break
+            if c == "\n" and pending:
+                i += 1
+                for marker, strip_tabs, quoted in pending:
+                    indent = r"\t*" if strip_tabs else ""
+                    end = re.compile(r"^" + indent + re.escape(marker) + r"$",
+                                     re.MULTILINE).search(text, i)
+                    stop = end.start() if end else n
+                    bodies.append((text[i:stop], quoted))
+                    i = end.end() if end else n
+                pending = []
+                out.append("\n")
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out), bodies, orphan, len(pending)
+
+
+def _attach_heredoc_bodies(parts):
+    """`parts` with each heredoc header given the body the splitter moved onto
+    a later part (`bash <<'EOF'; echo hi⏎…⏎EOF`, `cat <<'EOF' | sh⏎…`)."""
+    out = list(parts)
+    for i, part in enumerate(out):
+        if part is None or "<<" not in part or not _heredoc_split(part)[3]:
+            continue
+        for later in out[i + 1:]:
+            orphan = _heredoc_split(later)[2] if later else ""
+            if orphan:
+                out[i] = part + "\n" + orphan
+                break
+    return out
+
+
+def _unquote_word(raw):
+    """A shell word as the command receives it (quotes removed)."""
+    try:
+        return " ".join(shlex.split(raw, posix=True))
+    except ValueError:
+        return raw
+
+
+def _raw_is_literal(raw):
+    """True if the shell passes `raw` on as written: no `$`, backtick or
+    unquoted glob outside single quotes."""
+    sq = dq = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if sq:
+            sq = c != "'"
+        elif c == "\\":
+            i += 1
+        elif c == "'" and not dq:
+            sq = True
+        elif c == '"':
+            dq = not dq
+        elif c in "$`" or not dq and c in "*?[":
+            return False
+        i += 1
+    return True
+
+
+def _parse_simple_command(part):
+    """Read one simple command: (raw words from the command word on, stdin
+    source, hazard). Reserved words, assignments and redirections are set
+    aside; stdin is ("heredoc", body, quoted), ("string", raw word),
+    ("file", word) or None. `hazard` is an assignment that makes a shell
+    load other code (BASH_ENV=…). Heredoc bodies never become words."""
+    line, bodies, _orphan, _missing = _heredoc_split(part)
+    line = _strip_leading_keywords(line)
+    heredocs = iter(bodies)
+    words, stdin, hazard = [], None, False
+    raw = [w for _, w in _iter_word_starts(line)]
+    i = 0
+    while i < len(raw):
+        w = raw[i]
+        m = _REDIRECTION_RE.match(w)
+        if m and not w[m.end():].startswith("("):  # `<(cmd)` is a word
+            op, operand, fd = m.group(1), w[m.end():], w[:m.start(1)]
+            if not operand and i + 1 < len(raw):
+                i += 1
+                operand = raw[i]
+            if op in ("<<", "<<-"):
+                body = next(heredocs, None)
+                if fd in ("", "0"):
+                    stdin = ("heredoc",) + (body or (None, False))
+            elif fd in ("", "0") and op == "<<<":
+                stdin = ("string", operand)
+            elif fd in ("", "0") and op in ("<", "<&", "<>"):
+                stdin = ("file", operand)
+            i += 1
+            continue
+        if not words and _ASSIGNMENT_RE.match(w):
+            hazard = hazard or bool(_SHELL_ENV_HAZARD_RE.match(w))
+        else:
+            words.append(w)
+        i += 1
+    return words, stdin, hazard
+
+
+def _peel_words(words):
+    """(index of the command a wrapper chain runs, its unquoted words), or
+    None when the chain can't be lined up with `words` (env -S)."""
+    tokens = [_unquote_word(w) for w in words]
+    if not tokens:
+        return None
+    inner = _shlex_split_safe(_resolve_through_wrappers(shlex.join(tokens)))
+    k = len(tokens) - len(inner)
+    if k < 0 or tokens[k:] != inner:
+        return None
+    return k, tokens
+
+
+def _shell_fed(part):
+    """How the shell that `part` runs gets its code, or None if it runs no
+    shell. A tuple (kind, shell, code, literal, hazard, init):
+      "c"       `bash -c CODE`
+      "stdin"   a heredoc or here-string (`bash <<'EOF'`, `sh -s <<< …`)
+      "pipe"    stdin as inherited: a pipe (`… | sh`) or the terminal
+      "unknown" stdin from a file, /dev/stdin, `<(…)`: not readable
+      "script"  a script file operand (`bash build.sh`); code is None
+    `literal` is False when the shell gets code an expansion built. `init`
+    is [(code, literal)] that fish runs first (`-C` / `--init-command`)."""
+    words, stdin, hazard = _parse_simple_command(part)
+    peeled = _peel_words(words)
+    if peeled is None:
+        tokens = _shlex_split_safe(_resolve_through_wrappers(" ".join(words)))
+        if tokens and os.path.basename(tokens[0]) in _SHELL_NAMES:
+            return ("unknown", os.path.basename(tokens[0]), None, False, True, [])
+        return None
+    k, tokens = peeled
+    shell = os.path.basename(tokens[k])
+    if shell not in _SHELL_NAMES:
+        return None
+    hazard = hazard or any(_SHELL_ENV_HAZARD_RE.match(t) for t in tokens[:k])
+    args, raws = tokens[k + 1:], words[k + 1:]
+    commands, init = _fish_code(args, raws) if shell == "fish" else ([], [])
+    hazard = hazard or bool(init)  # fish's init command runs before the code
+    if commands:
+        return ("c", shell, "\n".join(t for t, _ in commands),
+                all(lit for _, lit in commands), hazard, init)
+    j = 0
+    has_c = has_s = False
+    while j < len(args):
+        a = args[j]
+        if a in ("--", "-"):
+            j += 1
+            break
+        if a in ("--version", "--help") and not init:
+            return None  # prints and exits: runs no code (fish runs init code first)
+        if a.startswith("--"):
+            # rc files run before the code
+            hazard = hazard or a in ("--rcfile", "--init-file", "--login")
+            j += 2 if a in ("--rcfile", "--init-file", "--init-command") else 1
+            continue
+        if len(a) > 1 and a[0] in "-+":
+            letters = a[1:]
+            if a[0] == "-":
+                has_c = has_c or "c" in letters
+                has_s = has_s or "s" in letters
+                hazard = hazard or "i" in letters or "l" in letters
+            j += 1 + sum(ch in "oOC" for ch in letters)  # -o/-O/fish -C take a value
+            continue
+        break
+    operands, op_raws = args[j:], raws[j:]
+    if has_c:
+        if not operands:
+            return None  # no command string: the shell fails
+        return ("c", shell, operands[0], _raw_is_literal(op_raws[0]), hazard, init)
+    if operands and not has_s:
+        if operands[0] in ("/dev/stdin", "-") or operands[0].startswith("/dev/fd/") \
+                or op_raws[0].startswith(("<(", "$(", "`")):
+            return ("unknown", shell, None, False, hazard, init)
+        return ("script", shell, None, True, hazard, init)
+    if stdin is None:
+        return ("pipe", shell, None, False, hazard, init)  # stdin: a pipe or the terminal
+    if stdin[0] == "file" or stdin[0] == "heredoc" and stdin[1] is None:
+        return ("unknown", shell, None, False, hazard, init)
+    if stdin[0] == "heredoc":
+        _, body, quoted = stdin
+        return ("stdin", shell, body, quoted or not re.search(r"[$`\\]", body), hazard, init)
+    return ("stdin", shell, _unquote_word(stdin[1]), _raw_is_literal(stdin[1]), hazard, init)
+
+
+def _fish_code(args, raws):
+    """fish's -c / --command and -C / --init-command code, in every form
+    (`-c X`, `-cX`, `-lc X`, `--command=X`, `--command X`), from any word:
+    fish runs each one, init code first. Reading a script's argument as
+    code only adds checks. Returns (commands, init), each [(code, literal)]."""
+    commands, init = [], []
+    j = 0
+    while j < len(args):
+        a, target, value = args[j], None, None
+        if a.startswith("--"):
+            name, eq, rest = a.partition("=")
+            if name in ("--command", "--init-command"):
+                target = commands if name == "--command" else init
+                if eq:
+                    value = (rest, _raw_is_literal(raws[j]))
+                elif j + 1 < len(args):
+                    j += 1
+                    value = (args[j], _raw_is_literal(raws[j]))
+        elif a.startswith("-") and len(a) > 1:
+            for n, ch in enumerate(a[1:]):
+                if ch in "cC":
+                    target = commands if ch == "c" else init
+                    if a[n + 2:]:
+                        value = (a[n + 2:], _raw_is_literal(raws[j]))
+                    elif j + 1 < len(args):
+                        j += 1
+                        value = (args[j], _raw_is_literal(raws[j]))
+                    break
+        if target is not None and value is not None:
+            target.append(value)
+        j += 1
+    return commands, init
+
+
+def _awk_program(args, raws):
+    """(program text, literal) of an awk command line, or None when the
+    program comes from a file (-f)."""
+    j, from_file, sources = 0, False, []
+    while j < len(args):
+        a = args[j]
+        if a == "--":
+            j += 1
+            break
+        if a in ("-e", "--source"):  # gawk runs every one, after any -f
+            if j + 1 >= len(args):
+                return None
+            sources.append((args[j + 1], _raw_is_literal(raws[j + 1])))
+            j += 2
+            continue
+        if a.startswith("--source=") or a.startswith("-e") and len(a) > 2:
+            sources.append((a.split("=", 1)[1] if a.startswith("--") else a[2:],
+                            _raw_is_literal(raws[j])))
+            j += 1
+            continue
+        if a in ("-f", "--file") or a.startswith(("--file=", "-f")):
+            # the program is a file (`-f prog.awk`); gawk adds any -e after it
+            from_file = True
+            j += 2 if a in ("-f", "--file") else 1
+            continue
+        if a in ("-F", "-v", "--assign", "--field-separator"):
+            j += 2
+            continue
+        if a.startswith("-") and len(a) > 1:
+            j += 1
+            continue
+        break
+    if sources:
+        return "\n".join(t for t, _ in sources), all(lit for _, lit in sources)
+    if from_file or j >= len(args):
+        return None
+    return args[j], _raw_is_literal(raws[j])
+
+
+def _awk_runs(program):
+    """(runs commands, [command strings it names literally]) for an awk program:
+    system(), a pipe to or from a command (`print | "cmd"`, `"cmd" | getline`,
+    gawk's `|&`), or an extension load (@load, -l)."""
+    # Strings out (kept as "" so `| "cmd"` still shows), then regex literals
+    # where an operand can't stand before them (division keeps its `/`).
+    strings = []
+
+    def hold(m):
+        strings.append(m.group(1))
+        return '"\x00%d"' % (len(strings) - 1)
+    text = re.sub(r'"((?:[^"\\\n]|\\.)*)"', hold, program)
+    text = re.sub(r'(^|[(,~!{};&|:?\n]|\bin\b)(\s*)/(?:[^/\\\n]|\\.)*/', r"\1\2//", text)
+    runs = bool(re.search(r"\bsystem\s*\(|@load\b", text)) or bool(
+        re.search(r"(?<!\|)\|(?!\|)", text))
+    named = []
+    for m in re.finditer(r'(?:\bsystem\s*\(\s*|\|&?\s*)"\x00(\d+)"', text):
+        named.append(strings[int(m.group(1))])
+    for m in re.finditer(r'"\x00(\d+)"\s*\|&?\s*getline', text):
+        named.append(strings[int(m.group(1))])
+    return runs, named
+
+
+def _exec_texts(part):
+    """What `part` runs as code besides itself: [(label, text, literal)].
+    text is None when the code can't be read here (it arrives on a pipe or
+    from a file, or an expansion builds it)."""
+    fed = _shell_fed(part)
+    if fed:
+        kind, shell, code, literal, _hazard, init = fed
+        texts = [(f"{shell} init command", t, lit) for t, lit in init]
+        if kind == "script":
+            return texts
+        return texts + [(f"{shell} code", code, literal)]
+    words, _stdin, _hazard = _parse_simple_command(part)
+    peeled = _peel_words(words)
+    if peeled is None:
+        return []
+    k, tokens = peeled
+    name, args, raws = os.path.basename(tokens[k]), tokens[k + 1:], words[k + 1:]
+    if name == "trap":
+        if args[:1] == ["--"]:
+            args, raws = args[1:], raws[1:]
+        # `trap -p`, `trap - INT` (reset) and `trap INT` (one operand: reset) run nothing
+        if len(args) < 2 or args[0] == "-" or args[0].startswith("-") and len(args[0]) > 1:
+            return []
+        return [("trap handler", args[0], _raw_is_literal(raws[0]))]
+    if name == "eval":
+        if not args:
+            return []
+        # eval joins its words (quotes already removed) and runs the result
+        return [("eval", " ".join(args), all(_raw_is_literal(r) for r in raws))]
+    if name == "find":
+        found, j = [], 0
+        while j < len(args):
+            if args[j] in _FIND_EXEC_ACTIONS:
+                end = j + 1
+                while end < len(args) and args[end] not in (";", "+"):
+                    end += 1
+                if end == j + 1 or end >= len(args):
+                    found.append(("find -exec", None, False))  # unterminated: find fails, or not read
+                else:
+                    # find runs the words as given (no shell): an expansion
+                    # in them was already done, so the raw words are the command.
+                    found.append(("find -exec", " ".join(raws[j + 1:end]), True))
+                j = end
+            j += 1
+        return found
+    if name in _AWK_NAMES:
+        if any(a in ("-l", "--load") or a.startswith(("--load=", "-l")) and len(a) > 2
+               for a in args):
+            return [("awk extension", None, False)]
+        prog = _awk_program(args, raws)
+        if prog is None:
+            return []
+        runs, named = _awk_runs(prog[0])
+        if not runs:
+            return []
+        out = [("awk command", t, prog[1]) for t in named]
+        return out + [("awk command", None, False)]
+    return []
+
+
+_ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|0[0-7]{0,3}|[0-7]{1,3}|.)", re.S)
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "f": "\f", "v": "\v",
+            "e": "\x1b", "\\": "\\"}
+
+
+def _unescape(text):
+    """printf / echo -e backslash escapes decoded."""
+    def one(m):
+        e = m.group(1)
+        if e[0] == "x":
+            return chr(int(e[1:], 16))
+        if e[0] in "01234567":
+            return chr(int(e, 8) & 0xFF)
+        return _ESCAPES.get(e, "\\" + e)
+    return _ESCAPE_RE.sub(one, text)
+
+
+def _printf_output(args):
+    """What `printf FORMAT ARGS…` prints, for the plain conversions; None
+    when the format uses one this doesn't model."""
+    if not args:
+        return None
+    fmt, rest = _unescape(args[0]), list(args[1:])
+    spec = re.compile(r"%(%|([-+ #0]*\d*(?:\.\d*)?)([sbdiuc]))")
+    if re.search(r"%(?!%|[-+ #0]*\d*(?:\.\d*)?[sbdiuc])", fmt):
+        return None
+    out = []
+    while True:
+        used = [0]
+
+        def conv(m):
+            if m.group(1) == "%":
+                return "%"
+            value = rest.pop(0) if rest else ""
+            used[0] += 1
+            flags, kind = m.group(2), m.group(3)
+            if kind in "diu":
+                try:
+                    number = int(value or "0", 0)
+                except ValueError:
+                    return value
+                if number == 0 and re.search(r"\.0*$", flags):
+                    # printf prints no digits for zero at precision 0
+                    return ("%" + flags.split(".")[0].replace("0", "") + "s") % ""
+                return ("%" + flags + "d") % number
+            if kind == "c":
+                value = value[:1]
+            elif kind == "b":
+                value = _unescape(value)
+            return ("%" + flags + "s") % value
+        out.append(spec.sub(conv, fmt))
+        if not rest or not used[0]:
+            return "".join(out)
+
+
+def _nested_verdict(text, depth, log_unknowns):
+    """evaluate_bash for code a command runs, one level deeper."""
+    if depth >= _MAX_SUBSTITUTION_DEPTH:
+        return ("ask", "Code nested too deeply to read")
+    return evaluate_bash(text, log_unknowns, _depth=depth + 1)
+
+
+def _exec_bearing_verdict(cmd, depth, log_unknowns):
+    """A deny or ask for what `cmd` runs as code, or None when that code
+    (if any) passes. A deny inside always wins; a `-c` string adds only its
+    deny (the inline-interpreter ask that follows settles the rest)."""
+    fed = _shell_fed(cmd)
+    if fed:
+        kind, shell, code, literal, hazard, init = fed
+        for text, _lit in init:
+            first = _nested_verdict(text, depth, log_unknowns)
+            if first[0] == "deny":
+                return first
+        verdict = _nested_verdict(code, depth, log_unknowns) if code is not None else None
+        if verdict and verdict[0] == "deny":
+            return verdict
+        if kind == "c":
+            # The inline-interpreter ask settles it, if that check sees the flag.
+            inner = _resolve_through_wrappers(cmd)
+            if _has_interpreter_exec_flag(shell, inner) or _has_interpreter_exec_flag(shell, cmd):
+                return None
+            return ("ask", f"Inline interpreter execution: {shell}")
+        if hazard:
+            return ("ask", f"Shell loads other code first (rc file, BASH_ENV, …): {shell}")
+        if kind == "script":
+            return None
+        if kind in ("pipe", "unknown"):
+            return ("ask", f"Shell reads code from a pipe or file: {shell}")
+        if not literal:
+            return ("ask", f"Shell code built at run time (expansion in heredoc or here-string): {shell}")
+        if shell == "fish":
+            return ("ask", "fish code (not read by these rules)")
+        if verdict[0] != "allow":
+            return ("ask", f"In {shell} code: {verdict[1]}")
+        return None
+    for label, text, literal in _exec_texts(cmd):
+        verdict = _nested_verdict(text, depth, log_unknowns) if text is not None else None
+        if verdict and verdict[0] == "deny":
+            return verdict
+        if label == "eval":
+            continue  # eval is not a safe word: the unknown-command ask follows
+        if text is None:
+            return ("ask", f"Runs code not readable here: {label}")
+        if not literal:
+            return ("ask", f"Code built at run time: {label}")
+        if label.startswith("awk"):
+            return ("ask", f"awk program runs commands: {text}")
+        if verdict[0] != "allow":
+            return ("ask", f"In {label}: {verdict[1]}")
+    return None
+
+
+def _piped_code_sources(command):
+    """(prefix, text) for text piped into a shell that reads its code from
+    stdin, where the source shows it literally: `echo '…' | sh`,
+    `printf '…' | bash`, `cat <<'EOF' | sh`. `prefix` is the command before
+    a top-level source (for a `cd` there), or None for one inside a group,
+    function or code another command runs. Read only for denies and C9 —
+    the pipe itself goes to the LLM."""
+    top = set(split_compound_command(command)[0])
+    prev, prev_start, prev_end, pos = None, -1, -1, 0
+    for part in _iter_commands(command):
+        if part is None:
+            prev = None
+            continue
+        start = command.find(part, pos) if part in top else -1
+        if start >= 0:
+            pos = start + len(part)
+        fed = _shell_fed(part)
+        if prev is not None and fed and fed[0] == "pipe":
+            # Only a pipe feeds it: `echo … > f; bash` runs no echoed text.
+            between = command[prev_end:start] if prev_end >= 0 and start >= 0 else None
+            if between is None or re.fullmatch(r"\s*\|&?\s*", between):
+                for text in _source_texts(prev, part):
+                    yield (command[:prev_start] if prev_start >= 0 else None), text
+        prev, prev_start = part, start
+        prev_end = start + len(part) if start >= 0 else -1
+
+
+def _source_texts(source, reader):
+    """What `source` writes to a pipe, where its text shows it: a heredoc or
+    here-string, or echo / printf of literal words."""
+    words, stdin, _hazard = _parse_simple_command(source)
+    if stdin and stdin[0] == "heredoc" and stdin[1] is None:
+        orphan = _heredoc_split(reader)[2]
+        if orphan:  # the body the splitter moved onto the reader (see _heredoc_split)
+            words, stdin, _hazard = _parse_simple_command(source + "\n" + orphan)
+    if stdin and stdin[0] == "heredoc" and stdin[1] is not None:
+        return [stdin[1]]
+    if stdin and stdin[0] == "string":
+        return [_unquote_word(stdin[1])]
+    name = _unquote_word(words[0]) if words else ""
+    args = [_unquote_word(w) for w in words[1:]]
+    if name == "printf":
+        out = _printf_output(args[1:] if args[:1] == ["--"] else args)
+        return [out] if out is not None else [" ".join(args)] + args
+    if name == "echo":
+        while args and re.fullmatch(r"-[neE]+", args[0]):
+            args = args[1:]
+        text = " ".join(args)
+        return [text, _unescape(text)]  # -e, and zsh's echo, decode escapes
+    return []
+
+
+def _guard_views(command, _depth=0):
+    """The command as the protected-delete guard should also read it: each
+    shell code, trap handler, find -exec command and text piped into a
+    shell put in place of the part that runs it, after everything before
+    that part — so a `cd` before `bash -c '…'` moves the code's relative
+    targets too. Code inside that code is placed the same way, to the
+    nesting limit."""
+    if _depth >= _MAX_SUBSTITUTION_DEPTH:
+        return
+    pos, placed = 0, []
+    parts, _ = split_compound_command(command)
+    for part, whole in zip(parts, _attach_heredoc_bodies(parts)):
+        start = command.find(part, pos)
+        if start >= 0:
+            pos = start + len(part)
+        prefix = command[:start] if start >= 0 else ""
+        placed += [(prefix, text) for _l, text, _lit in _exec_texts(whole) if text is not None]
+    placed += [(prefix, text) for prefix, text in _piped_code_sources(command)
+               if prefix is not None]
+    for prefix, text in placed:
+        yield prefix + "(" + text + "\n)"
+        for inner in _guard_views(text, _depth + 1):
+            yield prefix + "(" + inner + "\n)"
+
+
+# ── Risky operations of allowed commands ──────────────────────────────────
+# Commands the allowlist trusts (git, curl, chmod, docker, tee, cp, …) that
+# can still lose work, send local data away or plant code that runs later.
+# Each goes to the LLM: "Risky" in the reason keeps it out of the LLM cache.
+
+_GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
+                             "--super-prefix", "--config-env"})
+# `git -c KEY=VALUE` keys whose value git runs as a command (or that load one)
+_GIT_COMMAND_KEYS_RE = re.compile(
+    r"core\.(?:sshcommand|pager|editor|fsmonitor|hookspath|askpass|gitproxy)"
+    r"|diff\.external|sequence\.editor|pager\..*|uploadpack\..*|credential\..*"
+    r"|.*\.(?:textconv|command|driver|program|helper|clean|smudge|process|cmd|tool)"
+    r"|remote\..*\.(?:uploadpack|receivepack|vcs)|protocol\..*", re.I)
+_CURL_VALUE_LETTERS = frozenset("oHXAebcEuUxYyzCDQtPmrw")
+_CURL_DATA_OPTS = frozenset({"-d", "--data", "--data-binary", "--data-ascii",
+                             "--data-urlencode", "--json", "--variable", "--url-query"})
+_CURL_NAMED_FILE_OPTS = frozenset({"--data-urlencode", "--variable", "--url-query"})
+_RAW_DEVICE_RE = re.compile(r"^/dev/(?:r?disk\d|sd[a-z]|hd[a-z]|nvme\d|xvd[a-z]|vd[a-z]"
+                            r"|mmcblk\d|loop\d|md\d|dm-\d|mapper/|disk/)")
+_STARTUP_FILES = frozenset({".zshrc", ".bashrc", ".bash_profile", ".profile", ".zprofile",
+                            ".zshenv", ".zlogin", ".bash_login"})
+_COPY_COMMANDS = frozenset({"cp", "mv", "install", "ln", "rsync"})
+
+
+def _git_risk(args, _aliased=0):
+    """Why a git command line can lose work or rewrite shared history, or None."""
+    i, where, aliases = 0, HOOK_CWD or os.getcwd(), {}
+    while i < len(args) and args[i].startswith("-"):
+        a = args[i]
+        if a == "-c" and i + 1 < len(args):
+            key, _, value = args[i + 1].partition("=")
+            if key.lower().startswith("alias."):
+                # `!cmd` runs a command; any other value is git words (read below)
+                if value.lstrip().startswith("!"):
+                    return f"git -c setting that runs a command: {args[i + 1]}"
+                aliases[key[6:].lower()] = value
+            elif _GIT_COMMAND_KEYS_RE.fullmatch(key):
+                return f"git -c setting that runs a command: {args[i + 1]}"
+        if a == "-C" and i + 1 < len(args):
+            where = os.path.join(where, _expand_home(args[i + 1]))
+        if a.startswith(("--exec-path=", "--config-env")):
+            return f"git option that loads other code: {a}"
+        i += 2 if a in _GIT_VALUE_OPTS else 1
+    if i >= len(args):
+        return None
+    sub, rest = args[i], args[i + 1:]
+    if sub.lower() in aliases:  # `git -c alias.st='reset --hard' st`
+        try:
+            words = shlex.split(aliases[sub.lower()])
+        except ValueError:
+            words = None
+        if not words or _aliased >= 4:
+            return f"git alias not read: {sub}"
+        risk = _git_risk(args[:i] + words + rest, _aliased + 1)
+        if risk:
+            return risk
+        # git ignores an alias named like a built-in, so read it as one too
+    flags = _git_flags(rest, _GIT_SHORT_VALUES.get(sub, ""))
+    letters = "".join(f for f in flags if len(f) == 1)
+    plain = [a for a in rest if not a.startswith("-")]
+    if sub == "reset" and "--hard" in rest:
+        return "git reset --hard (discards uncommitted work)"
+    if sub == "clean" and ("f" in letters or "--force" in rest):
+        dry = False  # the last of -n / --dry-run / --no-dry-run wins
+        for f in flags:
+            dry = True if f in ("n", "--dry-run") else False if f == "--no-dry-run" else dry
+        if not dry:
+            return "git clean --force (deletes untracked files)"
+    if sub == "checkout" and _checkout_paths(rest, where):
+        return "git checkout of paths (discards uncommitted changes)"
+    if sub in ("checkout", "switch") and ("f" in letters or "--force" in rest
+                                          or "--discard-changes" in rest):
+        return f"git {sub} --force (discards uncommitted changes)"
+    if sub == "restore" and not (("S" in letters or "--staged" in rest)
+                                 and not ("W" in letters or "--worktree" in rest)):
+        return "git restore of the work tree (discards uncommitted changes)"
+    if sub == "stash" and plain[:1] in (["drop"], ["clear"]):
+        return f"git stash {plain[0]} (deletes stashed work)"
+    if sub == "branch" and ("D" in letters or ("d" in letters or "--delete" in rest)
+                            and ("f" in letters or "--force" in rest)):
+        return "git branch -D (deletes an unmerged branch)"
+    if sub in ("filter-branch", "filter-repo"):
+        return f"git {sub} (rewrites history)"
+    if sub == "push":
+        return _git_push_risk(rest, letters)
+    return None
+
+
+# Short options of these git subcommands that take a value (`-e PATTERN`,
+# `-bNAME`): the rest of the word is the value, not more options.
+_GIT_SHORT_VALUES = {"clean": "e", "checkout": "bB", "switch": "cC", "restore": "s",
+                     "branch": "u", "push": "o"}
+# long options of those subcommands whose value may be the next word
+_GIT_LONG_VALUES = frozenset({"--exclude", "--orphan", "--conflict", "--create", "--force-create",
+                              "--source", "--pathspec-from-file", "--set-upstream-to", "--repo",
+                              "--push-option", "--receive-pack", "--exec"})
+
+
+def _git_flags(rest, value_letters):
+    """The options in `rest`, in order: long ones whole, short clusters
+    letter by letter up to a letter that takes a value. Stops at `--`."""
+    flags, skip = [], False
+    for a in rest:
+        if skip:
+            skip = False
+            continue
+        if a == "--":
+            break
+        if a.startswith("--"):
+            flags.append(a.split("=", 1)[0])
+            skip = a in _GIT_LONG_VALUES  # `--exclude -node_modules`
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:]):
+                flags.append(ch)
+                if ch in value_letters:
+                    skip = k == len(a) - 2  # the value is the next word
+                    break
+    return flags
+
+
+def _checkout_paths(rest, where):
+    """True if `git checkout` arguments name paths to overwrite: after `--`,
+    `.`, a tree-ish followed by more operands, a pathspec file, or an
+    operand that looks like or is a file (`git checkout README.md`)."""
+    if "--" in rest[:-1]:
+        return True
+    plain, j = [], 0
+    while j < len(rest):
+        a = rest[j]
+        if a == "--pathspec-from-file" or a.startswith("--pathspec-from-file="):
+            return True
+        if a in ("-b", "-B", "--orphan", "--conflict"):
+            j += 2
+            continue
+        if not a.startswith("-"):
+            plain.append(a)
+        j += 1
+    # A ref can't be told from a path without the repository: a glob, a
+    # file-like name (`README.md`, `src/app.py`) or a path that exists
+    # counts as a path (a `cd` earlier in the command isn't followed).
+    return len(plain) > 1 or any(
+        a in (".", "./", ":/") or re.search(r"[*?\[]|\.[A-Za-z]\w*$", a)
+        or os.path.lexists(os.path.join(where, a)) for a in plain)
+
+
+def _git_push_risk(rest, letters):
+    """Why a `git push` deletes or force-overwrites shared refs, or None.
+    A force push to a branch other than main/master is left to the rules."""
+    positional, j = [], 0
+    while j < len(rest):
+        a = rest[j]
+        if a in ("-o", "--push-option", "--repo", "--receive-pack", "--exec"):
+            j += 2
+            continue
+        if not a.startswith("-"):
+            positional.append(a)
+        j += 1
+    repo_named = any(a == "--repo" or a.startswith("--repo=") for a in rest)
+    refspecs = positional if repo_named else positional[1:]
+    if "--delete" in rest or "d" in letters or any(r.startswith(":") for r in refspecs):
+        return "git push that deletes a remote branch"
+    if "--mirror" in rest or "--prune" in rest:
+        return "git push --mirror/--prune (deletes remote refs)"
+    dsts = []
+    for r in refspecs:
+        dst = r.lstrip("+").rsplit(":", 1)[-1]
+        dsts.append(dst[len("refs/heads/"):] if dst.startswith("refs/heads/") else dst)
+    hard = "--force" in rest or "f" in letters or any(r.startswith("+") for r in refspecs)
+    lease = any(a.startswith(("--force-with-lease", "--force-if-includes")) for a in rest)
+    if hard and (not refspecs or any(d in ("main", "master", "HEAD", "@") for d in dsts)):
+        return "force push to main/master (or to an upstream not named)"
+    if lease and (not refspecs or any(d in ("main", "master", "HEAD", "@") for d in dsts)):
+        return "force push to main/master (or to an upstream not named)"
+    return None
+
+
+def _upload_risk(name, args):
+    """Why a curl/wget command line sends a local file or stdin, or None."""
+    if name == "wget":
+        hit = next((a for a in args if a.startswith(("--post-file", "--body-file"))), None)
+        return f"wget upload of a local file: {hit}" if hit else None
+    for i, a in enumerate(args):
+        value = args[i + 1] if i + 1 < len(args) else ""
+        if a in ("-T", "--upload-file", "-K", "--config") or a.startswith("--upload-file="):
+            return f"curl {a} (uploads a file, or reads options from one)"
+        # `-d @file`, `--json @-`; `--data-urlencode name@file` (`name=x@y` is text)
+        if a in _CURL_DATA_OPTS and re.match(r"[^=@]*@" if a in _CURL_NAMED_FILE_OPTS else "@",
+                                             value):
+            return f"curl upload of a local file or stdin: {a} {value}"
+        if a in ("-F", "--form") and re.search(r"=[@<]", value):
+            return f"curl upload of a local file: {a} {value}"
+        if a.startswith("-") and not a.startswith("--"):
+            for k, ch in enumerate(a[1:]):
+                attached = a[k + 2:] or value
+                if ch in "TK":
+                    return f"curl -{ch} (uploads a file, or reads options from one)"
+                if ch == "d" and attached.startswith("@") or ch == "F" and re.search(r"=[@<]", attached):
+                    return f"curl upload of a local file or stdin: {a}"
+                if ch in "dF" or ch in _CURL_VALUE_LETTERS:
+                    break  # the rest of the word is this option's value
+    return None
+
+
+def _chmod_risk(args):
+    """Why a chmod makes a tree world-writable, or None."""
+    if not ("--recursive" in args or any(re.fullmatch(r"-[A-Za-z]*R[A-Za-z]*", a) for a in args)):
+        return None
+    mode = next((a for a in args if not re.fullmatch(r"-[A-Za-z]+|--(?:\w[\w-]*)?", a)), "")
+    if re.fullmatch(r"0*[0-7]{3,4}", mode):
+        world = int(mode[-1]) & 2
+    else:  # a clause for others/all that adds or sets w: `o+w`, `a=rwx`, `go+rw`
+        world = False
+        for clause in mode.split(","):
+            who = re.match(r"[ugoa]*", clause).group(0)
+            if ("o" in who or "a" in who) and re.search(r"[+=][rwxXst]*w", clause[len(who):]):
+                world = True
+    return f"chmod -R {mode} (world-writable tree)" if world else None
+
+
+def _docker_risk(name, args):
+    """Why a docker command deletes volumes or prunes the system, or None."""
+    plain = [a for a in args if not a.startswith("-")]
+    flags = [a for a in args if a.startswith("-")]
+    for i, w in enumerate(plain):
+        if w == "volume" and plain[i + 1:i + 2] in (["rm"], ["remove"], ["prune"]):
+            return f"docker volume {plain[i + 1]} (deletes volume data)"
+        if w == "system" and plain[i + 1:i + 2] == ["prune"]:
+            return "docker system prune"
+    if ("compose" in plain or name == "docker-compose") and "down" in plain and (
+            "--volumes" in flags or any(re.fullmatch(r"-[A-Za-z]*v[A-Za-z]*", f) for f in flags)):
+        return "docker compose down --volumes (deletes volume data)"
+    return None
+
+
+def _expand_home(word):
+    """`word` with a leading ~ / $HOME / ${HOME} spelled out."""
+    for prefix in ("${HOME}", "$HOME", "~"):
+        if word == prefix or word.startswith(prefix + "/"):
+            return HOME_DIR + word[len(prefix):]
+    return word
+
+
+def _written_operands(name, args):
+    """The paths a file-writing command writes (tee's files, a copy's
+    destination, dd's of=, sed -i's files)."""
+    operands = [a for a in args if not a.startswith("-")]
+    if name == "tee":
+        return operands
+    if name in _COPY_COMMANDS:
+        dirs = [args[i + 1] for i, a in enumerate(args[:-1]) if a == "-t"]
+        dirs += [a.split("=", 1)[1] for a in args if a.startswith("--target-directory=")]
+        return dirs + operands[-1:]
+    if name == "dd":
+        return [a[3:] for a in args if a.startswith("of=")]
+    if name == "sed" and any(a.startswith(("-i", "--in-place")) for a in args):
+        return operands
+    if name == "truncate":
+        return operands
+    if name in _AWK_NAMES:
+        return _awk_written(args)
+    return []
+
+
+def _awk_written(args):
+    """Every string an awk program could write to (its literals and -v
+    values) when it redirects output (`print … > f`), else []."""
+    prog = _awk_program(args, args)
+    if prog is None:
+        return []
+    text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', prog[0].replace("\\\n", " "))
+    if not re.search(r"\bprintf?\b[^;{}\n]*>", text):
+        return []
+    values = re.findall(r'"((?:[^"\\\n]|\\.)*)"', prog[0])
+    values += [args[i + 1].split("=", 1)[-1] for i, a in enumerate(args[:-1])
+               if a in ("-v", "--assign")]
+    values += [a.split("=", 1)[1] for a in args if re.match(r"[A-Za-z_]\w*=", a)]
+    return values
+
+
+def _sensitive_operand(word):
+    """The sensitive_paths entry a word names as a path, or None. A word
+    with whitespace in it is text (a commit message), not a path, unless it
+    starts like one (`'/tmp/my dir/.env'`)."""
+    if not word or "\n" in word or any(c.isspace() for c in word) and not \
+            re.match(r"(?:/|~|\.\.?/|\$\{?HOME\b)", word):
+        return None
+    for cand in [word] + [word.split(sep, 1)[1] for sep in "=:" if sep in word]:
+        path = _expand_home(cand)
+        low = ("" if path.startswith("/") else "/") + path.lower() + "/"  # `~/.ssh` too
+        for pattern in SENSITIVE_PATHS:
+            if pattern and pattern.lower() in low:
+                return pattern
+    return None
+
+
+def _risky_operation(cmd):
+    """("ask", reason) for a command the allowlist trusts doing something that
+    can lose work, send local data away, or plant code that runs later
+    (see the section comment); None otherwise."""
+    tokens = _shell_words(cmd)
+    words, targets, reads, i = [], [], [], 0
+    while i < len(tokens):
+        t = tokens[i]
+        if t and set(t) <= set("<>&|"):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if ">" in t and not (t in (">&", "<&") and (nxt.isdigit() or nxt == "-")) \
+                    or t == "<>":
+                targets.append(nxt)
+            elif t in ("<", "<&"):
+                reads.append(nxt)
+            i += 2
+            continue
+        words.append(t)
+        i += 1
+    while words and _ASSIGNMENT_RE.match(words[0]):
+        words = words[1:]
+    words = _unwrap_command(words)
+    name = os.path.basename(words[0]) if words else ""
+    args = words[1:]
+    reason = (_git_risk(args) if name == "git"
+              else _upload_risk(name, args) if name in ("curl", "wget")
+              else _chmod_risk(args) if name == "chmod"
+              else _docker_risk(name, args) if name in ("docker", "docker-compose")
+              else None)
+    if reason:
+        return ("ask", f"Risky {reason} — LLM review")
+    for path in targets + _written_operands(name, args):
+        full = _expand_home(path)
+        if _RAW_DEVICE_RE.match(full):
+            return ("ask", f"Risky write to a raw device: {path} — LLM review")
+        if os.path.basename(full.rstrip("/")) in _STARTUP_FILES \
+                or "Library/LaunchAgents" in full or "Library/LaunchDaemons" in full:
+            return ("ask", f"Risky write to a shell startup file or launch agent: {path} — LLM review")
+    for word in words + targets + reads:
+        hit = _sensitive_operand(word)
+        if hit:
+            return ("ask", f"Risky use of a sensitive path ({hit}) — LLM review")
+    return None
 
 
 # ============================================================
@@ -4834,7 +6012,7 @@ def extract_substitutions(command, quotes=True):
     return bodies, bool(pending) and quotes
 
 
-def split_compound_command(command):
+def split_compound_command(command, _depth=0):
     """
     Split a compound command into individual commands.
     Handles: &&, ||, ;, | and |& (pipes), a lone & (background job), and
@@ -5031,9 +6209,11 @@ def split_compound_command(command):
                     continue
                 # `;`, `|`, `|&` (a pipe that carries stderr too), and a lone
                 # `&` that runs the command before it in the background. `&`
-                # after `>`/`<` (`2>&1`, `<&3`) or before `>` (`&>f`) redirects.
-                if c in (";", "|") or (c == "&" and command[i+1:i+2] != ">"
-                                        and not (current and current[-1] in (">", "<"))):
+                # after `>`/`<` (`2>&1`, `<&3`) or before `>` (`&>f`) redirects,
+                # and `>|` (clobber) is one redirection, not a pipe.
+                if c == ";" or (c == "|" and not (current and current[-1] == ">")) \
+                        or (c == "&" and command[i+1:i+2] != ">"
+                            and not (current and current[-1] in (">", "<"))):
                     part = "".join(current).strip()
                     if part:
                         parts.append(part)
@@ -5057,11 +6237,23 @@ def split_compound_command(command):
     # Post-process: unwrap top-level subshells/groups. Redirections after
     # the group (`( a; b ) > out 2>&1`) come out as a part of their own, so
     # a write check still sees where the output goes.
+    # A group after reserved words or redirections (`then ( … )`, `! { …; }`,
+    # zsh's `2>&1 ( … )`) is unwrapped the same way; a prefix holding a
+    # redirection comes out as a part of its own.
     final_parts = []
     for p in parts:
         stripped = p.strip()
         rest = None
-        if stripped[:1] in ("(", "{"):
+        lead = _group_prefix_end(stripped)
+        if lead and _depth >= _MAX_GROUP_DEPTH:
+            uncertain = True  # a prefixed group nested too deep to read
+        if lead and _depth < _MAX_GROUP_DEPTH:
+            if re.search(r"[<>]", stripped[:lead]):
+                final_parts.append(stripped[:lead].strip())
+            stripped = stripped[lead:]
+        if stripped[:1] in ("(", "{") and _depth >= _MAX_GROUP_DEPTH:
+            uncertain = True  # nested too deep to read: the callers ask
+        elif stripped[:1] in ("(", "{"):
             closer = ")" if stripped[0] == "(" else "}"
             close = _find_closing_paren(stripped, 1, stripped[0], closer)
             rest = stripped[close + 1:].strip() if close > 0 else None
@@ -5072,16 +6264,46 @@ def split_compound_command(command):
         if rest is not None and (not rest or not _strip_leading_redirections(rest)):
             inner = stripped[1:close].strip()
             if inner:
-                inner_parts, inner_uncertain = split_compound_command(inner)
+                inner_parts, inner_uncertain = split_compound_command(inner, _depth + 1)
                 final_parts.extend(inner_parts if inner_parts else [inner])
                 if inner_uncertain:
                     uncertain = True
             if rest:
                 final_parts.append(rest)
         else:
-            final_parts.append(p)
+            final_parts.append(stripped if lead else p)
 
     return final_parts, uncertain
+
+
+_MAX_GROUP_DEPTH = 64  # nested ( ) / { } groups one command may hold
+
+
+def _group_prefix_end(part):
+    """Where a ( … ) or { …; } group starts in `part` after reserved words
+    (`!`, `then`, `do`, …, `time`) and redirections, or 0 when `part` does
+    not start that way. `((` is arithmetic, not a group."""
+    if part[:1] in ("(", "{"):
+        return 0
+    op = False  # a redirection still waiting for its operand word
+    seen = False
+    for start, word in _iter_word_starts(part):
+        if op:
+            op = False
+            continue
+        m = _REDIRECTION_RE.match(word)
+        if m and not word[m.end():].startswith("(") and m.group(1) not in ("<<", "<<-"):
+            op = m.end() == len(word)
+            seen = True
+            continue
+        if word in _SHELL_PREFIX_KEYWORDS and word != "{" or word in _ZSH_MODIFIERS \
+                or word == "time" or word == "-p" and seen:
+            seen = True
+            continue
+        if seen and (word == "{" or word.startswith("(") and not word.startswith("((")):
+            return start
+        return 0
+    return 0
 
 
 def _word_starts(text):

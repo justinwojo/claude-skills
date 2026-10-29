@@ -316,7 +316,7 @@
     "bash": ["-c"],
     "sh": ["-c"],
     "zsh": ["-c"],
-    "fish": ["-c"],
+    "fish": ["-c", "--command"],
     "osascript": ["-e"],
     "python": ["-c"],
     "python3": ["-c"],
