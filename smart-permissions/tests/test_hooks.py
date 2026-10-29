@@ -3667,6 +3667,13 @@ def test_leading_redirections_skipped():
         '( kubectl delete ns prod ) > /dev/null',
         '{ git status; kubectl delete ns prod; } 2>/dev/null',
         '<(echo x) foo',
+        # A group after the redirection (zsh runs it) keeps the redirection
+        # as the command word, as before: dropping it would check nothing.
+        '2>&1 ( kubectl delete ns prod )',
+        '2>&1 { kubectl delete ns prod; }',
+        '! 2>&1 ( kubectl delete ns prod )',
+        'FOO=1 2>&1 ( kubectl delete ns prod )',
+        '&> /tmp/sp-o ( kubectl delete ns prod )',
     ]
     allows = [
         '< /dev/null git status',

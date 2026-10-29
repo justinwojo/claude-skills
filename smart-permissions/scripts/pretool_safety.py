@@ -5099,7 +5099,9 @@ def _strip_leading_redirections(cmd):
     """`cmd` without the redirections before its command word: `< in kubectl …`
     and `2>/dev/null kubectl …` → `kubectl …`; `X=1 >out cmd` → `X=1 cmd`.
     Assignments and the rest stay verbatim. Empty when no command word
-    follows (`> f`, or a heredoc with only its body after it)."""
+    follows (`> f`, or a heredoc with only its body after it). Unchanged
+    when a group follows (`2>&1 ( a; b )`, which zsh runs): its body is no
+    command word, so dropping the redirection would leave nothing checked."""
     if "<" not in cmd and ">" not in cmd:
         return cmd
     cuts = []  # (start, end) of each redirection word and operand dropped
@@ -5119,6 +5121,8 @@ def _strip_leading_redirections(cmd):
             continue
         m = _REDIRECTION_RE.match(word)
         if not m or word[m.end():].startswith("("):  # `<(cmd)` is a word
+            if cuts and word[0] in "({":
+                return cmd
             break
         cuts.append((start, start + len(word)))
         if m.end() == len(word):
