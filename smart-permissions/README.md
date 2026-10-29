@@ -4,7 +4,14 @@ A hook plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 
 
 Out of the box, Claude Code prompts you for every file write, every bash command, and every web fetch. With this plugin, common development operations are auto-approved based on rules you control.
 
-The plugin evaluates in a strict **trust order — rules → LLM → human**. Local rules decide first. Anything they can't classify is handed to an optional LLM (if you've configured one). Only what neither can vouch for reaches you as a standard permission prompt with full "Always allow" support. A second hook (PermissionRequest) also auto-approves and *learns* unknown-but-safe commands, so your permissions build up naturally as you work — while restricted command families, permission-config edits, and anything risky always stop for confirmation.
+The plugin evaluates in a strict **trust order — rules → LLM → human**. Local rules decide first. Anything they can't classify is handed to an optional LLM (if you've configured one). Only what neither can vouch for reaches you as a standard permission prompt with full "Always allow" support. The plugin never edits its own config: an LLM approval covers that one call, and only you add entries to the allowlists.
+
+> **Upgrading from an earlier version — auto-learning is gone.** Earlier versions wrote approved commands, write folders, web domains and MCP tool names into your config. That has been removed, and two behaviors change:
+>
+> - **Without an LLM configured**, calls the rules can't settle now show the normal Claude prompt. They used to be approved silently and learned: unknown Bash commands, writes under your home or temp folders, and WebFetch to new domains. To keep things quiet, configure an LLM (`SAFETY_HOOK_MODEL=claude-haiku-5-5` plus a key, see [LLM environment variables](#llm-environment-variables)), add your own entries to the config, or use the prompt's "Always allow".
+> - **With an LLM**, nothing it approves is saved to your config. An exact repeat within 7 days reuses the [cached verdict](#llm-decision-cache); any other call gets a fresh, context-aware judgment.
+>
+> `SAFETY_HOOK_AUTO_LEARN` and the config keys `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored; you can delete them. Entries earlier versions learned stay in your config as ordinary entries. Look through `safe_commands`, `safe_write_paths`, `allowed_web_domains` and `safe_mcp_tools` and prune anything you don't want trusted permanently. `/smart-permissions:setup` can walk you through it.
 
 ## Installation
 
@@ -19,12 +26,13 @@ Then run the setup wizard to configure it:
 /smart-permissions:setup
 ```
 
-The wizard walks you through LLM evaluation, auto-learn, safe commands, write paths, and MCP tool permissions.
+The wizard walks you through LLM evaluation, safe commands, write paths, and MCP tool permissions.
 
 ## How it works
 
 Every tool call passes through **two** hooks. The PreToolUse hook runs first;
-if it can't decide, the PermissionRequest hook (the "learner") gets a second,
+if it can't decide, the PermissionRequest hook (`permission_learner.py`, logged
+as source `learner`; the name predates the removal of learning) gets a second,
 LLM-consulting pass before Claude ever shows you a prompt:
 
 ```
@@ -46,9 +54,9 @@ Tool call
                           ▼
   ┌─ PermissionRequest (learner) ────────────────────────────────────┐
   │  Re-check dangerous/risky patterns              ──→  DENY / ASK    │
+  │  Permission-config write                        ──→  ASK           │
   │  LLM configured?  ── yes ─→ LLM eval (+ cache)   ──→  ALLOW / ASK  │
-  │                   └─ no  ─→ unknown-but-safe cmd ──→  ALLOW + LEARN │
-  │  Restricted family / MCP / config write         ──→  ASK           │
+  │                   └─ no                         ──→  ASK           │
   └───────────────────────────────────────────────────────────────────┘
                           │ still "ask"
                           ▼
@@ -77,7 +85,7 @@ upload needs explicit authorization.
 - **Second pass.** A flagged call is judged again at
   `SAFETY_HOOK_RECHECK_REASONING_EFFORT` (default `high`), with the first
   verdict attached. If the recheck clears it, the call runs (`source:
-  llm-recheck`; never cached or learned). If the recheck confirms it, the hook
+  llm-recheck`; never cached). If the recheck confirms it, the hook
   emits an explicit `ask`, so you decide — even in auto mode, where a silent
   fall-through would go to Claude's classifier instead. The PermissionRequest
   hook that fires for that prompt leaves it to you rather than asking the LLM a
@@ -228,7 +236,7 @@ zsh's `cdpath=(…)` array isn't followed, so there it lands anywhere.
 
 Every other recursive or bulk delete (`rm -r`, `find -delete`, `find -exec rm`,
 `xargs rm`) goes to the LLM on every call. It is never auto-allowed by rule,
-never cached, and never learned. The LLM sees the working directory and your
+and never cached. The LLM sees the working directory and your
 recent messages. It approves build output, caches and temp files, and flags a
 whole project or data the task doesn't cover. Without an LLM configured, these
 fall through to the normal prompt. The guard reads only the command text: a
@@ -269,12 +277,13 @@ auto-allowed: they reach the LLM like any other recursive delete.
 - `rm *` or `rm .*` (wildcard deletion)
 - `find / -delete` or `find / -exec rm` (recursive deletion from root)
 - Archive extraction to system roots (`tar -C /usr/`)
-- **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never blanket-approved; without an LLM it prompts, with one the LLM decides.
-- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files. These *always* prompt — never auto-allowed, never learned, never LLM-vouched — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. This guard is not subtractable.
+- **Restricted command families** — a base command that ships (or is configured) only with multi-word entries, like `docker`, `npm`, `gh`, `terraform`, `kubectl`, `cargo`, `helm`, `pip`. An unrecognized subcommand (`docker run`, `npm publish`) is never approved by rule; without an LLM it prompts, with one the LLM decides.
+- **Permission-config writes (C9)** — Write/Edit/NotebookEdit targeting `~/.claude/settings*`, `~/.claude/hooks/`, `~/.claude/keybindings.json`, or the plugin's own config / cache / log files. These *always* prompt — never auto-allowed, never LLM-vouched — even when their parent (`~/.claude/`) is a safe write path, so the agent can't rewrite its own permission rules. This guard is not subtractable.
 - WebFetch to domains not in the allow list
-- MCP tools not matching any `safe_mcp_tools` pattern (unless auto-learned — see below)
+- MCP tools not matching any `safe_mcp_tools` pattern
+- Anything else the rules can't settle (a novel CLI tool, a write outside the safe folders), when no LLM is configured
 
-Genuinely-unknown, non-restricted commands (e.g. a novel CLI tool) are auto-approved and learned by the PermissionRequest hook rather than prompting — so they build up in your config as you work. When something *does* prompt, you get the standard Claude permission dialog with "Always allow", so it only prompts once if you choose to permanently allow it.
+With an LLM configured, everything in this list except permission-config writes goes to the LLM first, and you see only what it won't approve. When something *does* prompt, you get the standard Claude permission dialog with "Always allow", so it only prompts once if you choose to permanently allow it.
 
 ## Security model / threat boundary
 
@@ -306,7 +315,6 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `safe_internal_tools` | string array | Claude Code / harness internal tools auto-allowed (no side effects outside the harness) |
 | `sensitive_paths` | string array | Path substrings that always deny for file operations |
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
-| `never_learn_commands` | string array | Command first-words never persisted to the allowlist (still LLM-approvable per call) |
 | `dangerous_patterns` | string array | Regex patterns that always deny (full command match) |
 | `protected_delete_paths` | string array | Folders a recursive delete may never touch, nor anything above them (default `~`, `~/*`; globs expand on disk). **Not subtractable.** |
 | `risky_patterns` | string array | Regex patterns that prompt instead of auto-allowing |
@@ -315,7 +323,6 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `decision_log` | bool | Log every decision to `~/.claude/hooks/smart-permissions-decisions.jsonl` (default `true`) |
 | `llm_cache` | bool | Cache LLM *allow* decisions for identical repeat calls (default `true`) |
 | `llm_cache_ttl_days` | number | How long a cached allow stays valid (default `7`) |
-| `auto_learn_mcp_tools` | bool | Persist LLM-approved MCP tool names to `safe_mcp_tools` (default `true`) |
 
 Positive allowlists (`safe_commands`, `safe_write_paths`, `safe_script_paths`, `allowed_web_domains`, `safe_mcp_tools`, `safe_internal_tools`) merge as a union with the defaults. Scalars and objects (like `interpreter_exec_flags`) are replaced wholesale.
 
@@ -332,11 +339,11 @@ Arrays only ever *add* to the defaults, so to remove a shipped entry use `remove
 }
 ```
 
-Removal is applied last, after defaults + platform overlay + your additions. Removing a `safe_commands` entry also makes that base a **restricted family** — the first word of a removed entry means "ask me", never "unknown → allow" — and the learner will never re-add an entry you subtracted.
+Removal is applied last, after defaults + platform overlay + your additions. Removing a `safe_commands` entry also makes that base a **restricted family** — the first word of a removed entry means "ask me", never "unknown → allow".
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, timing, and anything learned. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Calls from other agent CLIs (see below) also record the original `client_tool` name. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, hook, tool, truncated input (≤500 chars), decision, source (`rule` / `llm` / `llm-cache` / `llm-recheck` / `learner`), reason, and timing. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Calls from other agent CLIs (see below) also record the original `client_tool` name. It rotates to a single `.jsonl.1` generation at 5 MB. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
 
@@ -361,11 +368,7 @@ With this config, `mcp__sentry__get_issue` is auto-allowed, but `mcp__sentry__re
 
 Patterns use Python's `fnmatch` — `*` matches any characters, `?` matches a single character. For example, `mcp__*__get_*` matches all get operations from any MCP server.
 
-### MCP auto-learn
-
-When an MCP tool is approved by the LLM (with `SAFETY_HOOK_AUTO_LEARN` enabled), the plugin persists that **exact tool name** to `safe_mcp_tools` so identical calls are instant next time. It only ever learns the precise name that was approved — never a wildcard — so approving `mcp__sentry__get_issue` never broadens to `mcp__sentry__*`.
-
-> **Migration note:** earlier versions never auto-learned MCP tools. This behavior is on by default now. Set `"auto_learn_mcp_tools": false` in your config to restore the old "explicit patterns only" behavior; you can still add glob patterns by hand at any time, and Claude's "Always allow" remains available when a tool prompts.
+An MCP tool that matches no pattern goes to the LLM (if configured) on each call, and to the standard prompt otherwise. An LLM approval is never saved as a pattern.
 
 ## How Bash commands are parsed
 
@@ -424,11 +427,7 @@ The `safe_commands` list supports multi-word entries for granular subcommand con
 
 Wildcards use Python's `fnmatch` — `*` matches any characters, `?` matches a single character.
 
-**Auto-learning** is conservative by design:
-- When `flutter doctor` is approved, it learns `"flutter doctor"` — not `"flutter"`. So `flutter run` still prompts separately.
-- Commands with flags before the subcommand (like `docker --context prod build`) are matched correctly but **not auto-learned**, since flag parsing is ambiguous without command-specific knowledge. These commands are still auto-approved each time by the PermissionRequest hook — they just don't get persisted to your config.
-- Single-word base commands are never auto-learned to prevent accidental blanket approvals.
-- If you want blanket approval for a tool, manually add the single-word entry (e.g. `"flutter"`) to your config.
+If you want blanket approval for a tool, add the single-word entry (e.g. `"flutter"`) to your config. Prefer multi-word entries for tools that have destructive subcommands.
 
 ### Default subcommand restrictions
 
@@ -493,8 +492,8 @@ If you prefer not to use the plugin system:
    ```
 
    The PreToolUse hook alone still blocks dangerous commands and auto-allows safe
-   ones, but without the PermissionRequest hook you lose LLM evaluation, learning,
-   and the restricted-family / config-write prompts.
+   ones, but without the PermissionRequest hook you lose its LLM pass on the
+   calls PreToolUse leaves to the prompt.
 
 ## Testing
 
@@ -503,7 +502,7 @@ cd smart-permissions
 python3 tests/test_hooks.py
 ```
 
-Covers all decision paths: safe commands, dangerous patterns, risky patterns, file paths, web domains, MCP tools, compound commands, edge cases, and config learning. Dangerous test payloads are base64-encoded so they don't trigger live safety hooks.
+Covers all decision paths: safe commands, dangerous patterns, risky patterns, file paths, web domains, MCP tools, compound commands, the no-LLM prompt path, and edge cases. Dangerous test payloads are base64-encoded so they don't trigger live safety hooks.
 
 ### LLM environment variables
 
@@ -515,7 +514,7 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 | `SAFETY_HOOK_PROVIDER` | Optional wire format override: `anthropic` or `openai`. Auto-detected otherwise: an `anthropic.com` URL, or a `claude-*` model with no URL, uses the Messages API; everything else uses chat completions. |
 | `SAFETY_HOOK_REASONING_EFFORT` | Optional effort (e.g. `none`, `low`, `medium`, `high`). OpenAI-compatible: sent as `reasoning_effort`. Anthropic: sent as `output_config.effort`, with `none`/`minimal` mapped to `low`. Only sent if set. |
 | `SAFETY_HOOK_RECHECK_REASONING_EFFORT` | `reasoning_effort` for the second pass on a flagged call (default `high`; empty string = provider default) |
-| `SAFETY_HOOK_AUTO_LEARN` | Persist LLM-approved commands to config (`true` / `1` / `yes`) |
+| `SAFETY_HOOK_AUTO_LEARN` | **Retired** — ignored. Approvals are no longer written to the config; remove it from your shell config. |
 
 ## Audit log
 
@@ -530,6 +529,10 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 - Python 3.6+ (stdlib only — no pip dependencies)
 - Claude Code
 - macOS, Linux, or Windows
+
+## Changelog
+
+- **2026-10-29 — auto-learning removed.** Approvals are no longer written to your config. Without an LLM, unknown Bash commands, home/temp writes and WebFetch to new domains now prompt instead of being approved and learned. `SAFETY_HOOK_AUTO_LEARN`, `auto_learn_mcp_tools` and `never_learn_commands` are retired and ignored. Previously learned entries stay in your config. See [the upgrade note](#smart-permissions) at the top.
 
 ## License
 

@@ -11,14 +11,15 @@ prompt as the true last resort.
   1. Re-checks dangerous patterns as a safety net → deny.
   2. Classifies everything else as "consult":
      - LLM configured → call it (client timeout 15s, inside the hook budget).
-       allow → approve (+ learn only if SAFETY_HOOK_AUTO_LEARN); a flag the
-       second pass confirms, error or unparseable → manual prompt (logged).
-       A call PreToolUse already flagged skips the LLM and prompts.
-     - LLM NOT configured → keep the historical self-learning blanket-approve
-       for unknown Bash / home-dir writes / WebFetch, EXCEPT restricted
-       command families (C0) which now ask; MCP/other tools keep asking.
-  3. Permission-config writes (C9) always prompt — never consult the LLM,
-     never learn (an LLM cannot vouch for a permission-rule edit).
+       allow → approve; a flag the second pass confirms, error or
+       unparseable → manual prompt (logged). A call PreToolUse already
+       flagged skips the LLM and prompts.
+     - LLM NOT configured → manual prompt.
+  3. Permission-config writes (C9) always prompt — never consult the LLM
+     (an LLM cannot vouch for a permission-rule edit).
+
+Nothing is ever written to the user config: an approval covers this one call.
+(The hook keeps its old file name so existing hook registrations still work.)
 
 Every exit path writes a structured decision-log record (C1); the learner's
 "ask" records ARE the manual-approval history.
@@ -40,7 +41,6 @@ from pretool_safety import (  # noqa: E402
     SAFE_COMMANDS,
     SAFE_COMMANDS_MULTI,
     SAFE_COMMANDS_WILD,
-    AUTO_LEARN,
     evaluate_file_path,
     evaluate_web_fetch,
     split_compound_command,
@@ -65,7 +65,6 @@ from pretool_safety import (  # noqa: E402
     unguarded_delete_check,
     _STEER_PREFIX,
     set_hook_cwd,
-    _auto_learn,
     _contains_case_start,
     _extract_function_body,
     _extract_case_arm_bodies,
@@ -111,7 +110,7 @@ def main():
     tool, tool_input = parse_hook_payload(input_data)
 
     set_hook_cwd(input_data)
-    verdict, fallback, reason = evaluate_for_learning(tool, tool_input)
+    verdict, reason = classify_request(tool, tool_input)
 
     if verdict == "deny":
         log_decision("permission_request", tool, tool_input, "deny", "learner",
@@ -120,167 +119,146 @@ def main():
         _emit_deny(reason if reason.startswith(_STEER_PREFIX) else "Blocked by safety hook")
         return
 
-    if verdict == "ask":
-        # Definite ask (C9 config write, empty/ambiguous) — no LLM, no learn.
+    # A definite ask (C9 config write, empty/ambiguous), or nothing to consult:
+    # without an LLM every call the rules could not settle goes to the human.
+    if verdict == "ask" or not llm_is_configured():
         log_decision("permission_request", tool, tool_input, "ask", "learner",
                      reason, duration_ms=_elapsed_ms(start))
         sys.exit(0)
 
     # verdict == "consult": lean on the LLM, human as last resort.
-    if llm_is_configured():
-        # PreToolUse already ran both LLM passes on this exact call and
-        # confirmed a flag — this prompt is the human decision it asked for.
-        flagged = _flag_get(tool, tool_input)
-        if flagged:
-            log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
-                         flagged, duration_ms=_elapsed_ms(start))
-            sys.exit(0)
-        cacheable = not _reason_is_risky(reason)
-        decision, llm_reason, info = llm_evaluate(
-            tool, tool_input, timeout=15, cacheable=cacheable,
-            context=build_llm_context(input_data))
-        source = info["source"]
-        llm_ms = info.get("llm_ms")
-        if decision == "allow":
-            # Learn only on a live-LLM allow with AUTO_LEARN (never on a
-            # cache hit — a cached decision is not a fresh approval).
-            learned = None
-            if AUTO_LEARN and source == "llm":
-                learned = _auto_learn(tool, tool_input)
-            log_decision("permission_request", tool, tool_input, "allow",
-                         source, llm_reason, duration_ms=_elapsed_ms(start),
-                         llm_ms=llm_ms, learned=learned,
-                         rule_reason=reason)
-            _emit_allow()
-            return
-        # Confirmed flag, LLM error or unparseable → manual prompt.
-        log_decision("permission_request", tool, tool_input, "ask", source,
-                     llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
-                     rule_reason=reason)
+    # PreToolUse already ran both LLM passes on this exact call and
+    # confirmed a flag — this prompt is the human decision it asked for.
+    flagged = _flag_get(tool, tool_input)
+    if flagged:
+        log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
+                     flagged, duration_ms=_elapsed_ms(start))
         sys.exit(0)
-
-    # LLM not configured — historical self-learning fallback.
-    if fallback == "allow":
-        # Non-LLM mode keeps the always-learn behavior (restricted bases and
-        # config writes never reach here — they map to fallback "ask").
-        learned = _auto_learn(tool, tool_input)
-        log_decision("permission_request", tool, tool_input, "allow", "learner",
-                     reason, duration_ms=_elapsed_ms(start), learned=learned)
+    cacheable = not _reason_is_risky(reason)
+    decision, llm_reason, info = llm_evaluate(
+        tool, tool_input, timeout=15, cacheable=cacheable,
+        context=build_llm_context(input_data))
+    source = info["source"]
+    llm_ms = info.get("llm_ms")
+    if decision == "allow":
+        log_decision("permission_request", tool, tool_input, "allow",
+                     source, llm_reason, duration_ms=_elapsed_ms(start),
+                     llm_ms=llm_ms, rule_reason=reason)
         _emit_allow()
         return
-
-    log_decision("permission_request", tool, tool_input, "ask", "learner",
-                 reason, duration_ms=_elapsed_ms(start))
+    # Confirmed flag, LLM error or unparseable → manual prompt.
+    log_decision("permission_request", tool, tool_input, "ask", source,
+                 llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
+                 rule_reason=reason)
     sys.exit(0)
 
 
-def evaluate_for_learning(tool, tool_input):
-    """Classify a tool call for the learner.
+def classify_request(tool, tool_input):
+    """Classify a tool call for the PermissionRequest hook.
 
-    Returns (verdict, fallback, reason):
-      - ("deny", None, reason)          → block outright
-      - ("ask", None, reason)           → manual prompt, never consult the LLM
-      - ("consult", "allow", reason)    → consult LLM; without it, approve+learn
-      - ("consult", "ask", reason)      → consult LLM; without it, manual prompt
+    Returns (verdict, reason):
+      - ("deny", reason)     → block outright
+      - ("ask", reason)      → manual prompt, never consult the LLM
+      - ("consult", reason)  → consult the LLM; without one, manual prompt
+    The reason says which rule settled or punted the call; on a consult it is
+    logged as `rule_reason` beside the LLM's own reason.
     """
     # FIX 3: safe regardless of caller — a non-dict tool_input would
     # AttributeError on the .get() calls below.
     if not isinstance(tool_input, dict):
         tool_input = {}
 
-    # their-M1: shipped defaults failed to load → fail closed (never learn or
-    # blanket-approve with empty guards); route everything to a manual prompt.
+    # their-M1: shipped defaults failed to load → fail closed (never consult
+    # the LLM with empty guards); route everything to a manual prompt.
     if _FAIL_CLOSED:
-        return ("ask", None, "smart-permissions defaults unavailable — failing closed")
+        return ("ask", "smart-permissions defaults unavailable — failing closed")
 
     if tool == "Bash":
-        return evaluate_bash_for_learning(tool_input.get("command", ""))
+        return classify_bash(tool_input.get("command", ""))
 
     if tool in ("Write", "Edit", "NotebookEdit"):
         path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
-        # C9: permission-config writes always prompt — no LLM, no learn.
+        # C9: permission-config writes always prompt — no LLM.
         if is_always_ask_write_path(path):
-            return ("ask", None, "Permission-config path requires confirmation")
+            return ("ask", "Permission-config path requires confirmation")
         result, reason = evaluate_file_path(path)
         if result == "deny":
-            return ("deny", None, reason)
+            return ("deny", reason)
         if result == "allow":
-            return ("consult", "allow", reason)
-        # result == "ask" (not in a safe write path). Only auto-approve/learn
-        # writes under the home or temp dirs; system paths ask without an LLM.
+            return ("consult", reason)
         normalized = os.path.realpath(os.path.expanduser(path)) if path else ""
         home = os.path.expanduser("~")
         if (normalized.startswith(home + os.sep)
                 or normalized.startswith("/tmp/")
                 or normalized.startswith("/private/tmp/")):
-            return ("consult", "allow", "Home/temp directory write")
-        return ("consult", "ask", "Write outside safe paths")
+            return ("consult", "Home/temp directory write")
+        return ("consult", "Write outside safe paths")
 
     if tool == "WebFetch":
         result, reason = evaluate_web_fetch(tool_input)
         if result == "deny":
-            return ("deny", None, reason)
-        return ("consult", "allow", reason)
+            return ("deny", reason)
+        return ("consult", reason)
 
-    # MCP tools and any other tool type: consult the LLM; without it, ask.
-    return ("consult", "ask", f"Tool requires evaluation: {tool}")
+    # MCP tools and any other tool type: consult the LLM.
+    return ("consult", f"Tool requires evaluation: {tool}")
 
 
-def evaluate_bash_for_learning(command):
-    """Classify a bash command for the learner. See evaluate_for_learning.
+def classify_bash(command):
+    """Classify a bash command for the learner. See classify_request.
 
     A recursive delete of a protected folder is denied; one whose target leans
     on a possibly-empty variable is denied with a guarded rewrite (the LLM can
     only guess at what an unguarded variable holds); any other recursive
-    delete consults the LLM with a manual-prompt fallback, never approve+learn.
+    delete consults the LLM under the guard's reason.
     """
     # Same order as evaluate_bash: plain deny, rewrite, then the empty case.
     guard = protected_delete_check(command, pretool_safety.HOOK_CWD, empty_side=False)
     if guard and guard[0] == "deny":
-        return ("deny", None, guard[1])
+        return ("deny", guard[1])
     steer = unguarded_delete_check(command)
     if steer:
-        return ("deny", None, steer[1])
+        return ("deny", steer[1])
     guard = protected_delete_check(command, pretool_safety.HOOK_CWD)
     if guard and guard[0] == "deny":
-        return ("deny", None, guard[1])
-    verdict, fallback, reason = _bash_learning_rules(command)
+        return ("deny", guard[1])
+    verdict, reason = _bash_rules(command)
     if guard and verdict == "consult":
-        return ("consult", "ask", guard[1])
-    return (verdict, fallback, reason)
+        return ("consult", guard[1])
+    return (verdict, reason)
 
 
-def _bash_learning_rules(command):
-    """The pattern and allowlist rules behind evaluate_bash_for_learning."""
+def _bash_rules(command):
+    """The pattern and allowlist rules behind classify_bash."""
     if not command or not command.strip():
-        return ("ask", None, "Empty command")
+        return ("ask", "Empty command")
 
     # Dangerous patterns — deny (safety net, should have been caught upstream)
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, command):
-            return ("deny", None, "Blocked dangerous pattern")
+            return ("deny", "Blocked dangerous pattern")
 
     if _is_destructive_rm(command):
-        return ("deny", None, "Blocked destructive rm targeting /")
+        return ("deny", "Blocked destructive rm targeting /")
 
-    # Risky patterns — "confirm each time". Consult the LLM but the no-LLM
-    # fallback (and the cache-skip) is ask.
+    # Risky patterns — "confirm each time". Consult the LLM, but never cache
+    # its verdict (_reason_is_risky keys on this reason).
     for pattern in RISKY_PATTERNS:
         if re.search(pattern, command):
-            return ("consult", "ask", "Risky command pattern — confirm before running")
+            return ("consult", "Risky command pattern — confirm before running")
 
     # C9/H1: a Bash command that WRITES to a permission-config/state path is a
-    # self-escalation vector — definite ask (no LLM, no learn), mirroring the
+    # self-escalation vector — definite ask (no LLM), mirroring the
     # Write/Edit C9 guard. Reads of the same paths stay allowed.
     if bash_writes_to_config_path(command):
-        return ("ask", None, "Bash write to permission-config path")
+        return ("ask", "Bash write to permission-config path")
 
     # Split compound command and check each part
     commands, parse_uncertain = split_compound_command(command)
     commands = merge_case_blocks(commands)
 
     if not commands or parse_uncertain:
-        return ("ask", None, "Ambiguous parse — unbalanced quotes or incomplete heredoc")
+        return ("ask", "Ambiguous parse — unbalanced quotes or incomplete heredoc")
 
     # Collect defined functions so _check_inner_commands can trust calls to them
     defined_functions = set()
@@ -300,8 +278,8 @@ def _bash_learning_rules(command):
                 if inner_result:
                     decision, _r = inner_result
                     if decision == "deny":
-                        return ("deny", None, "Blocked dangerous pattern in compound block")
-                    return ("consult", "ask", "Unsafe command in compound block")
+                        return ("deny", "Blocked dangerous pattern in compound block")
+                    return ("consult", "Unsafe command in compound block")
             continue
 
         # Case blocks — check arm bodies
@@ -312,8 +290,8 @@ def _bash_learning_rules(command):
                 if inner_result:
                     decision, _r = inner_result
                     if decision == "deny":
-                        return ("deny", None, "Blocked dangerous pattern in compound block")
-                    return ("consult", "ask", "Unsafe command in compound block")
+                        return ("deny", "Blocked dangerous pattern in compound block")
+                    return ("consult", "Unsafe command in compound block")
             continue
 
         # Regular commands — interpreter exec + wrapper peeling, mirroring
@@ -323,12 +301,12 @@ def _bash_learning_rules(command):
         if first_word is None:
             stripped = cmd.lstrip()
             if stripped.startswith("$(") or stripped.startswith("`") or stripped.startswith("\\`"):
-                return ("consult", "ask", "Command substitution as command word")
+                return ("consult", "Command substitution as command word")
             continue
 
         basename = os.path.basename(first_word)
         if _has_interpreter_exec_flag(basename, cmd):
-            return ("consult", "ask", f"Inline interpreter execution: {basename}")
+            return ("consult", f"Inline interpreter execution: {basename}")
 
         # Peel transparent wrappers (env, timeout, nohup, …) and evaluate the
         # inner command — the wrapper must not hide a non-safe inner.
@@ -339,7 +317,7 @@ def _bash_learning_rules(command):
             if inner_first:
                 inner_basename = os.path.basename(inner_first)
                 if _has_interpreter_exec_flag(inner_basename, inner):
-                    return ("consult", "ask",
+                    return ("consult",
                             f"Inline interpreter execution via wrapper: {inner_basename}")
                 eff_first, eff_cmd = inner_first, inner
 
@@ -350,18 +328,18 @@ def _bash_learning_rules(command):
         eff_base = eff_base.lstrip("\\")
 
         # M1: a variable/indirect command word ($DOCKER, ${X}, $'docker') is
-        # inherently unknown — C0's literal-basename match can't classify it, so
-        # never blanket-approve. Mirror the $()/backtick handling above.
+        # inherently unknown — C0's literal-basename match can't classify it.
+        # Mirror the $()/backtick handling above.
         if first_word.startswith("$") or (eff_first and eff_first.startswith("$")):
-            return ("consult", "ask", "Variable/indirect command word")
+            return ("consult", "Variable/indirect command word")
 
         # H4(c): a meta-execution builtin (eval/exec/source/./command) runs its
-        # arguments as a command, hiding the real family behind it. Never
-        # unknown-allow — consult/ask. Check the raw first word too, since
-        # eval/source/. are not peeled as transparent wrappers.
+        # arguments as a command, hiding the real family behind it. Check the
+        # raw first word too, since eval/source/. are not peeled as
+        # transparent wrappers.
         if (basename.lstrip("\\") in _META_EXEC_BUILTINS
                 or eff_base in _META_EXEC_BUILTINS):
-            return ("consult", "ask", "Meta-execution command word")
+            return ("consult", "Meta-execution command word")
 
         # Explicitly safe (incl. user single-word override) — short-circuit
         # before the restricted-base check.
@@ -369,22 +347,20 @@ def _bash_learning_rules(command):
             continue
 
         # M2: a transparent wrapper (env/timeout/nohup/…) hid a NON-safe inner
-        # command — restore the old conservative guard. Bare unwrapped unknowns
-        # keep their historic consult/allow; only the WRAPPED case re-tightens
-        # to ask (e.g. `env evil-tool --wipe` → ask, not blanket-approve).
+        # command (e.g. `env evil-tool --wipe`).
         if inner != cmd:
-            return ("consult", "ask", f"Wrapped non-safe command: {eff_base}")
+            return ("consult", f"Wrapped non-safe command: {eff_base}")
 
         # C0: a restricted command family (docker/npm/gh/… with only
-        # multi-word entries) is NOT a plain unknown — never blanket-approve.
+        # multi-word entries) is NOT a plain unknown.
         if is_restricted_base(eff_base):
             restricted_found = True
 
     if restricted_found:
-        return ("consult", "ask", "Restricted command family — LLM or manual approval")
+        return ("consult", "Restricted command family — LLM or manual approval")
 
-    # Plain unknown Bash — consult; without an LLM, approve + learn (historic).
-    return ("consult", "allow", "Unknown command")
+    # Plain unknown Bash — consult the LLM; without one, the human.
+    return ("consult", "Unknown command")
 
 
 if __name__ == "__main__":

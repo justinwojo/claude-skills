@@ -33,18 +33,21 @@ Read the JSONL (one JSON object per line). Each record has these fields:
 | `tool` | tool name (`Bash`, `Write`, `WebFetch`, `mcp__…`, …) |
 | `input` | the tool input, truncated to 500 chars (command / path / url) |
 | `decision` | `allow`, `deny`, or `ask` |
-| `source` | `rule`, `llm`, `llm-cache`, or `learner` |
+| `source` | `rule`, `llm`, `llm-cache`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules) |
 | `reason` | human-readable decision reason |
 | `duration_ms` | hook wall-clock time (optional) |
 | `llm_ms` | LLM round-trip time, when an LLM was called (optional) |
-| `learned` | list of entries persisted to the config, when any (optional) |
+| `rule_reason` | why the local rules punted to the LLM, when it differs from `reason` (optional) |
+| `learned` | entries persisted to the config — only in records from versions before auto-learning was retired (optional) |
 
 Use a quick Bash/jq (or `python3`) pass to compute totals. Example:
 
 ```bash
 LOG="$HOME/.claude/hooks/smart-permissions-decisions.jsonl"
 python3 - "$LOG" <<'PY'
-import sys, json, collections
+import sys, json, collections, os
+if os.environ.get("SAFETY_HOOK_AUTO_LEARN"):
+    print("Note: SAFETY_HOOK_AUTO_LEARN is retired and ignored; remove it from your shell config.")
 recs = []
 try:
     with open(sys.argv[1]) as f:
@@ -60,7 +63,8 @@ learned = [e for r in recs for e in (r.get("learned") or [])]
 print(f"Total decisions: {len(recs)}")
 print("By decision:", dict(by_dec))
 print("By source:", dict(by_src))
-print(f"Entries learned: {len(learned)}")
+if learned:
+    print(f"Entries learned by the retired auto-learner: {len(learned)}")
 # Most-asked / most-denied inputs
 asks = collections.Counter(r.get("input") for r in recs if r.get("decision") == "ask")
 denies = collections.Counter(r.get("input") for r in recs if r.get("decision") == "deny")
@@ -83,8 +87,12 @@ Show the user:
    candidates to add to `safe_commands` (or configure LLM evaluation for).
 3. **What's being denied** — the most frequent `deny` inputs, so the user can
    spot anything unexpected.
-4. **Recently learned** — the last several `learned` entries and where they went
-   (`safe_commands`, `safe_write_paths`, `allowed_web_domains`, `safe_mcp_tools`).
+4. **Retired auto-learn** — the plugin no longer writes approvals to the config.
+   If the log still has `learned` entries (from older versions), list the last
+   several so the user can review or prune them in their config. If
+   `SAFETY_HOOK_AUTO_LEARN` is set in the environment or the config has
+   `auto_learn_mcp_tools` or `never_learn_commands`, mention once that the
+   setting is retired and ignored.
 5. If an LLM is configured, note the average `llm_ms` and how many decisions were
    served from the cache (`source: llm-cache`) versus a live call (`source: llm`).
 

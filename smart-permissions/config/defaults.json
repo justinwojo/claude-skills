@@ -272,7 +272,7 @@
     "/.env"
   ],
 
-  "__ always_ask_write_paths __": "Permission-config files: Write/Edit always prompts (never auto-allow, never learn, never LLM-vouch) even when the parent is a safe_write_path. Substring match. NOT subtractable via remove_from_defaults.",
+  "__ always_ask_write_paths __": "Permission-config files: Write/Edit always prompts (never auto-allow, never LLM-vouch) even when the parent is a safe_write_path. Substring match. NOT subtractable via remove_from_defaults.",
   "always_ask_write_paths": [
     "smart-permissions-config.json",
     "smart-permissions-llm-cache",
@@ -284,14 +284,6 @@
 
   "__ protected_delete_paths __": "Folders a recursive rm may never delete, nor anything above them. Denied locally, never sent to the LLM. Globs expand against the disk; '~/*' covers every top-level folder in home (Dev, Desktop, Documents, Library, .ssh, ...). Add '~/Dev/*' to protect each project root too.",
   "protected_delete_paths": ["~", "~/*"],
-
-  "__ never_learn_commands __": "First words never persisted to the allowlist regardless of family logic. They can still be LLM-approved per call.",
-  "never_learn_commands": [
-    "rm", "mv", "dd", "sudo", "chmod", "chown", "kill", "pkill",
-    "curl", "wget", "ssh", "scp", "eval", "exec", "source", "command",
-    "bash", "sh", "zsh", "fish", "python", "python3", "perl", "ruby",
-    "node", "deno", "osascript"
-  ],
 
   "dangerous_patterns": [
     "\\bsudo\\b",
@@ -340,6 +332,5 @@
   "__ Behavior toggles (scalars — replaced, not merged) __": "",
   "decision_log": true,
   "llm_cache": true,
-  "llm_cache_ttl_days": 7,
-  "auto_learn_mcp_tools": true
+  "llm_cache_ttl_days": 7
 }

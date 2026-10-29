@@ -27,6 +27,15 @@ echo "SAFETY_HOOK_AUTO_LEARN=${SAFETY_HOOK_AUTO_LEARN:-(not set)}"
 
 Present a summary of the current state to the user before proceeding.
 
+**Retired settings.** The plugin no longer learns approvals into the config. If
+`SAFETY_HOOK_AUTO_LEARN` is set, or the config has `auto_learn_mcp_tools` or
+`never_learn_commands`, tell the user once that the setting is retired and ignored,
+and that they can delete it (the env var from their shell config, which you do not
+edit; the keys from the config file, which you remove only if they say so). Entries
+earlier versions learned stay in `safe_commands`, `safe_write_paths`,
+`allowed_web_domains` and `safe_mcp_tools` as ordinary config. Offer to review them
+with the user and prune any they no longer want; never drop one without asking.
+
 ## Step 2: LLM Safety Evaluation
 
 Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
@@ -49,7 +58,7 @@ Use AskUserQuestion to ask if they want to configure LLM fallback evaluation:
     },
     {
       "label": "No, skip LLM evaluation",
-      "description": "Unknown-but-safe commands are still auto-approved and learned by the PermissionRequest hook; restricted families (docker/npm/gh/…), MCP tools, and permission-config writes show the standard prompt"
+      "description": "Anything the local rules can't settle (unknown commands, writes outside safe paths, new web domains, MCP tools) shows the standard Claude permission prompt"
     }
   ]
 }
@@ -102,31 +111,7 @@ Do NOT edit their shell config files — just show them what to add to `~/.zshrc
 
 If they chose a provider and the relevant API key is already set, confirm it's working.
 
-## Step 3: Auto-Learn
-
-Only show this step if they enabled LLM evaluation in step 2.
-
-Use AskUserQuestion:
-
-```json
-{
-  "question": "Do you want the plugin to auto-learn commands approved by the LLM?",
-  "options": [
-    {
-      "label": "Yes, enable auto-learn",
-      "description": "LLM-approved commands are saved to your config so they're instant next time"
-    },
-    {
-      "label": "No, don't auto-learn",
-      "description": "The LLM evaluates each time but doesn't persist decisions"
-    }
-  ]
-}
-```
-
-If they enable it, tell them to add `export SAFETY_HOOK_AUTO_LEARN=true` to their shell config.
-
-## Step 4: Safe Commands
+## Step 3: Safe Commands
 
 Show them the current `safe_commands` list from their config (if any) and the defaults.
 
@@ -155,7 +140,7 @@ Use AskUserQuestion:
 
 If yes, ask them to list the commands they want to add (free-form text input). Then update their `~/.claude/smart-permissions-config.json` file, merging into the existing `safe_commands` array without duplicating entries already present.
 
-## Step 5: Safe Write Paths
+## Step 4: Safe Write Paths
 
 Show them the current `safe_write_paths` from defaults and their config.
 
@@ -179,7 +164,7 @@ Use AskUserQuestion:
 
 If yes, ask for directories. Paths should end with `/` and can use `~/`. Update the config file.
 
-## Step 6: MCP Tool Permissions
+## Step 5: MCP Tool Permissions
 
 Use AskUserQuestion:
 
@@ -210,16 +195,16 @@ If yes:
 3. Ask which patterns they want to add.
 4. Update `safe_mcp_tools` in the config file.
 
-Also mention: when LLM evaluation + auto-learn are enabled, MCP tools approved by
-the LLM are auto-learned by their **exact** name (never a wildcard). To disable
-that and rely only on the patterns above, set `"auto_learn_mcp_tools": false` in
-the config.
+Also mention: MCP tools that match no pattern go to the LLM (if configured) on
+each call, and to the standard prompt otherwise. The plugin never saves
+approvals, so these patterns are its only way to pre-approve an MCP tool
+(Claude's own "Always allow" and `permissions.allow` still work as usual).
 
-## Step 7: Review Existing settings.json Permissions
+## Step 6: Review Existing settings.json Permissions
 
 Look at their `permissions.allow` entries in `~/.claude/settings.json`. If they have many `Bash(cmd:*)` entries that overlap with the plugin's `safe_commands` defaults, mention that the plugin handles these automatically and they could optionally clean up the redundant entries from settings.json. Do NOT remove them automatically — just inform them.
 
-## Step 8: Summary
+## Step 7: Summary
 
 Show a summary of everything configured:
 
@@ -227,7 +212,6 @@ Show a summary of everything configured:
 ## Smart Permissions Setup Complete
 
 **LLM Evaluation:** {enabled/disabled} ({provider})
-**Auto-Learn:** {enabled/disabled}
 **Safe Commands:** {count} custom + {count} defaults
 **Safe Write Paths:** {count} custom + {count} defaults
 **MCP Tool Patterns:** {count} patterns

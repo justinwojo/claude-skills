@@ -35,7 +35,6 @@ import shlex
 import time
 import threading
 import hashlib
-import shutil
 import glob
 import itertools
 from fnmatch import fnmatch
@@ -84,7 +83,7 @@ SUBTRACTABLE_KEYS = frozenset({
 # control, never erase it. This also subsumes the old non-list import crash.
 _SAFETY_LIST_KEYS = frozenset({
     "dangerous_patterns", "risky_patterns", "sensitive_paths",
-    "always_ask_write_paths", "never_learn_commands", "safe_internal_tools",
+    "always_ask_write_paths", "safe_internal_tools",
     "safe_commands", "safe_write_paths", "safe_script_paths",
     "allowed_web_domains", "safe_mcp_tools", "protected_delete_paths",
 })
@@ -105,8 +104,7 @@ def load_config():
         restricted-family set so user config can never demote a shipped
         multi-word family back to unknown-allow.
       - removals: the user's remove_from_defaults map (allowlist keys only),
-        used by C0 (subtracted safe_commands bases stay restricted) and by
-        learn_to_config (never re-add an entry the user explicitly removed).
+        used by C0 (subtracted safe_commands bases stay restricted).
     """
     # Load defaults
     defaults_ok = True
@@ -265,7 +263,7 @@ def _strip_comments(items):
 _CONFIG, _DEFAULTS_SAFE_COMMANDS, _REMOVALS, _DEFAULTS_OK = load_config()
 
 # their-M1: if the shipped defaults failed to load, all safety lists are empty.
-# A permission hook must FAIL CLOSED — evaluate()/evaluate_for_learning() return
+# A permission hook must FAIL CLOSED — evaluate()/classify_request() return
 # ask for everything rather than blanket-allowing with no guards.
 _FAIL_CLOSED = not _DEFAULTS_OK
 
@@ -312,13 +310,10 @@ if _reserved_attempt:
 SAFE_INTERNAL_TOOLS = _configured_internal - RESERVED_TOOLS
 
 # Permission-config paths that must always prompt (never auto-allow, never
-# learn) even when their parent is a safe_write_path — self-escalation guard.
+# LLM-vouched) even when their parent is a safe_write_path — self-escalation guard.
 ALWAYS_ASK_WRITE_PATHS = _strip_comments(_CONFIG.get("always_ask_write_paths"))
 DANGEROUS_PATTERNS = _strip_comments(_CONFIG.get("dangerous_patterns"))
 RISKY_PATTERNS = _strip_comments(_CONFIG.get("risky_patterns"))
-# Commands never persisted to the allowlist regardless of family logic
-# (they can still be LLM-approved per-call — just never made permanent).
-NEVER_LEARN_COMMANDS = set(_strip_comments(_CONFIG.get("never_learn_commands")))
 # Folders a recursive rm may never delete, or delete anything above. Globs are
 # expanded against the filesystem at check time (see protected_delete_check).
 PROTECTED_DELETE_PATHS = [
@@ -342,8 +337,9 @@ INTERPRETER_EXEC_FLAGS = {
 # ============================================================
 # A "restricted base" is a command whose destructive subcommands are gated:
 # it appears only as multi-word/wildcard safe_commands entries, never as a
-# bare single-word entry. The learner must never treat such a base as a
-# plain unknown (which would blanket-approve `docker run`, `npm publish`, …).
+# bare single-word entry. The learner classifies such a base apart from a
+# plain unknown (`docker run`, `npm publish`, …), so the log says why the
+# call went to the LLM or the human.
 
 def _restricted_first_word(entry):
     """First real word of a multi-word/wildcard safe_commands entry.
@@ -389,15 +385,10 @@ def _compute_restricted_bases(safe_commands):
 #     means "ask me", never "unknown → allow".
 #
 # The plan's third component — "merged-multi-only", any live-config base
-# appearing only as multi-word entries — was DROPPED. In the merged config a
-# self-learned 2-word entry (e.g. "foo bar", persisted by _auto_learn) is
-# structurally identical to a hand-authored multi-only family, so including it
-# made the learner poison its own future learning: once "foo bar" was learned,
-# "foo" became restricted and every sibling subcommand ("foo baz") stopped
-# learning and asked forever (no-LLM). Since the defaults component already
-# covers all shipped-dangerous families subtraction-proof, dropping merged-
-# multi-only costs only novel user-hand-authored multi-only families (rare,
-# and indistinguishable from accumulation) while restoring sibling learning.
+# appearing only as multi-word entries — was DROPPED: in the merged config an
+# entry the retired learning feature wrote ("foo bar") looks exactly like a
+# hand-authored multi-only family. The defaults component already covers
+# every shipped-dangerous family subtraction-proof.
 _DEFAULTS_RESTRICTED = _compute_restricted_bases(
     _strip_comments(_DEFAULTS_SAFE_COMMANDS))
 _SUBTRACTED_FIRST_WORDS = set()
@@ -408,10 +399,9 @@ for _entry in _REMOVALS.get("safe_commands", []):
 RESTRICTED_BASES = _DEFAULTS_RESTRICTED | _SUBTRACTED_FIRST_WORDS
 # Case-folded view for matching (FIX 2): on a case-insensitive filesystem
 # (macOS APFS default), `Docker`/`DOCKER` resolve to and execute the real
-# `docker` binary, so an exact-case check let the learner auto-allow a
-# restricted family. Fold to lower — this only ever makes the guard match
-# MORE (fail-closed); a differently-cased name that ISN'T the real binary is
-# simply asked instead of blanket-approved.
+# `docker` binary, so an exact-case check misfiled a restricted family as a
+# plain unknown. Fold to lower — this only ever makes the guard match MORE
+# (fail-closed).
 _RESTRICTED_BASES_LOWER = frozenset(b.lower() for b in RESTRICTED_BASES)
 
 
@@ -420,8 +410,8 @@ def is_restricted_base(basename):
 
     Consulted only for commands not already matched as safe — an explicit
     single-word allowlist entry short-circuits before this check. Case-folded
-    so a cased variant (`Docker`) can't slip a restricted family past the
-    learner's no-LLM path on a case-insensitive filesystem.
+    so a cased variant (`Docker`) is still recognized on a case-insensitive
+    filesystem.
     """
     return isinstance(basename, str) and basename.lower() in _RESTRICTED_BASES_LOWER
 
@@ -456,10 +446,6 @@ LLM_CACHE_MAX_ENTRIES = 500
 # the human instead of paying for (and possibly overruling) a third opinion.
 LLM_FLAG_PATH = os.path.join(_HOOK_STATE_DIR, "smart-permissions-llm-flags.json")
 LLM_FLAG_TTL_S = 300
-
-# Persist exact MCP tool names to safe_mcp_tools on approval (C2). Gate lets
-# users restore the previous "MCP tools are never auto-learned" behavior.
-AUTO_LEARN_MCP_TOOLS = bool(_CONFIG.get("auto_learn_mcp_tools", True))
 
 # M3: relocated state files must be covered by the C9 self-escalation guard.
 # If the user moved the config, log, or cache off the default paths (via
@@ -533,12 +519,7 @@ LLM_RECHECK_MIN_S = 3
 # at 30s (a manual prompt), so this leaves headroom for startup + logging.
 LLM_PRETOOL_BUDGET_S = 24
 
-# When true, commands/paths/domains approved by the LLM are automatically
-# added to ~/.claude/smart-permissions-config.json so they're auto-allowed
-# next time without an LLM call. Set to "true" to enable.
-AUTO_LEARN = os.environ.get("SAFETY_HOOK_AUTO_LEARN", "").lower() in ("true", "1", "yes")
-
-# Enable verbose logging to stderr (LLM approved/denied, auto-learn events).
+# Enable verbose logging to stderr (LLM approved/flagged/rechecked).
 # Errors and unparseable responses always log regardless of this flag.
 DEBUG = os.environ.get("SAFETY_HOOK_DEBUG", "").lower() in ("true", "1", "yes")
 
@@ -731,7 +712,7 @@ def _decision_log_input(tool, tool_input):
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,
-                 duration_ms=None, llm_ms=None, learned=None, rule_reason=None):
+                 duration_ms=None, llm_ms=None, rule_reason=None):
     """Append one JSONL record describing a permission decision.
 
     Best-effort: never raises, never blocks the hook (blanket guard like
@@ -756,8 +737,6 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
             record["duration_ms"] = duration_ms
         if llm_ms is not None:
             record["llm_ms"] = llm_ms
-        if learned:
-            record["learned"] = learned
         # Why the rules punted to the LLM — the LLM's own reason replaces it
         if rule_reason and rule_reason != reason:
             record["rule_reason"] = rule_reason
@@ -998,91 +977,6 @@ def llm_is_configured():
     return bool(LLM_API_KEY and LLM_API_URL and LLM_MODEL)
 
 
-def learn_to_config(key, value):
-    """Add a value to the user's config file for future auto-approval.
-
-    Reads ~/.claude/smart-permissions-config.json, appends `value` to the
-    array at `key` (creating both if needed), and writes back. Silently
-    no-ops on any error to avoid blocking tool execution. Returns True if
-    the value was newly persisted, False otherwise.
-
-    Never re-adds an entry the user explicitly subtracted via
-    remove_from_defaults[key] — an explicit removal must not be undone by
-    self-learning (C6).
-    """
-    try:
-        # Read existing config
-        try:
-            with open(USER_CONFIG_PATH, "r") as f:
-                user_config = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            user_config = {}
-
-        # Respect an explicit user subtraction — don't re-learn it.
-        removals = user_config.get("remove_from_defaults", {})
-        if isinstance(removals, dict) and value in (removals.get(key) or []):
-            return False
-
-        # Ensure array exists
-        if key not in user_config or not isinstance(user_config[key], list):
-            user_config[key] = []
-
-        # Don't duplicate
-        if value in user_config[key]:
-            return False
-
-        user_config[key].append(value)
-
-        # Write back (atomic via temp file)
-        os.makedirs(os.path.dirname(USER_CONFIG_PATH), exist_ok=True)
-        tmp_path = USER_CONFIG_PATH + ".tmp"
-        with open(tmp_path, "w") as f:
-            json.dump(user_config, f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, USER_CONFIG_PATH)
-
-        if DEBUG:
-            print(f"Learned: {key} += {value!r}", file=sys.stderr)
-        return True
-    except OSError as e:
-        print(f"Could not save to config: {e}", file=sys.stderr)
-        return False
-
-
-_LEARNABLE_WORD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
-_LEARNABLE_WORD_MAX_LEN = 64
-
-
-def _is_learnable_word(word):
-    """Reject words that aren't clean command/subcommand identifiers.
-
-    Auto-learn must never persist tokens like $VAR, DEPS+=("...", weird"
-    fragments, or heredoc body words. We require strict identifier shape:
-    leading letter/underscore, then letters/digits/_/./- only. Excessively
-    long tokens are also rejected — a 200-char identifier may match the
-    regex but is almost certainly heredoc/log content rather than a real
-    command name.
-    """
-    if not word or len(word) > _LEARNABLE_WORD_MAX_LEN:
-        return False
-    return bool(_LEARNABLE_WORD_RE.match(word))
-
-
-_LEARNABLE_MCP_RE = re.compile(r"^mcp__[A-Za-z0-9_.\-]+__[A-Za-z0-9_.\-]+$")
-
-
-def _is_learnable_mcp_tool(tool):
-    """Reject MCP tool names that aren't clean, wildcard-free identifiers.
-
-    Auto-learn persists the EXACT tool name (never a glob), so anything with
-    a '*'/'?' or odd shape is refused — a learned pattern must not broaden
-    scope beyond the single tool that was approved.
-    """
-    if not tool or "*" in tool or "?" in tool or len(tool) > 200:
-        return False
-    return bool(_LEARNABLE_MCP_RE.match(tool))
-
-
 def _normalize_flag_token(token):
     """Strip quoting wrappers from a token for flag matching.
 
@@ -1106,7 +1000,7 @@ _INTERPRETER_WRAPPERS = frozenset({
 
 # H4: meta-execution builtins run their argument list as a command, so the
 # real command family hides behind them (`eval docker run`, `source x`). The
-# learner's no-LLM path must treat these as consult/ask, never unknown-allow.
+# learner treats these as their own class, never a plain unknown.
 # (exec/command are also peeled as wrappers above; eval/source/. are not.)
 _META_EXEC_BUILTINS = frozenset({"eval", "exec", "source", ".", "command"})
 
@@ -1441,146 +1335,6 @@ def _is_safe_inline_python(basename, cmd, outer=None):
     return _safe_python_code(tokens[idx + 1])
 
 
-def _contains_inline_interpreter(command):
-    """True if the command invokes an inline interpreter (bash -c, python -c).
-
-    When this is true, auto-learn must skip the entire command — the
-    splitter can't reliably tokenize the contents of the -c string, and
-    naive splits would persist heredoc/script fragments as 'commands'.
-    """
-    if not command or not command.strip():
-        return False
-    parts, _ = split_compound_command(command)
-    for cmd in parts:
-        first_word = get_first_command_word(cmd)
-        if not first_word:
-            continue
-        basename = os.path.basename(first_word)
-        if _has_interpreter_exec_flag(basename, cmd):
-            return True
-        # Also check through transparent wrappers (env, timeout, nohup, …)
-        inner = _resolve_through_wrappers(cmd)
-        if inner != cmd:
-            inner_first = get_first_command_word(inner)
-            if inner_first:
-                inner_basename = os.path.basename(inner_first)
-                if _has_interpreter_exec_flag(inner_basename, inner):
-                    return True
-    return False
-
-
-def _auto_learn(tool, tool_input):
-    """Determine what to learn from an approved tool call and persist it.
-
-    Returns a list of entries actually persisted (for the decision log's
-    `learned` field); empty list when nothing new was learned.
-    """
-    learned = []
-    if tool == "Bash":
-        command = tool_input.get("command", "")
-        # Inline interpreter (bash -c, python -c, etc.) — the contents
-        # of the -c string can't be reliably tokenized as shell, so any
-        # words we'd extract are likely fragments (heredoc text, embedded
-        # script, regex). Skip auto-learn entirely for these.
-        if _contains_inline_interpreter(command):
-            return learned
-        commands, uncertain = split_compound_command(command)
-        # Parser hit unbalanced quotes / incomplete heredoc — extracted
-        # words can't be trusted, don't persist anything.
-        if uncertain:
-            return learned
-        for cmd in commands:
-            # Extract up to 3 words so we can DETECT (and reject) 3+ word
-            # commands without persisting them. If we extracted with
-            # max_words=2 and the input was actually 3-word, we'd
-            # silently truncate to a 2-word entry that broadens scope
-            # (approving "foo bar baz" should NOT auto-allow "foo bar
-            # destructive"). Three-word patterns (docker compose up,
-            # gh pr list) belong in defaults.json wildcards instead.
-            words = get_command_words(cmd, max_words=3, flag_handling="stop")
-            if not words:
-                continue
-            basename = os.path.basename(words[0])
-            # Skip wrapper-prefixed forms (env kubectl, timeout ls, …) —
-            # learning them would broaden scope (`nohup kubectl` then
-            # auto-allows `nohup kubectl delete`). The inner command
-            # should be learned on its own merits via a non-wrapped run.
-            if basename in _INTERPRETER_WRAPPERS:
-                continue
-            # If the base command is already approved (single-word), skip
-            if basename in SAFE_COMMANDS or words[0] in SAFE_COMMANDS:
-                continue
-            # Already covered by a multi-word entry (exact or wildcard)?
-            if matches_safe_command(words[0], cmd):
-                continue
-            # Safety: never learn a single-word base command — if we only
-            # extracted 1 word it may be because flags obscured the real
-            # subcommand, and learning the base command would blanket-approve
-            # all subcommands including dangerous ones.
-            if len(words) < 2:
-                continue
-            # Refuse to learn 3+ word commands. Truncating to 2 would
-            # broaden scope; the user (or defaults.json) should add the
-            # full pattern explicitly. Also catches prose-shaped 3-word
-            # fragments from misparsed heredocs.
-            if len(words) > 2:
-                continue
-            # Reject anything that doesn't look like a clean command +
-            # subcommand chain. Catches $VAR-prefixed, +=array assignments,
-            # quoted heredoc fragments, words with punctuation.
-            if not _is_learnable_word(basename):
-                continue
-            if not all(_is_learnable_word(w) for w in words[1:]):
-                continue
-            # C3: reject a subcommand shaped like a filename (extension tail).
-            # "pdfinfo px1_check.pdf" dies; "docker compose"/"flutter doctor"
-            # are unaffected. Collateral: version-shaped words like "v1.2".
-            if re.search(r"\.[A-Za-z0-9]{1,5}$", words[1]):
-                continue
-            # C0: never persist a restricted family (npm publish, docker run,
-            # …) or an explicitly never-learn command — these can still be
-            # LLM-approved per call, they just can't become permanent.
-            if basename in NEVER_LEARN_COMMANDS or is_restricted_base(basename):
-                continue
-            # Only persist real executables. Misparsed script text (`import
-            # json`, `var testModule`) and shell functions defined in the same
-            # command (`chk before`) aren't on PATH — they can still be
-            # LLM-approved per call, they just never become permanent entries.
-            if shutil.which(words[0]) is None:
-                continue
-            to_learn = " ".join([basename] + words[1:])
-            if learn_to_config("safe_commands", to_learn):
-                learned.append(to_learn)
-    elif tool in ("Write", "Edit", "NotebookEdit"):
-        path = tool_input.get("file_path", "") or tool_input.get("notebook_path", "")
-        # C9: never learn a parent that would cover a permission-config file.
-        if path and not is_always_ask_write_path(path):
-            # Learn the parent directory (not the specific file)
-            parent = os.path.dirname(os.path.realpath(os.path.expanduser(path)))
-            if not parent.endswith("/"):
-                parent += "/"
-            # Collapse home dir back to ~/
-            if parent.startswith(HOME_DIR):
-                parent = "~" + parent[len(HOME_DIR):]
-            if learn_to_config("safe_write_paths", parent):
-                learned.append(parent)
-    elif tool == "WebFetch":
-        url = tool_input.get("url", "")
-        try:
-            hostname = urlparse(url).hostname or ""
-            if hostname and learn_to_config("allowed_web_domains", hostname):
-                learned.append(hostname)
-        except Exception:
-            pass
-    elif tool.startswith("mcp__"):
-        # C2: persist the EXACT MCP tool name (never a wildcard) on approval,
-        # gated by auto_learn_mcp_tools (default true).
-        if AUTO_LEARN_MCP_TOOLS and _is_learnable_mcp_tool(tool):
-            if learn_to_config("safe_mcp_tools", tool):
-                learned.append(tool)
-    return learned
-
-
 def _extract_json_decision(content):
     """Extract a {"safe": bool} decision from LLM response content.
 
@@ -1836,10 +1590,8 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, cacheable=True,
     and write (an LLM override on a "confirm each time" call must not stick).
     `context` (build_llm_context) is prepended to the tool call.
 
-    Auto-learn is intentionally NOT performed here — callers decide whether
-    to learn (PreToolUse/learner gate on SAFETY_HOOK_AUTO_LEARN; a cache hit
-    never learns). Only first-pass allows are written to the cache; a
-    recheck allow was borderline by definition and stays uncached.
+    Only first-pass allows are written to the cache; a recheck allow was
+    borderline by definition and stays uncached.
     """
     # H5: the LLM env gate comes FIRST. The cache stores LLM allow decisions;
     # consulting it when no LLM is configured would let a planted or stale entry
@@ -1930,13 +1682,12 @@ def main():
     decision, reason = evaluate(tool, tool_input)
     source = "rule"
     llm_ms = None
-    learned = None
     rule_reason = None
 
     # If local rules can't decide, hand off to LLM (if configured). Skip the
     # cache for risky-class asks — an LLM override there must not become sticky.
     if decision == "ask":
-        # C9: permission-config writes NEVER consult the LLM (and never learn)
+        # C9: permission-config writes NEVER consult the LLM
         # — an LLM cannot vouch for an edit to the hook's own permission rules.
         # Mirrors the learner, which routes these to a definite "ask".
         if tool in ("Write", "Edit", "NotebookEdit"):
@@ -1957,10 +1708,6 @@ def main():
             context=build_llm_context(input_data))
         source = info["source"]
         llm_ms = info.get("llm_ms")
-        # Auto-learn only on a live first-pass LLM allow (never on a cache hit
-        # or a recheck) and only when SAFETY_HOOK_AUTO_LEARN is set.
-        if decision == "allow" and source == "llm" and AUTO_LEARN:
-            learned = _auto_learn(tool, tool_input)
         # Both passes flagged it: put it in front of the human explicitly.
         # A silent exit would hand it to auto mode's classifier instead.
         if info.get("flagged"):
@@ -1982,7 +1729,7 @@ def main():
         sys.exit(0)
 
     log_decision("pretool", tool, tool_input, decision, source, reason,
-                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, learned=learned,
+                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
                  rule_reason=rule_reason)
     output_decision(decision, reason)
 
@@ -2067,7 +1814,7 @@ def is_always_ask_write_path(file_path):
     """True if a Write/Edit target is a permission-config file (C9).
 
     Substring match like sensitive_paths. These must always prompt — never
-    auto-allow, never learn, never LLM-vouch — even when their parent is a
+    auto-allow, never LLM-vouch — even when their parent is a
     safe_write_path, so the agent cannot rewrite its own permission rules.
     """
     if not file_path:
@@ -5414,7 +5161,7 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
     is encountered while scanning for subcommand words:
 
     - "stop" (default): Stop scanning at the first flag. Only immediately
-      adjacent subcommand words are returned.  Safe for auto-learning.
+      adjacent subcommand words are returned.
     - "skip": Skip the flag but continue scanning. Handles boolean flags
       before subcommands (e.g. "docker --verbose build" → ["docker", "build"]).
     - "skip_with_value": Skip the flag AND the next token (presumed flag
@@ -5422,11 +5169,9 @@ def get_command_words(cmd, max_words=2, flag_handling="stop"):
       prod build" → ["docker", "build"]).
     - "include": Treat the flag itself as a subcommand word. Handles tools
       where the "subcommand" is really a flag (e.g. "spctl --status",
-      "codesign --verify ..."). Only used by matches_safe_command — never
-      by auto-learn (we don't want to persist flag forms).
+      "codesign --verify ..."). Only used by matches_safe_command.
 
-    matches_safe_command tries all four modes for matching; _auto_learn
-    uses only "stop" to avoid persisting ambiguous extractions.
+    matches_safe_command tries all four modes for matching.
     """
     if not cmd:
         return []
