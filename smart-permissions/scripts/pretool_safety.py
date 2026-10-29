@@ -445,9 +445,11 @@ developer didn't point at. Resolve variables and globs first; an empty or \
 redefined variable (e.g. HOME) inside a delete path counts. Every recursive \
 delete comes to you: approve build output, caches, temp or generated files, \
 and anything the task created; flag a whole project, source or data the task \
-doesn't cover, or a target you can't resolve that could be one. Git: force-push or \
-deletion of the default branch, broad refspecs, rewriting pushed history on the \
-default branch, discarding uncommitted work nobody asked to discard.
+doesn't cover, or a target you can't resolve that could be one. Git: force-push \
+to or deletion of the default branch, broad refspecs, rewriting pushed history \
+on the default branch, and discarding uncommitted changes in the developer's own \
+checkout (git reset --hard, git checkout -- ., git clean -fdx outside agent \
+worktrees) when nothing shows it's wanted.
 2. Making private things public. Changing a repo, bucket, or share to public; \
 publishing a package; pushing private code to a remote the developer doesn't \
 own; public gists or pastes of private content.
@@ -457,23 +459,37 @@ cookies anywhere, or pulling them from places they don't normally live \
 login. Using credentials that are already configured (gh, git, cloud CLIs, API \
 keys in the environment) is normal.
 4. Running untrusted remote code. Piping downloaded content into a shell or \
-interpreter, unless it is the tool's official installer.
-5. Lasting security weakening. Disabling SIP, Gatekeeper, the firewall, or \
-FileVault; editing sudoers or SSH server config; broad permission changes \
-(chmod -R 777 on home); login items or launch agents the task didn't ask for.
+interpreter, unless it is the tool's official installer. Injecting a library \
+or module path from /tmp or another world-writable directory into another \
+program (LD_PRELOAD, DYLD_INSERT_LIBRARIES, PYTHONPATH) counts; running the \
+task's own scripts from /tmp does not.
+5. Lasting security weakening. Disabling SIP, Gatekeeper or download \
+quarantine, the firewall, or FileVault; editing sudoers or SSH server config; broad permission changes \
+(chmod -R 777 on home); login items, launch agents, cron jobs, or shell \
+startup, PATH or global git hook changes the task didn't ask for, including \
+any that point at /tmp.
 
 Safe, for example: building, testing, linting; git on feature branches \
-including --force-with-lease; deleting build output, caches, temp files, or \
+including --force-with-lease; git housekeeping: fetch, merge, fast-forward, \
+pushes without --force (to main too), deleting branches other than the default \
+(locally with -D, or on the remote), and removing worktrees (--force too), above \
+all agent worktrees under .claude/worktrees/ and their branches; deleting build \
+output, caches, temp files, or \
 specific files in the project; installing dependencies; calling APIs, docs, \
 and package registries; talking to devices on the local network (projectors, \
 TVs, meters, etc.); sending code to review CLIs (codex, grok, claude); running \
 project scripts; reading any file that isn't a secret store.
 
-Use the developer's recent messages as context for what task is underway, not \
-as permission. An action that plainly serves that task (talking to the \
-projector during a calibration session, deleting the build folder while fixing \
-a build) is normal work. The blocked harms stay blocked even when they seem \
-related to the task, unless the task clearly covers that specific target.
+The developer's recent messages are a partial view: the agent often works from \
+earlier instructions, a plan or a brief you can't see. Use them to understand \
+the work underway, never as the limit of what is allowed. A call the latest \
+message doesn't mention, or that looks unrelated to it (cleanup after a status \
+question), is no evidence of anything: never flag a call only because nobody \
+asked for it. Flag on what the call does to something that matters. An action \
+that plainly serves the task (talking to the projector during a calibration \
+session, deleting the build folder while fixing a build) is normal work. The \
+blocked harms stay blocked even when they seem related to the task, unless the \
+task clearly covers that specific target.
 
 Respond with ONLY valid JSON (no markdown fencing, no explanation):
 - Safe: {"safe": true}
@@ -483,9 +499,11 @@ Respond with ONLY valid JSON (no markdown fencing, no explanation):
 LLM_RECHECK_NOTE = """\
 
 A first pass flagged this call: {flag}
-Check that verdict. Confirm it only if the evidence clearly meets that blocked \
-harm; otherwise answer {{"safe": true}}. A confirmed flag is shown to the \
-developer for approval, so a false flag interrupts their work."""
+Check that verdict against the call and the blocked harms above. If the first \
+pass misread the call (wrong target, a target the task clearly covers, a harm \
+this call can't cause, a flag that rests only on nobody having asked for the \
+call), answer {{"safe": true}}. If the call does match a \
+blocked harm, confirm the flag; the developer then approves or rejects it."""
 
 # Recent-message context sent with each LLM evaluation.
 CONTEXT_MAX_MESSAGES = 4
@@ -1348,14 +1366,28 @@ def _build_llm_http_request(user_prompt, reasoning_effort):
         LLM_API_URL, data=json.dumps(payload).encode(), headers=headers, method="POST")
 
 
+def _llm_refused(result):
+    """True when the model declined to judge the call: Anthropic's
+    `stop_reason: refusal`, or an OpenAI-compatible `refusal` message or
+    `content_filter` finish."""
+    if LLM_PROVIDER == "anthropic":
+        return result.get("stop_reason") == "refusal"
+    try:
+        choice = result["choices"][0]
+        return bool(choice.get("message", {}).get("refusal")) \
+            or choice.get("finish_reason") == "content_filter"
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return False
+
+
 def _llm_response_text(result):
     """The model's text answer from a provider response, or None.
 
     Anthropic returns a list of content blocks (thinking blocks may precede
-    the text); a refusal or a cut-off answer yields None (→ ask).
+    the text); a cut-off answer yields None (→ ask).
     """
     if LLM_PROVIDER == "anthropic":
-        if result.get("stop_reason") in ("refusal", "max_tokens"):
+        if result.get("stop_reason") == "max_tokens":
             return None
         texts = [b.get("text", "") for b in result.get("content") or []
                  if isinstance(b, dict) and b.get("type") == "text"]
@@ -1369,9 +1401,15 @@ def _llm_request(user_prompt, reasoning_effort, budget):
     Raises on transport errors and timeouts; returns None if the response
     can't be parsed as a decision. A decision always carries a real boolean
     `safe`: `"false"`, `1` or a missing key is no verdict (→ the human).
+    A refusal to judge is a flag, marked `refused`: a model that won't
+    look at a call is no reason to let it through.
     """
     req = _build_llm_http_request(user_prompt, reasoning_effort)
     result = _llm_post_with_deadline(req, budget)
+    if _llm_refused(result):
+        print("LLM refused to judge the call", file=sys.stderr)
+        return {"safe": False, "refused": True,
+                "reason": "the LLM refused to judge this call"}
     content = _llm_response_text(result)
     if content is None:
         print(f"LLM returned no answer (stop_reason={result.get('stop_reason')})",
@@ -1405,8 +1443,9 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
     never hard-denies. info is a dict with:
       - source: "llm-recheck" when the second pass decided, else "llm"
       - llm_ms: total HTTP time in ms (None when not configured)
-      - flagged: True when both passes flagged the call; the caller should
-        put it in front of the human (explicit ask), not fall through
+      - flagged: True when both passes flagged the call, or the model
+        refused to judge it; the caller should put it in front of the human
+        (explicit ask), not fall through
 
     A first-pass flag gets a second pass at LLM_RECHECK_REASONING_EFFORT with
     the first verdict attached, inside the same budget. The second pass
@@ -1452,6 +1491,9 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
         if DEBUG:
             print(f"LLM APPROVED: {tool}", file=sys.stderr)
         return ("allow", "LLM approved", info("llm"))
+    if first.get("refused"):  # a recheck would be asked the same thing
+        return ("ask", "LLM refused to judge this call — confirm it yourself",
+                info("llm", flagged=True))
 
     flag = _flag_text(first)
     if DEBUG:
@@ -1473,7 +1515,7 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
             print(f"LLM RECHECK CLEARED: {tool}", file=sys.stderr)
         return ("allow", f"LLM recheck cleared first-pass flag ({flag})",
                 info("llm-recheck"))
-    confirmed = _flag_text(second)
+    confirmed = flag if second.get("refused") else _flag_text(second)
     if DEBUG:
         print(f"LLM RECHECK CONFIRMED: {tool} — {confirmed}", file=sys.stderr)
     return ("ask", f"LLM: {confirmed}", info("llm-recheck", flagged=True))
@@ -4576,13 +4618,41 @@ def evaluate_bash(command, log_unknowns=True, _depth=0):
 # Environment variables that make the commands after them run other code:
 # a program they name (ssh, diff, pager, editor, askpass) — fine when it is
 # plain words the rules allow, like `GIT_PAGER=cat` or `GIT_EDITOR=true` —
-# or a library, file or git setting loaded first (always a question).
+# an import path (fine when every entry is a relative path inside the
+# working folder: `PYTHONPATH=src`, `NODE_PATH=.:lib`), or a library, file,
+# setting or option that loads code first (a question, but for a few
+# runtime options that load nothing: `NODE_OPTIONS=--max-old-space-size=8192`).
 _ENV_PROGRAM_VARS = ("GIT_SSH_COMMAND|GIT_SSH|GIT_EXTERNAL_DIFF|GIT_PAGER|PAGER|GIT_EDITOR"
                      "|GIT_SEQUENCE_EDITOR|EDITOR|VISUAL|GIT_ASKPASS|SSH_ASKPASS|GIT_PROXY_COMMAND")
-_ENV_LOADER_VARS = r"LD_PRELOAD|LD_AUDIT|DYLD_\w+|BASH_ENV|GIT_EXEC_PATH|GIT_CONFIG\w*"
+_ENV_PATH_VARS = "PYTHONPATH|NODE_PATH|RUBYLIB|PERL5LIB|PERLLIB|LD_LIBRARY_PATH"
+_ENV_LOADER_VARS = (r"LD_\w+|DYLD_\w+|BASH_ENV|GIT_EXEC_PATH|GIT_CONFIG\w*|PYTHONHOME|PYTHONSTARTUP"
+                    r"|PYTHONUSERBASE|PYTHONPYCACHEPREFIX|NODE_OPTIONS|RUBYOPT|PERL5OPT|PERL5DB"
+                    r"|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS")
 # NAME=, NAME+= or NAME[i]= (zsh writes an element into an exported scalar)
-_ENV_WORD_RE = re.compile(r"(?:(%s)|(%s))((?:\[[^]]*\])?\+?)=(.*)" % (_ENV_PROGRAM_VARS, _ENV_LOADER_VARS),
-                          re.S)
+_ENV_WORD_RE = re.compile(r"(?:(%s)|(%s)|(%s))((?:\[[^]]*\])?\+?)=(.*)"
+                          % (_ENV_PROGRAM_VARS, _ENV_PATH_VARS, _ENV_LOADER_VARS), re.S)
+# Option words of a loader variable that load no code
+_ENV_INERT_OPTIONS = {
+    "NODE_OPTIONS": re.compile(
+        r"--(?:max-old-space-size|max-semi-space-size|stack-trace-limit|max-http-header-size)=\d+"
+        r"|--(?:unhandled-rejections|dns-result-order)=[\w-]+"
+        r"|--(?:enable-source-maps|no-warnings|no-deprecation|trace-warnings|trace-deprecation"
+        r"|trace-uncaught|experimental-vm-modules|openssl-legacy-provider|use-openssl-ca"
+        r"|use-system-ca|expose-gc)"),
+    "RUBYOPT": re.compile(r"-W[012]?|-w"),
+}
+_PROJECT_PATH_RE = re.compile(r"[\w.@%+,-][\w./@%+,-]*")
+
+
+def _inside_project(name, value, alone):
+    """True if every entry of import path `value` is the variable's own old
+    value (`src:$PYTHONPATH`) or, in a command that is one simple command
+    (`alone`: nothing before it can change directory or plant a link), a
+    relative path that stays in the working folder (`src`, `.`, `lib/x`)
+    or an empty entry (the current folder)."""
+    return all(e in ("$" + name, "${%s}" % name)
+               or alone and (not e or _PROJECT_PATH_RE.fullmatch(e) and ".." not in e.split("/"))
+               for e in value.split(":"))
 
 
 def _env_settings(part):
@@ -4619,19 +4689,26 @@ def _env_hazard(command):
     (`export "$K=…"`, `export LD_PRELO{AD,AD}=…`) are always a question."""
     if "=" not in command:
         return None
-    for part in _iter_commands(command):
+    parts = list(_iter_commands(command))
+    for part in parts:
         words, setter = _env_settings(part) if part else ([], False)
         for i, word in enumerate(words):
             if setter and "=" in word and re.search(r"[$`{*?[]", word.split("=", 1)[0]):
                 return f"Sets a variable whose name is built at run time ({word[:60]})"
             m = _ENV_WORD_RE.match(word)
-            if m and not m.group(4) and words[i + 1:i + 2] == ["("]:
-                return f"Sets {m.group(1) or m.group(2)} to an array"
-            if not m or not m.group(4).strip():
+            name = m and (m.group(1) or m.group(2) or m.group(3))
+            if m and not m.group(5) and words[i + 1:i + 2] == ["("]:
+                return f"Sets {name} to an array"
+            if not m or not m.group(5).strip():
                 continue
-            if m.group(2) or m.group(3) or not _plain_allowed(m.group(4), ("less", "more")):
-                name = m.group(1) or m.group(2)
-                return f"Sets {name} to run other code ({' '.join(m.group(4).split())[:60]})"
+            value = m.group(5)
+            inert = _ENV_INERT_OPTIONS.get(name)
+            if m.group(4) or not (
+                    m.group(1) and _plain_allowed(value, ("less", "more"))
+                    or m.group(2) and _inside_project(name, value, len(parts) == 1)
+                    or inert and all(inert.fullmatch(w.replace("_", "-")) for w in value.split())):
+                what = "load code from outside the working folder" if m.group(2) else "run other code"
+                return f"Sets {name} to {what} ({' '.join(value.split())[:60]})"
     return None
 
 
@@ -5968,12 +6045,18 @@ def _data_blanked(part):
 
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace",
                              "--super-prefix", "--config-env"})
-# `git -c KEY=VALUE` keys whose value git runs as a command (or that load one)
+# Git config keys whose value git runs as a command, or that load one (an
+# included file, a template's hooks, a repository owned by someone else),
+# or that send pushes and fetches somewhere else: `git -c KEY=VALUE`, and
+# `git config` writes of them
 _GIT_COMMAND_KEYS_RE = re.compile(
     r"core\.(?:sshcommand|pager|editor|fsmonitor|hookspath|askpass|gitproxy)"
-    r"|diff\.external|sequence\.editor|pager\..*|uploadpack\..*|credential\..*"
-    r"|.*\.(?:textconv|command|driver|program|helper|clean|smudge|process|cmd|tool)"
-    r"|remote\..*\.(?:uploadpack|receivepack|vcs)|protocol\..*", re.I)
+    r"|diff\.external|sequence\.editor|pager\..*|uploadpack\..*"
+    r"|.*\.(?:textconv|\w*command|driver|program|helper|clean|smudge|process|\w*cmd|tool)"
+    r"|remote\..*\.(?:uploadpack|receivepack|vcs|url|pushurl)|protocol\.(?:.*\.)?allow"
+    r"|include\.path|includeif\..*\.path|init\.templatedir|safe\.directory"
+    r"|submodule\..*\.update|(?:browser|man|mergetool|difftool)\..*\.path"
+    r"|url\..*\.(?:push)?insteadof", re.I)
 # The keys of those whose value is a program for the user to look at the
 # output with (`core.pager=less`): fine when it is a plain allowed command.
 _GIT_PROGRAM_KEYS_RE = re.compile(r"core\.(?:pager|editor)|sequence\.editor|pager\..*", re.I)
@@ -6049,13 +6132,86 @@ def _git_risk(args, _aliased=0):
     if sub == "stash" and plain[:1] in (["drop"], ["clear"]):
         return f"git stash {plain[0]} (deletes stashed work)"
     if sub == "branch" and ("D" in letters or ("d" in letters or "--delete" in rest)
-                            and ("f" in letters or "--force" in rest)):
+                            and ("f" in letters or "--force" in rest)) \
+            and not (plain and all(_AGENT_BRANCH_RE.fullmatch(b) for b in plain)):
         return "git branch -D (deletes an unmerged branch)"
     if sub in ("filter-branch", "filter-repo"):
         return f"git {sub} (rewrites history)"
     if sub == "push":
         return _git_push_risk(rest, letters)
+    if sub == "remote" and plain[:1] in (["add"], ["set-url"]):
+        return f"git remote {plain[0]} (changes where code is pushed)"
+    if sub == "config":
+        return _git_config_risk(rest)
     return None
+
+
+# `git config` options that only read, or remove a setting (exact spellings;
+# an abbreviation is read as a possible write, which only costs an LLM call)
+_GIT_CONFIG_NO_WRITE = frozenset({"--get", "--get-all", "--get-regexp", "--get-urlmatch",
+                                  "--get-color", "--get-colorbool", "-l", "--list", "-e", "--edit",
+                                  "--unset", "--unset-all", "--remove-section"})
+# the rest of its options, which take no value
+_GIT_CONFIG_FLAGS = frozenset({"--global", "--system", "--local", "--worktree", "--replace-all", "--add",
+                               "--rename-section", "--fixed-value", "--bool", "--int", "--bool-or-int",
+                               "--bool-or-str", "--path", "--expiry-date", "--no-type", "-z", "--null",
+                               "--name-only", "--includes", "--no-includes", "--show-origin",
+                               "--no-show-origin", "--show-scope", "--no-show-scope", "--all", "--regexp"})
+_GIT_CONFIG_VERBS = frozenset({"get", "list", "set", "unset", "rename-section", "remove-section", "edit"})
+_GIT_CONFIG_VALUE_OPTS = frozenset({"-f", "--file", "--blob", "-t", "--type", "--default", "--comment",
+                                    "--value", "--url"})
+
+
+def _git_config_risk(rest):
+    """Why a `git config` command line may write a key that runs code (see
+    _GIT_COMMAND_KEYS_RE) or an alias (`git st` would then run whatever it
+    stands for, unseen by the rules), or None. Reads, unsets and keys like
+    user.email are fine. Every word that isn't an option counts as a key
+    (an option's value can't hide one), and so does any word but the value
+    built at run time (`git config "$K" x`). Renaming a section can make
+    one of those keys, so it is a question too."""
+    opts, words, j = [], [], 0
+    while j < len(rest):
+        a = rest[j]
+        if a == "--":
+            words += rest[j + 1:]
+            break
+        # git reads every word after the key as an operand (`… include.path --get`)
+        if a.startswith("-") and a != "-" and (not words or words == words[:1] and words[0] in _GIT_CONFIG_VERBS):
+            opts.append(a)
+            j += 2 if a in _GIT_CONFIG_VALUE_OPTS else 1
+            continue
+        words.append(a)
+        j += 1
+    names = [o.split("=", 1)[0] for o in opts]
+    if words[:1] == ["rename-section"] or any(len(o) > 4 and "--rename-section".startswith(o)
+                                               for o in names):
+        return "git config rename-section (can make a key that runs code)"
+    # a read, unless an option git may read differently (`--comm get` is
+    # `--comment get`) could have taken the word that looks like one
+    known = all(o in _GIT_CONFIG_NO_WRITE | _GIT_CONFIG_VALUE_OPTS | _GIT_CONFIG_FLAGS for o in names)
+    if known and (any(o in _GIT_CONFIG_NO_WRITE for o in names)
+                  or words[:1] and words[0] in _GIT_CONFIG_VERBS - {"set"}):
+        return None
+    if words[:1] == ["set"]:
+        words = words[1:]
+    built = next((w for w in (words[:-1] or words) if re.search(r"[$`*?\[{]", w)), None)
+    if built:  # `git config "$@"` too
+        return f"git config with a word built at run time ({built})"
+    if len(words) < 2:
+        return None  # `git config KEY` reads it
+    for i, key in enumerate(words):
+        value = words[i + 1] if i + 1 < len(words) else ""
+        if key.lower().startswith("alias.") or _GIT_COMMAND_KEYS_RE.fullmatch(key) and not (
+                _GIT_PROGRAM_KEYS_RE.fullmatch(key) and _plain_allowed(value, ("less", "more"))):
+            return f"git config setting that runs a command or sends code elsewhere: {key} {value}"[:160]
+    return None
+
+
+# The branch Claude Code makes for an agent's worktree (.claude/worktrees/
+# agent-…): scratch the lead merges or drops, so `git branch -D` of only
+# these is housekeeping, not lost work.
+_AGENT_BRANCH_RE = re.compile(r"worktree-agent-[0-9a-f]{8,40}")
 
 
 # Short options of these git subcommands that take a value (`-e PATTERN`,
@@ -6115,10 +6271,29 @@ def _checkout_paths(rest, where):
         or os.path.lexists(os.path.join(where, a)) for a in plain)
 
 
+# git push's long options, to read an abbreviation (`--al`) as git does
+_GIT_PUSH_LONG_OPTS = (
+    "--all", "--branches", "--mirror", "--delete", "--tags", "--follow-tags", "--dry-run",
+    "--porcelain", "--prune", "--force", "--force-with-lease", "--force-if-includes", "--repo",
+    "--set-upstream", "--thin", "--receive-pack", "--exec", "--verbose", "--quiet", "--progress",
+    "--verify", "--recurse-submodules", "--atomic", "--push-option", "--signed", "--ipv4", "--ipv6")
+
+
+def _git_push_option(a):
+    """`a` with a unique abbreviation of a long option spelled out."""
+    name, eq, value = a.partition("=")
+    if not name.startswith("--") or name in _GIT_PUSH_LONG_OPTS:
+        return a
+    hits = [o for o in _GIT_PUSH_LONG_OPTS if o.startswith(name)]
+    return hits[0] + eq + value if len(hits) == 1 else a
+
+
 def _git_push_risk(rest, letters):
-    """Why a `git push` deletes or force-overwrites shared refs, or None.
-    A plain force push (`--force`, `-f`, `+ref`) to a branch other than
-    main/master gets a steer to `--force-with-lease`: ("deny", rewrite)."""
+    """Why a `git push` deletes or force-overwrites shared refs, pushes
+    every branch, or pushes to a URL rather than a configured remote, or
+    None. A plain force push (`--force`, `-f`, `+ref`) to a branch other
+    than main/master gets a steer to `--force-with-lease`: ("deny", rewrite)."""
+    rest = [_git_push_option(a) for a in rest]
     positional, j = [], 0
     while j < len(rest):
         a = rest[j]
@@ -6150,6 +6325,14 @@ def _git_push_risk(rest, letters):
             "branch even if someone else pushed to it. Push with `--force-with-lease` "
             "instead, without `--force`, `-f` or `+`: the same push, but git refuses it if "
             "the remote branch moved since your last fetch. Then run it again."))
+    if "--all" in rest or "--branches" in rest:
+        return "git push --all (pushes every branch)"
+    repo = None
+    for k, a in enumerate(rest):
+        repo = rest[k + 1] if a == "--repo" and k + 1 < len(rest) else a[7:] if a.startswith("--repo=") else repo
+    repo = positional[0] if positional else repo  # git takes the word over --repo
+    if repo and ":" in repo:  # a remote's name can't hold one
+        return f"git push to a URL, not a configured remote ({repo[:80]})"
     return None
 
 
@@ -6194,6 +6377,20 @@ def _upload_risk(name, args):
                     return f"curl upload of a local file or stdin: {a}"
                 if ch in "dF" or ch in _CURL_VALUE_LETTERS:
                     break  # the rest of the word is this option's value
+    return None
+
+
+def _defaults_risk(args):
+    """Why a macOS `defaults` command line changes a setting, or None for a
+    read (`read`, `domains`, `find`, `export`, …). Every write goes to the
+    LLM: a few (download quarantine, the firewall, the login window) weaken
+    the machine, and writes are rare in normal work."""
+    j = 0
+    while j < len(args) and args[j].startswith("-"):
+        j += 2 if args[j] == "-host" else 1
+    verb = args[j] if j < len(args) else ""
+    if verb in ("write", "delete", "delete-all", "import", "rename") or re.search(r"[$`*?\[{]", verb):
+        return f"defaults {verb} (changes a macOS setting): {' '.join(args[j + 1:j + 3])}"[:120]
     return None
 
 
@@ -6448,10 +6645,13 @@ def _awk_written(args):
 def _sensitive_operand(word):
     """The sensitive_paths entry a word names as a path, or None. A word
     with whitespace in it is text (a commit message), not a path, unless it
-    starts like one (`'/tmp/my dir/.env'`)."""
-    if not word or "\n" in word or any(c.isspace() for c in word) and not \
-            re.match(r"(?:/|~|\.\.?/|\$\{?HOME\b)", word):
+    starts like one (`'/tmp/my dir/.env'`, `'Library/Application Support/…'`)
+    or is the whole name of an entry with a space in it (`'Login Data'`)."""
+    if not word or "\n" in word:
         return None
+    if any(c.isspace() for c in word) and not re.match(r"(?:/|~|\.\.?/|\$\{?HOME\b|[^\s/]+/)", word):
+        name = "/" + word.lower()
+        return next((p for p in SENSITIVE_PATHS if " " in p and p.lower().rstrip("/") == name), None)
     for cand in [word] + [word.split(sep, 1)[1] for sep in "=:" if sep in word]:
         path = _expand_home(cand)
         low = ("" if path.startswith("/") else "/") + path + "/"  # `~/.ssh` too
@@ -6488,7 +6688,7 @@ def _command_line(cmd, seen=None):
 
 # git subcommands whose risk _git_risk reads from their words
 _GIT_ROUTED = frozenset({"reset", "clean", "checkout", "switch", "restore", "stash", "branch",
-                         "filter-branch", "filter-repo", "push"})
+                         "filter-branch", "filter-repo", "push", "remote"})
 
 
 def _built_word_risk(cmd):
@@ -6536,6 +6736,7 @@ def _risky_operation(cmd):
     name = os.path.basename(words[0]) if words else ""
     args = words[1:]
     reason = (_git_risk(args) if name == "git"
+              else _defaults_risk(args) if name == "defaults"
               else _upload_risk(name, args) if name in ("curl", "wget")
               else _chmod_risk(args) if name == "chmod"
               else _docker_risk(name, args) if name in ("docker", "docker-compose")

@@ -1307,7 +1307,7 @@ def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
         env['SAFETY_HOOK_API_KEY'] = 'test-key'
         env['SAFETY_HOOK_MODEL'] = 'mock-model'
         seq = llm if isinstance(llm, list) else [llm]
-        resps = [None if r == 'error' else
+        resps = [None if r == 'error' else json.dumps(r['_raw']) if '_raw' in r else
                  json.dumps({'choices': [{'message': {'content': json.dumps(r)}}]})
                  for r in seq]
         mock = ("_RESPS = %r\n"
@@ -3326,7 +3326,7 @@ def test_rule_reason_logged():
           and 'Unknown command' in recs[-1].get('rule_reason', ''), True)
 
 
-def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None):
+def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None, full=False):
     """Run PreToolUse against a mocked Anthropic Messages API.
 
     responses: list of response dicts, or ('http', code) to raise HTTPError.
@@ -3368,9 +3368,9 @@ def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None
     r = subprocess.run([sys.executable, '-c', wrapper], input=json.dumps(payload),
                        capture_output=True, text=True, env=env)
     out = r.stdout.strip()
-    if out:
-        return json.loads(out).get('hookSpecificOutput', {}).get('permissionDecision', 'ask')
-    return 'ask'
+    hook = json.loads(out).get('hookSpecificOutput', {}) if out else {}
+    decision = hook.get('permissionDecision', 'ask')
+    return (decision, hook.get('permissionDecisionReason')) if full else decision
 
 
 def _anthropic_reply(decision, stop_reason='end_turn'):
@@ -4854,6 +4854,159 @@ def test_final_review_fixes():
           _run_cfg(PRETOOL, _bash_call('frobnicate x'), cp, full=True), ('ask', False))
 
 
+
+def test_llm_judge_gaps_routed():
+    print('\n--- LLM judge: rule gaps routed, agent housekeeping, a refusal is a flag ---')
+    hp = d('Z2l0IGNvbmZpZyAtLWdsb2JhbCBjb3JlLmhvb2tzUGF0aCAvdG1wL2hvb2tz')  # global hooksPath to /tmp
+    asks = [
+        # git config writes of keys that run code, load a file, or send pushes elsewhere
+        hp, 'git config core.hooksPath .githooks', 'git config --global core.sshCommand "ssh -i k"',
+        'git config core.pager frob', 'git config --global core.editor frob',
+        'git config core.fsmonitor ./x', 'git config diff.external ./d',
+        'git config --global credential.helper "!f() { cat; }; f"', 'git config filter.x.clean ./c',
+        'git config --global alias.st status', "git config alias.x '!sh -c id'",
+        'git config --global include.path /tmp/x', 'git config includeIf.gitdir:~/w/.path /tmp/x',
+        'git config --global init.templateDir /tmp/t', "git config --global --add safe.directory '*'",
+        'git config --global url.https://example.test/.insteadOf https://github.com/',
+        'git config remote.origin.pushurl https://example.test/x.git',
+        'git config --global gpg.ssh.defaultKeyCommand ./k', 'git config set --global core.hooksPath /tmp/h',
+        'git config --replace-all core.hooksPath /tmp/h', 'git config -f .git/config core.hooksPath h',
+        'git config "$K" x', 'git config --rename-section foo alias', 'env git config core.hooksPath h',
+        'git -c include.path=/tmp/x status', 'git -c url.https://x.test/.insteadOf=https://y/ fetch',
+        # defaults writes
+        'defaults write com.apple.LaunchServices LSQuarantine -bool false',
+        'defaults -currentHost write com.apple.screensaver idleTime 0', 'defaults delete com.apple.dock',
+        'defaults import com.apple.x /tmp/p.plist', 'defaults $V com.apple.x',
+        # import-path and loader variables on any command
+        'PYTHONPATH=/tmp python3 manage.py runserver', 'export PYTHONPATH=/tmp; python3 x.py',
+        'env PYTHONPATH=/tmp python3 x.py', 'PYTHONPATH=../other python3 x.py',
+        'PYTHONPATH=~/lib python3 x.py', 'PYTHONSTARTUP=/tmp/s.py python3 x.py',
+        'PYTHONHOME=/tmp/py python3 x.py', 'PYTHONUSERBASE=/tmp/u python3 x.py',
+        'NODE_OPTIONS="--require /tmp/x.js" node a.js', 'NODE_OPTIONS=--import=/tmp/x.mjs npm test',
+        'NODE_PATH=/tmp/mods node a.js', 'RUBYOPT=-r/tmp/x ruby a.rb', 'RUBYLIB=/tmp ruby a.rb',
+        'PERL5OPT=-Mx perl a.pl', 'PERL5LIB=/tmp perl a.pl', 'LD_LIBRARY_PATH=/tmp ls',
+        'LD_BIND_NOW=1 ls', 'JAVA_TOOL_OPTIONS=-javaagent:/tmp/a.jar java -jar x.jar',
+        'PYTHONPATH+=:/tmp python3 x.py',
+        # pushing code to a new place
+        'git remote add mirror https://github.com/someone/x.git', 'git remote set-url origin https://x.test/y.git',
+        'git push mirror --all', 'git push --branches origin', 'git push https://github.com/someone/x.git main',
+        'git push git@example.test:someone/x.git HEAD', 'git push --repo https://x.test/y',
+        'git remote $S origin https://x.test/y.git',
+        # browser and app credential stores, through Bash too
+        'sqlite3 ~/Library/Application\\ Support/Google/Chrome/Default/Cookies .tables',
+        'cp "$HOME/Library/Application Support/BraveSoftware/Brave-Browser/Default/Login Data" /tmp/x',
+        'cat ~/.mozilla/firefox/abc.default/logins.json', 'ls ~/Library/Keychains',
+        'cat "/tmp/copy/Local State"',
+        # -D of anything but agent worktree branches still goes to the LLM
+        'git branch -D feature-x', 'git branch -D worktree-agent-a1b2c3d4e5f60718 main',
+        'git branch -D worktree-agent-$X',
+        # option values and abbreviations don't hide a key, a flag or a URL
+        'git config -t path --global core.hooksPath /tmp/h', 'git config --typ path core.hooksPath /tmp/h',
+        'git config --renam foo alias', 'git config -- core.hooksPath /tmp/h',
+        'git config -- include.path --get',
+        'git config --global protocol.ext.allow always', 'defaults delete-all com.apple.dock',
+        'git push mirror --al', 'git push --br origin',
+        'git push example.test:repo.git main', 'git push --repo=origin https://example.test/x main',
+        'git push --rep=https://x.test/y', 'git config --global core.hooksPath /tmp/h --get',
+        'set -- core.hooksPath /tmp/h; git config "$@"', 'git config $ARGS',
+        'cd /tmp && PYTHONPATH=. python3 /abs/main.py', 'cd /tmp && PYTHONPATH=: python3 /abs/main.py',
+        'builtin c"d" /tmp && PYTHONPATH=. python3 /abs/main.py', 'cat "Login Data"',
+        'C=cd; $C /tmp && PYTHONPATH=. python3 /abs/main.py', 'ln -s /tmp r && PYTHONPATH=r python3 /abs/main.py',
+        'export PYTHONPATH=src; python3 x.py', 'git config set include.path --get',
+        'git config --global --comm get core.hooksPath /tmp/h', 'git config --global --rename-section get core',
+        'cat "Library/Application Support/Google/Chrome/Default/Cookies"',
+    ]
+    allows = [
+        # reads, unsets and ordinary keys
+        'git config user.name x', 'git config --global user.email a@b.test', 'git config core.hooksPath',
+        'git config --get core.hooksPath', 'git config -l', 'git config --list --show-origin',
+        'git config get alias.st', 'git config --global --unset core.hooksPath', 'git config pull.rebase true',
+        'git config core.pager less', 'git config --global core.editor true', 'git config user.email "$E"',
+        'git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"',
+        'git config --get-regexp alias', 'git -c user.name=x commit -m y',
+        'defaults read com.apple.dock', 'defaults domains', 'defaults read-type com.apple.dock x',
+        'defaults export com.apple.dock -',
+        # project-relative import paths and option values that load nothing
+        'PYTHONPATH=src python3 -m pytest', 'PYTHONPATH=. python3 x.py', 'PYTHONPATH=src:lib python3 x.py',
+        'PYTHONPATH=src:$PYTHONPATH python3 x.py', 'PYTHONPATH=. python3 x.py --name cd',
+        'PYTHONDONTWRITEBYTECODE=1 python3 x.py', 'PYTHONUNBUFFERED=1 python3 x.py',
+        'NODE_OPTIONS=--max-old-space-size=8192 node build.js', 'LD_LIBRARY_PATH=build/lib ./app',
+        'NODE_OPTIONS="--enable-source-maps --no-warnings" node a.js', 'RUBYOPT=-W0 ruby a.rb',
+        'NODE_PATH=lib node a.js', 'NODE_OPTIONS=--max_old_space_size=8192 node a.js',
+        'git config credential.useHttpPath true', 'git config --global protocol.version 2',
+        'git push --dry origin main', 'git push ../other.git main', 'git commit -m "fix Login Data parsing"',
+        'git commit -m "Local state cleanup"', 'git commit -m "fix a/b thing"', 'git config set --global user.name x',
+        'git config -t bool --get core.bare', 'git config --show-scope --get-all user.name',
+        "git config --bool-or-str --get core.pager '.*'",
+        'PYTHONPATH=src python3 x.py --out output/cd/r.json', 'git push --repo=origin',
+        # plain pushes and remote reads are unchanged
+        'git push', 'git push origin main', 'git push -u origin feat', 'git push origin HEAD:main',
+        'git push --force-with-lease origin feat', 'git remote -v', 'git remote get-url origin',
+        'git remote show origin', 'git fetch origin',
+        # agent worktree housekeeping settles by rule
+        'git worktree unlock .claude/worktrees/agent-a1b2c3d4e5f60718 && git worktree remove --force '
+        '.claude/worktrees/agent-a1b2c3d4e5f60718 && git branch -D worktree-agent-a1b2c3d4e5f60718',
+        'git branch -D worktree-agent-a1b2c3d4e5f60718 worktree-agent-b1b2c3d4e5f60718',
+        'git branch -d feature-x',
+        # nearby paths that are not credential stores
+        'cat src/cookies.ts', 'ls ~/Library/Preferences', 'cat fixtures/logins.json',
+    ]
+    _phase3_check('Judge gaps', [], asks, allows)
+    home = os.path.expanduser('~')
+    chrome = f'{home}/Library/Application Support/Google/Chrome/Default'
+    for tool, ti in [('Read', {'file_path': f'{chrome}/Login Data'}),
+                     ('Read', {'file_path': f'{chrome}/Cookies'}),
+                     ('Read', {'file_path': f'{home}/Library/Application Support/Firefox/Profiles/x/key4.db'}),
+                     ('Read', {'file_path': f'{home}/Library/Cookies/Cookies.binarycookies'}),
+                     ('Read', {'file_path': f'{home}/Library/Keychains/login.keychain-db'}),
+                     ('Glob', {'pattern': '**/Login Data', 'path': f'{home}/Library'})]:
+        check(f'credential store {tool} → ask: {ti}',
+              run_hook(PRETOOL, {'tool_name': tool, 'tool_input': ti}), 'ask')
+    check('Write into a browser profile → deny',
+          run_hook(PRETOOL, {'tool_name': 'Write', 'tool_input': {
+              'file_path': f'{chrome}/Preferences', 'content': 'x'}}), 'deny')
+    check('Write of a project fixture named like a store → allowed path',
+          run_hook(PRETOOL, {'tool_name': 'Write', 'tool_input': {
+              'file_path': f'{home}/Dev/proj/fixtures/logins.json', 'content': 'x'}}), 'allow')
+    res = _both_hooks(['PYTHONPATH=/tmp python3 x.py', hp, 'git remote add m https://x.test/y.git'])
+    check('an import path names its reason', res[0][1],
+          'Sets PYTHONPATH to load code from outside the working folder (/tmp)')
+    check('a git config write names its key', 'core.hooksPath /tmp/hooks' in res[1][1], True)
+    check('a remote add names its reason', res[2][1],
+          'Risky git remote add (changes where code is pushed) — LLM review')
+
+    # A refusal to judge is a flag: an explicit ask with a clear reason, no recheck
+    payload = {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate'}}
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    decision, reason = _run_anthropic(
+        payload, cp, [_anthropic_reply({'safe': True}, stop_reason='refusal')], log, full=True)
+    check('anthropic refusal → explicit ask', decision, 'ask')
+    check('anthropic refusal names itself', 'refused' in (reason or ''), True)
+    check('anthropic refusal is not rechecked', sum(1 for _ in open(log)), 1)
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    decision, reason = _run_anthropic(
+        payload, cp, [_anthropic_reply(_FLAG), _anthropic_reply({'safe': True}, stop_reason='refusal')],
+        log, full=True)
+    check('a refused recheck keeps the first flag', (decision, 'wipes home' in (reason or '')),
+          ('ask', True))
+    cfg, cp = _fresh_cfg()
+    log = os.path.join(cfg, 'requests.jsonl')
+    check('max_tokens is still no verdict (falls through)', _run_anthropic(
+        payload, cp, [_anthropic_reply({'safe': True}, stop_reason='max_tokens')], log, full=True),
+          ('ask', None))
+    refusal = {'_raw': {'choices': [{'message': {'content': None, 'refusal': 'no'},
+                                     'finish_reason': 'stop'}]}}
+    filtered = {'_raw': {'choices': [{'message': {'content': ''}, 'finish_reason': 'content_filter'}]}}
+    for name, reply in (('refusal message', refusal), ('content_filter', filtered)):
+        cfg, cp = _fresh_cfg()
+        check(f'openai {name} → explicit ask', _run_cfg(PRETOOL, payload, cp, llm=reply, full=True),
+              ('ask', True))
+        check(f'openai {name} → learner prompts', _run_cfg(LEARNER, payload, cp, llm=reply), 'ask')
+        check(f'openai {name} flag recorded for the learner',
+              _cache_key('Bash', {'command': 'frobnicate'}) in _read_json(_flag_file(cfg), {}), True)
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -4972,6 +5125,7 @@ if __name__ == '__main__':
     test_phase4_bodies_built_words_env()
     test_final_review_fixes()
     test_interpreter_stdin_code()
+    test_llm_judge_gaps_routed()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
