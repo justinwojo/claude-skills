@@ -4021,6 +4021,59 @@ def test_llm_gets_rule_reason_and_total_time():
         check(f'{name}: failure reports total time', bool(re.search(r'\d+\.\ds in all\)', reason)), True)
 
 
+def test_git_status_snapshot_for_discards():
+    print('\n--- A discard that reaches the LLM carries a git status snapshot of the cwd ---')
+    repo = tempfile.mkdtemp(prefix='sp-git-')
+    atexit.register(shutil.rmtree, repo, ignore_errors=True)
+    git = ['git', '-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false']
+    subprocess.run(git + ['init', '-q'], check=True)
+    for name in ('kept.txt', 'edited.txt'):
+        with open(os.path.join(repo, name), 'w') as f:
+            f.write('v1\n')
+    subprocess.run(git + ['add', '.'], check=True)
+    subprocess.run(git + ['commit', '-qm', 'init'], check=True)
+
+    def prompt(cmd, cwd=repo):
+        cfg, cp = _fresh_cfg()
+        reqs = os.path.join(cfg, 'reqs.jsonl')
+        _run_cfg(PRETOOL, dict(_bash_call(cmd), cwd=cwd), cp, llm={'safe': True}, requests_log=reqs)
+        sent = _requests(reqs)
+        return sent[0]['messages'][1]['content'] if sent else ''
+
+    user = prompt('git checkout -- kept.txt')
+    check('clean repo: snapshot says clean', '(clean: no uncommitted changes' in user, True)
+    check('clean repo: ignored files not vouched for', 'ignored files unknown' in user, True)
+    check('snapshot comes before the tool call',
+          0 <= user.find('git status --short') < user.find('Tool: Bash'), True)
+
+    with open(os.path.join(repo, 'edited.txt'), 'w') as f:
+        f.write('v2\n')
+    with open(os.path.join(repo, 'new.txt'), 'w') as f:
+        f.write('x\n')
+    user = prompt('set -e; git read-tree HEAD\ngit checkout -- kept.txt edited.txt')
+    check('dirty repo: modified file listed', ' M edited.txt' in user, True)
+    check('dirty repo: untracked file listed', '?? new.txt' in user, True)
+    check('dirty repo: not called clean', '(clean:' in user, False)
+
+    # A dirty submodule is listed, not hidden behind a clean claim
+    outer = tempfile.mkdtemp(prefix='sp-git-outer-')
+    atexit.register(shutil.rmtree, outer, ignore_errors=True)
+    og = ['git', '-C', outer, '-c', 'user.name=t', '-c', 'user.email=t@t',
+          '-c', 'commit.gpgsign=false', '-c', 'protocol.file.allow=always']
+    subprocess.run(og + ['init', '-q'], check=True)
+    subprocess.run(og + ['submodule', '-q', 'add', repo, 'sub'], check=True, capture_output=True)
+    subprocess.run(og + ['commit', '-qm', 'sub'], check=True)
+    with open(os.path.join(outer, 'sub', 'kept.txt'), 'w') as f:
+        f.write('edited inside the submodule\n')
+    check('dirty submodule listed', ' M sub' in prompt('git reset --hard --recurse-submodules', cwd=outer), True)
+
+    check('other git risk (reset --hard) also gets it',
+          'git status --short' in prompt('git reset --hard'), True)
+    check('non-git command: no snapshot', 'git status --short' in prompt('flyctl deploy'), False)
+    check('cwd not a repository: no snapshot',
+          'git status --short' in prompt('git checkout -- a.txt', cwd=tempfile.gettempdir()), False)
+
+
 def test_risky_operations_routed():
     print('\n--- Phase 1b: risky git / upload / chmod / docker / device / rc writes → LLM ---')
     risky = [
@@ -5106,6 +5159,7 @@ if __name__ == '__main__':
     test_learner_reuses_pretool_rules()
     test_shell_fed_code_checked()
     test_risky_operations_routed()
+    test_git_status_snapshot_for_discards()
     test_deny_beats_earlier_ask()
     test_dangerous_by_position()
     test_dangerous_messages()

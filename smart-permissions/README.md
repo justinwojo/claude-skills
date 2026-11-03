@@ -83,7 +83,12 @@ upload needs explicit authorization.
   tell it what task is underway, so a raw socket to a projector during a
   calibration session reads as normal work. Tool results, assistant text and
   harness notices are never sent, so file or web content can't argue its way
-  past the judge. It also sees why the local rules sent the call (`Unknown
+  past the judge. For a Bash command that can discard work (`git checkout`,
+  `restore`, `reset`, `clean`, `switch`, `stash`) it also gets a read-only
+  `git status --short` of the working directory (2s cap, 40 lines, ignored
+  files not listed), so a
+  `git checkout --` of paths that hold no uncommitted or untracked changes
+  goes through, and one over real edits is still flagged. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
   a hint about what to check.
 - **Messages are a partial view.** An agent often works from earlier

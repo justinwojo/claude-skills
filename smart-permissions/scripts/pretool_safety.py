@@ -449,7 +449,12 @@ doesn't cover, or a target you can't resolve that could be one. Git: force-push 
 to or deletion of the default branch, broad refspecs, rewriting pushed history \
 on the default branch, and discarding uncommitted changes in the developer's own \
 checkout (git reset --hard, git checkout -- ., git clean -fdx outside agent \
-worktrees) when nothing shows it's wanted.
+worktrees) when nothing shows it's wanted. When a `git status` snapshot is \
+given, use it: a discard whose paths it shows clean loses nothing (their \
+content is committed); flag one only when a path it overwrites or deletes \
+shows uncommitted or untracked changes, or the snapshot can't vouch for it \
+(truncated, another directory, ignored files that `git clean -x`/`-X` deletes, \
+or the command itself edits those paths first).
 2. Making private things public. Changing a repo, bucket, or share to public; \
 publishing a package; pushing private code to a remote the developer doesn't \
 own; public gists or pastes of private content.
@@ -789,6 +794,45 @@ def recent_user_messages(transcript_path, limit=CONTEXT_MAX_MESSAGES):
     return list(reversed(messages))
 
 
+# A git subcommand that can discard uncommitted work (see _git_risk). A loose
+# match: it only decides whether the LLM also gets a `git status` snapshot.
+_GIT_DISCARD_HINT_RE = re.compile(r"\bgit\b[^\n;&|]*?\b(?:checkout|restore|reset|clean|switch|stash)\b")
+GIT_STATUS_TIMEOUT_S = 2
+GIT_STATUS_MAX_LINES = 40
+
+
+def git_status_snapshot(cwd):
+    """`git status --short` of the repository at `cwd`, labelled for the LLM,
+    or '' (not a repository, git missing, slow or failing). It lets the LLM
+    see whether the paths a `git checkout --` / `reset --hard` / `clean`
+    would overwrite hold uncommitted or untracked work. No optional locks
+    (no index refresh racing the command itself) and no fsmonitor hook;
+    otherwise it is the plain `git status` the rules already allow. Dirty
+    submodules are listed; ignored files are not (named in the label)."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "status",
+             "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
+            cwd=cwd, capture_output=True, text=True, timeout=GIT_STATUS_TIMEOUT_S,
+            stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0",
+                                               GIT_TERMINAL_PROMPT="0"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+    if out.returncode != 0:
+        return ""
+    lines = out.stdout.splitlines()
+    head = (f"`git status --short` in {cwd}, taken before the command runs (a `cd` or "
+            "`git -C` in the command, or its own earlier steps, can make it not apply; "
+            "ignored files are not listed):")
+    if not lines:
+        return f"{head}\n(clean: no uncommitted changes and no untracked files; ignored files unknown)"
+    body = "\n".join(lines[:GIT_STATUS_MAX_LINES])
+    if len(lines) > GIT_STATUS_MAX_LINES:
+        body += f"\n[… {len(lines) - GIT_STATUS_MAX_LINES} more entries not shown]"
+    return f"{head}\n{body}"
+
+
 def build_llm_context(input_data):
     """Context block for the LLM from the hook input ('' when none)."""
     if not isinstance(input_data, dict):
@@ -797,6 +841,13 @@ def build_llm_context(input_data):
     cwd = input_data.get("cwd")
     if isinstance(cwd, str) and cwd:
         parts.append(f"Working directory: {cwd}")
+    tool, tool_input = parse_hook_payload(input_data)
+    command = tool_input.get("command") if tool == "Bash" else None
+    if isinstance(cwd, str) and os.path.isabs(cwd) and isinstance(command, str) \
+            and _GIT_DISCARD_HINT_RE.search(command):
+        snapshot = git_status_snapshot(cwd)
+        if snapshot:
+            parts.append(snapshot)
     messages = recent_user_messages(input_data.get("transcript_path"))
     if messages:
         parts.append("Developer's recent messages (oldest first):")
