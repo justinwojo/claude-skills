@@ -464,7 +464,12 @@ snapshot can't vouch for it (truncated, another directory, ignored files that \
 `git clean -x`/`-X` deletes, or the command itself edits those paths first).
 2. Making private things public. Changing a repo, bucket, or share to public; \
 publishing a package; pushing private code to a remote the developer doesn't \
-own; public gists or pastes of private content.
+own; public gists or pastes of private content. The context may check the owners \
+of git remotes. A push to an owner it says matches none of the developer's, or \
+pointing an existing remote at one, is concrete evidence of this harm even if \
+you can't see whether the code is private, unless the developer's messages name \
+that owner or remote. An owner it says is the developer's is not this harm. \
+Adding a remote or fetching from one harms nothing by itself.
 3. Leaking secrets. Sending credentials, API keys, tokens, SSH keys, or session \
 cookies anywhere, or pulling them from places they don't normally live \
 (browser profiles, keychains, other apps' data, logs) to get around a failed \
@@ -812,25 +817,30 @@ GIT_CONTEXT_BUDGET_S = 4
 GIT_CONTEXT_MAX_DIRS = 3
 
 
-def _git_probe(path, args, deadline):
-    """stdout of a read-only `git <args>` in `path`, or None (not a repository,
-    git missing, slow, failing, or past `deadline`). No optional locks (no index
-    refresh racing the command itself) and no fsmonitor hook. GIT_DIR and the
-    like stay in the environment: the command inherits them too, so git's answer
-    is about the checkout the command would really change."""
+def _probe(argv, path, deadline):
+    """stdout of a read-only command in `path`, or None (missing, slow, failing,
+    or past `deadline`)."""
     import subprocess
     left = min(GIT_STATUS_TIMEOUT_S, deadline - time.monotonic())
     if left <= 0:
         return None
     try:
         out = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", *args],
-            cwd=path, capture_output=True, text=True, timeout=left,
+            argv, cwd=path, capture_output=True, text=True, timeout=left,
             stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0",
                                                GIT_TERMINAL_PROMPT="0"))
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
     return out.stdout if out.returncode == 0 else None
+
+
+def _git_probe(path, args, deadline):
+    """stdout of a read-only `git <args>` in `path`, or None (see _probe). No
+    optional locks (no index refresh racing the command itself) and no fsmonitor
+    hook. GIT_DIR and the like stay in the environment: the command inherits them
+    too, so git's answer is about the checkout the command would really change."""
+    return _probe(["git", "-c", "core.fsmonitor=false", "--no-optional-locks", *args],
+                  path, deadline)
 
 
 def git_status_snapshot(cwd, deadline):
@@ -877,59 +887,206 @@ def git_linked_worktree_note(path, deadline):
             f"{main[0][len('worktree '):]}, not its main checkout.")
 
 
-def _git_context_dirs(command, cwd):
-    """Directories the LLM should know about for a discard: the working directory,
-    then each literal `cd`/`pushd` and `-C` target that exists. These are only
-    places to look: the LLM reads the command to see which one the discard changes,
-    so a stray match costs one extra true fact. An unparsable or dynamic target
-    adds nothing, and the working directory is what remains."""
+_COMMANDS_WORDS_ACTIVE = False
+
+
+def _commands_words(command):
+    """The words of each simple command `command` may run, unquoted and unwrapped,
+    at any depth (`bash -c`, `(…)`, `$(…)`); [] when it can't be read. Reading a
+    command can evaluate code inside it (fish -C), which comes back here: that inner
+    call gets [], or the walk repeats itself hundreds of times."""
+    global _COMMANDS_WORDS_ACTIVE
+    if _COMMANDS_WORDS_ACTIVE:
+        return []
+    _COMMANDS_WORDS_ACTIVE = True
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        return [cwd]
-    dirs = [] if tokens and tokens[0] in ("cd", "pushd") else [cwd]
-    base = cwd
+        lines = [_command_line(c)[0] for c in _iter_commands(command) if c is not None]
+        return [words for words in lines if words]
+    except Exception:
+        return []
+    finally:
+        _COMMANDS_WORDS_ACTIVE = False
 
-    def resolve(word):
+
+# A `cd` that doesn't move the commands after it: in a subshell or substitution,
+# or a pipeline or background job of its own.
+_SCOPED_CD_RE = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])[^;&|\n]*(?:\|(?!\|)|&(?!&))")
+
+
+def _git_command_dirs(command, cwd):
+    """(directories, certain) for git in a command: the working directory, then each
+    `cd`/`pushd` and `git -C` target that exists. These are only places to look: the
+    reader takes the command to see which applies, so a stray one costs one extra
+    true fact. The working directory is left out only when the command itself starts
+    by leaving it. `certain` is False when git may run somewhere this can't name: a
+    target that doesn't resolve (`cd "$X"`), a relative move after an earlier move
+    (that one may not have happened: `if x; then cd a; fi; cd b`), a `cd` whose scope
+    isn't plain (`(cd x); …`), or --git-dir, --work-tree, GIT_DIR."""
+    commands = _commands_words(command)
+    dirs = [] if re.match(r"\s*(?:cd|pushd)(?![\w.-])", command) else [cwd]
+    base, moved = cwd, False
+    certain = not re.search(r"\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)=", command)
+
+    def move(word, relative_to):
+        """The existing directory `word` names, or None; notes what can't be trusted."""
+        nonlocal certain
         word = os.path.expanduser(word)
-        if word.startswith("-") or re.search(r"[\x00-\x1f\x7f]", word) \
-                or (base is None and not os.path.isabs(word)):
+        if moved and not os.path.isabs(word):
+            certain = False
+        path = None
+        if not word.startswith("-") and not re.search(r"[\x00-\x1f\x7f]", word) \
+                and (relative_to is not None or os.path.isabs(word)):
+            path = os.path.realpath(os.path.join(relative_to or "", word))
+        if path is None or not os.path.isdir(path):
+            certain = False
             return None
-        path = os.path.realpath(os.path.join(base or "", word))
-        return path if os.path.isdir(path) else None
+        dirs.append(path)
+        return path
 
-    for i, tok in enumerate(tokens[:-1]):
-        if tok in ("cd", "pushd"):
-            j = i + 1
-            while j < len(tokens) - 1 and tokens[j] in ("-L", "-P", "-e", "-@", "--"):
-                j += 1
-            base = resolve(tokens[j])
-            if base:
-                dirs.append(base)
-        elif tok == "-C":
-            path = resolve(tokens[i + 1])
-            if path:
-                dirs.append(path)
+    for words in commands:
+        name = os.path.basename(words[0])
+        if name in ("cd", "pushd", "popd"):
+            if "(" in command or _SCOPED_CD_RE.search(command):
+                certain = False
+            target = next((w for w in words[1:] if w not in ("-L", "-P", "-e", "-@", "--")), None)
+            if target:
+                base = move(target, base)
+            else:
+                base, certain = None, False
+            moved = True
+        elif name == "git":
+            i, here = 1, base
+            while i < len(words) and words[i].startswith("-"):
+                if words[i] == "-C" and i + 1 < len(words):
+                    here = move(words[i + 1], here)
+                    moved = True
+                if words[i].startswith(("--git-dir", "--work-tree")):
+                    certain = False
+                i += 2 if words[i] in _GIT_VALUE_OPTS else 1
     seen, unique = set(), []
     for d in dirs:
         key = os.path.realpath(d)
         if key not in seen:
             seen.add(key)
             unique.append(d)
-    return unique or [cwd]
+    return unique or [cwd], certain
 
 
-def git_discard_context(command, cwd):
+def _git_context_dirs(command, cwd):
+    """The directories the LLM should know about for this command."""
+    return _git_command_dirs(command, cwd)[0]
+
+
+def git_discard_context(command, cwd, deadline=None):
     """Blocks for the LLM on a command that can discard work: for each directory
     involved, whether it is a linked worktree and its `git status`."""
-    deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S
+    deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     parts = []
     for path in _git_context_dirs(command, cwd)[:GIT_CONTEXT_MAX_DIRS]:
         note = git_linked_worktree_note(path, deadline)
         snapshot = git_status_snapshot(path, deadline)
         parts.extend(p for p in (note, snapshot) if p)
+    return parts
+
+
+# A URL's host and first path segment. A local path or file:// has no owner.
+_REMOTE_OWNER_RE = re.compile(
+    r"(?:(?!file:)[\w+.-]+://(?:[^/@]*@)?(?P<host>[^/:]+)(?::\d+)?/"
+    r"|(?:[^/@:\s]+@)?(?P<scp>[^/:\s]+):(?!/))(?P<owner>[^/\s]+)(?:/.*)?")
+_GIT_REMOTE_HINT_RE = re.compile(r"\bgit\b[^\n;&|]*?\b(?:remote|push)\b")
+GIT_OWNER_RULE_TIMEOUT_S = 1
+
+
+def _remote_owner(url):
+    """`host/owner` of a remote URL, lowercased (no credentials), or None."""
+    m = _REMOTE_OWNER_RE.fullmatch(url.strip())
+    return f"{m['host'] or m['scp']}/{m['owner']}".lower() if m else None
+
+
+def _git_remotes(path, deadline):
+    """{name: {"fetch": url, "push": [urls]}} of the repository at `path`, or None.
+    A remote can have several push URLs, and git pushes to them all."""
+    stdout = _git_probe(path, ["remote", "-v"], deadline)
+    if stdout is None:
+        return None
+    remotes = {}
+    for line in stdout.splitlines():
+        m = re.fullmatch(r"(\S+)\t(.+) \((fetch|push)\)", line)
+        if m and m[3] == "fetch":
+            remotes.setdefault(m[1], {"push": []})["fetch"] = m[2]
+        elif m:
+            remotes.setdefault(m[1], {"push": []})["push"].append(m[2])
+    return remotes
+
+
+def _developer_owners(remotes, path, deadline):
+    """The owners that count as the developer's: origin's fetch URL and the gh
+    login. A push URL can be repointed without changing where code comes from, so
+    it doesn't count, and neither does any other remote: adding one can't vouch
+    for itself."""
+    owners = set()
+    origin = _remote_owner(remotes.get("origin", {}).get("fetch", ""))
+    if origin:
+        owners.add(origin)
+    login = (_probe(["gh", "config", "get", "user", "-h", "github.com"], path, deadline) or "").strip()
+    if re.fullmatch(r"[\w-]+", login):
+        owners.add(f"github.com/{login}".lower())
+    return owners
+
+
+def _git_remote_owner_risk(name, quiet_unresolved=False):
+    """Why a push to the remote `name` goes to the LLM, or None. Every push to a
+    named remote is read here: adding a remote and pushing to it can be two calls,
+    and the push alone looks plain. Each directory the whole command may run git in
+    is checked (a `cd` is an earlier part of the command, not of this one). A remote
+    found nowhere, or a directory that can't be named, goes to the LLM too, as does
+    an owner with nothing to compare against; origin found nowhere stays quiet."""
+    if name.startswith((".", "/", "~")):
+        return None
+    dirs, certain = _git_command_dirs(_TOP_COMMAND or "", HOOK_CWD or os.getcwd())
+    if not certain:
+        return "git push from a directory not resolved here"
+    deadline = time.monotonic() + GIT_OWNER_RULE_TIMEOUT_S
+    found = False
+    for path in dirs:
+        remotes = _git_remotes(path, deadline) or {}
+        urls = remotes.get(name, {}).get("push")
+        if not urls:
+            continue
+        found = True
+        owners = {_remote_owner(url) for url in urls} - {None}
+        foreign = sorted(owners - _developer_owners(remotes, path, deadline)) if owners else []
+        if foreign:
+            return f"git push to a remote owned by none of the developer's owners ({foreign[0][:80]})"
+    if found or name == "origin" or quiet_unresolved:
+        return None
+    return f"git push to a remote not resolved here ({name[:40]})"
+
+
+def git_remote_context(command, cwd, deadline):
+    """Blocks for the LLM on a command that adds, repoints or pushes to a remote:
+    whose are the remotes and the URLs it names. The judge can't otherwise tell a
+    stranger's account from the developer's own."""
+    parts = []
+    named = [w for words in _commands_words(command) for w in words
+             if _remote_owner(w) and ("://" in w or "@" in w.split(":", 1)[0])]
+    for path in _git_context_dirs(command, cwd)[:GIT_CONTEXT_MAX_DIRS]:
+        remotes = _git_remotes(path, deadline)
+        if remotes is None:
+            continue
+        mine = _developer_owners(remotes, path, deadline)
+
+        def verdict(label, owner):
+            whose = "is the developer's" if owner in mine else "matches none of the developer's owners"
+            return f"{label} {owner} {whose}."
+
+        checks = [verdict(f"Remote {name}", _remote_owner(url))
+                  for name, urls in list(remotes.items())[:GIT_CONTEXT_MAX_DIRS * 4]
+                  for url in urls["push"] if _remote_owner(url)]
+        checks += [verdict("URL in the command:", _remote_owner(w)) for w in named]
+        known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here, so a mismatch proves little)"
+        parts.append(f"Owner check in {path}, against origin's fetch URL and the gh login {known}:\n"
+                     + "\n".join(checks))
     return parts
 
 
@@ -944,8 +1101,12 @@ def build_llm_context(input_data):
     tool, tool_input = parse_hook_payload(input_data)
     command = tool_input.get("command") if tool == "Bash" else None
     if isinstance(cwd, str) and os.path.isabs(cwd) and isinstance(command, str) \
-            and _GIT_DISCARD_HINT_RE.search(command):
-        parts.extend(git_discard_context(command, cwd))
+            and (_GIT_DISCARD_HINT_RE.search(command) or _GIT_REMOTE_HINT_RE.search(command)):
+        deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S
+        if _GIT_DISCARD_HINT_RE.search(command):
+            parts.extend(git_discard_context(command, cwd, deadline))
+        if _GIT_REMOTE_HINT_RE.search(command):
+            parts.extend(git_remote_context(command, cwd, deadline))
     messages = recent_user_messages(input_data.get("transcript_path"))
     if messages:
         parts.append("Developer's recent messages (oldest first):")
@@ -2209,12 +2370,16 @@ def _resolve_written(path):
 _C9_BASH_REASON = "Bash write to permission-config path"
 
 
+_BULK_PUSH_REASON = "Pushes every branch to a remote or URL the command itself just named"
+
+
 def human_required_reason(tool, tool_input):
     """Why this call must go to the human with no LLM in the loop, or None.
 
-    The one "human required" class both hooks honor (C9): a write to a
-    permission-config path, by Write/Edit/NotebookEdit or by any command a
-    Bash call may run. It outranks every verdict but a deny.
+    The "human required" classes both hooks honor: a write to a permission-config
+    path (C9), by Write/Edit/NotebookEdit or by any command a Bash call may run,
+    and a push of every branch to a remote the command itself adds or repoints,
+    or to a URL. It outranks every verdict but a deny.
     """
     if not isinstance(tool_input, dict):
         return None
@@ -2225,6 +2390,8 @@ def human_required_reason(tool, tool_input):
     elif tool == "Bash":
         if bash_writes_to_config_path(tool_input.get("command", "")):
             return _C9_BASH_REASON
+        if _bulk_push_to_new_remote(tool_input.get("command", "")):
+            return _BULK_PUSH_REASON
     return None
 
 
@@ -6437,11 +6604,8 @@ def _git_push_option(a):
     return hits[0] + eq + value if len(hits) == 1 else a
 
 
-def _git_push_risk(rest, letters):
-    """Why a `git push` deletes or force-overwrites shared refs, pushes
-    every branch, or pushes to a URL rather than a configured remote, or
-    None. A plain force push (`--force`, `-f`, `+ref`) to a branch other
-    than main/master gets a steer to `--force-with-lease`: ("deny", rewrite)."""
+def _git_push_positional(rest):
+    """A push's option words spelled out, and its positional words."""
     rest = [_git_push_option(a) for a in rest]
     positional, j = [], 0
     while j < len(rest):
@@ -6452,6 +6616,23 @@ def _git_push_risk(rest, letters):
         if not a.startswith("-"):
             positional.append(a)
         j += 1
+    return rest, positional
+
+
+def _git_push_repo(rest, positional):
+    """Where a push goes, as written: git takes the word over --repo."""
+    repo = None
+    for k, a in enumerate(rest):
+        repo = rest[k + 1] if a == "--repo" and k + 1 < len(rest) else a[7:] if a.startswith("--repo=") else repo
+    return positional[0] if positional else repo
+
+
+def _git_push_risk(rest, letters):
+    """Why a `git push` deletes or force-overwrites shared refs, pushes
+    every branch, or pushes to a URL rather than a configured remote, or
+    None. A plain force push (`--force`, `-f`, `+ref`) to a branch other
+    than main/master gets a steer to `--force-with-lease`: ("deny", rewrite)."""
+    rest, positional = _git_push_positional(rest)
     repo_named = any(a == "--repo" or a.startswith("--repo=") for a in rest)
     refspecs = positional if repo_named else positional[1:]
     if "--delete" in rest or "d" in letters or any(r.startswith(":") for r in refspecs):
@@ -6476,13 +6657,55 @@ def _git_push_risk(rest, letters):
             "the remote branch moved since your last fetch. Then run it again."))
     if "--all" in rest or "--branches" in rest:
         return "git push --all (pushes every branch)"
-    repo = None
-    for k, a in enumerate(rest):
-        repo = rest[k + 1] if a == "--repo" and k + 1 < len(rest) else a[7:] if a.startswith("--repo=") else repo
-    repo = positional[0] if positional else repo  # git takes the word over --repo
+    repo = _git_push_repo(rest, positional)
     if repo and ":" in repo:  # a remote's name can't hold one
         return f"git push to a URL, not a configured remote ({repo[:80]})"
-    return None
+    if not repo:
+        return None
+    # `--repo=origin feat` has git read `feat` as the remote; it just fails.
+    return _git_remote_owner_risk(repo, quiet_unresolved=repo_named)
+
+
+# Refspecs that name every branch or ref (`*`, `refs/heads/*:refs/heads/*`)
+_EVERY_BRANCH_REFSPEC_RE = re.compile(r"\+?(?:refs/(?:heads/)?)?\*(?::.*)?")
+
+
+def _bulk_push_to_new_remote(command):
+    """True when the command pushes every branch to a URL, or to a remote it adds or
+    repoints itself. Too rare in real work and too costly when wrong to leave to a
+    verdict, however the LLM reads it. Every branch: --all, --branches, --mirror, a
+    `*` refspec, or a remote added with --mirror or --mirror=push. A push naming no
+    remote goes to whichever the config says, so it counts as going to the new one.
+    An alias set on the command line (`-c alias.p=push`) reads as what it stands for."""
+    new, mirrored = set(), set()
+    for words in _commands_words(command):
+        if os.path.basename(words[0]) != "git":
+            continue
+        i, aliases = 1, {}
+        while i < len(words) and words[i].startswith("-"):
+            if words[i] == "-c" and i + 1 < len(words) and words[i + 1].lower().startswith("alias."):
+                key, _, value = words[i + 1].partition("=")
+                aliases[key[6:].lower()] = _shlex_split_safe(value) or []
+            i += 2 if words[i] in _GIT_VALUE_OPTS else 1
+        args = words[i:]
+        for _ in range(5):  # git ignores an alias named like a built-in
+            if not args or args[0] in ("push", "remote") or args[0].lower() not in aliases:
+                break
+            args = aliases[args[0].lower()] + args[1:]
+        sub, rest = (args[0], args[1:]) if args else (None, [])
+        plain = [a for a in rest if not a.startswith("-")]
+        if sub == "remote" and plain[:1] in (["add"], ["set-url"]) and len(plain) > 1:
+            new.add(plain[1])
+            if any(a in ("--mirror", "--mirror=push") for a in rest):
+                mirrored.add(plain[1])
+        elif sub == "push":
+            rest, positional = _git_push_positional(rest)
+            repo = _git_push_repo(rest, positional)
+            every = any(a in rest for a in ("--all", "--branches", "--mirror")) or repo in mirrored \
+                or any(_EVERY_BRANCH_REFSPEC_RE.fullmatch(r) for r in positional[1:])
+            if every and (repo in new or (repo and ":" in repo) or (repo is None and new)):
+                return True
+    return False
 
 
 _PLAIN_CODE_RE = re.compile(r"[\w \t./=:@%+,-]*")

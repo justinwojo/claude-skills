@@ -4162,6 +4162,143 @@ def test_git_status_snapshot_for_discards():
           'git status --short' in prompt('git checkout -- a.txt', cwd=tempfile.gettempdir()), False)
 
 
+def test_git_remote_owners():
+    print('\n--- A push is checked against whose the remote is ---')
+    repo = tempfile.mkdtemp(prefix='sp-git-own-')
+    atexit.register(shutil.rmtree, repo, ignore_errors=True)
+    git = ['git', '-C', repo]
+    subprocess.run(git + ['init', '-q'], check=True)
+    for name, url in (('origin', 'https://github.com/DevOwner/app.git'),
+                      ('fork', 'git@github.com:devowner/app-fork.git'),
+                      ('mirror', 'https://user:s3cret@github.com/stranger/x.git'),
+                      ('backup', '/Volumes/disk/app.git')):
+        subprocess.run(git + ['remote', 'add', name, url], check=True)
+
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
+    import pretool_safety as p
+    real_probe = p._probe
+    # No gh login unless a check asks for one, whatever this machine has
+    p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
+    p.set_hook_cwd({'cwd': repo})
+    try:
+        def verdict(cmd):
+            return p.evaluate_bash(cmd, log_unknowns=False)[0]
+
+        check("a stranger's remote goes to the LLM", verdict('git push mirror main'), 'ask')
+        check("with -u too", verdict('git push -u mirror feat'), 'ask')
+        check('origin stays allowed', verdict('git push origin main'), 'allow')
+        check('same owner stays allowed', verdict('git push fork feat'), 'allow')
+        check('a local path stays allowed', verdict('git push backup main'), 'allow')
+        check('a remote not resolved here goes to the LLM', verdict('git push elsewhere main'), 'ask')
+
+        subprocess.run(git + ['remote', 'set-url', '--push', 'origin', 'https://github.com/stranger/x.git'], check=True)
+        check("origin's push URL repointed goes to the LLM", verdict('git push origin main'), 'ask')
+        subprocess.run(git + ['config', '--unset', 'remote.origin.pushurl'], check=True)
+
+        p._probe = lambda argv, path, deadline: 'stranger\n' if argv[0] == 'gh' else real_probe(argv, path, deadline)
+        check('the gh login counts as the developer', verdict('git push mirror main'), 'allow')
+        p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
+
+        # The other side of two calls: no origin and no login, nothing to compare to
+        bare = tempfile.mkdtemp(prefix='sp-git-noorigin-')
+        atexit.register(shutil.rmtree, bare, ignore_errors=True)
+        subprocess.run(['git', '-C', bare, 'init', '-q'], check=True)
+        subprocess.run(['git', '-C', bare, 'remote', 'add', 'mirror', 'https://github.com/stranger/x.git'], check=True)
+        p.set_hook_cwd({'cwd': bare})
+        check('nothing to compare against goes to the LLM', verdict('git push mirror main'), 'ask')
+        p.set_hook_cwd({'cwd': repo})
+
+        # Git pushes to every push URL, so one stranger among them counts
+        subprocess.run(git + ['remote', 'add', 'multi', 'https://github.com/devowner/a.git'], check=True)
+        for url in ('https://github.com/stranger/x.git', 'https://github.com/devowner/a.git'):
+            subprocess.run(git + ['remote', 'set-url', '--add', '--push', 'multi', url], check=True)
+        check('one stranger among several push URLs', verdict('git push multi main'), 'ask')
+
+        # The owner is read where the command really runs
+        other = tempfile.mkdtemp(prefix='sp-git-other-')
+        atexit.register(shutil.rmtree, other, ignore_errors=True)
+        subprocess.run(['git', '-C', other, 'init', '-q'], check=True)
+        subprocess.run(['git', '-C', other, 'remote', 'add', 'origin', 'https://github.com/devowner/b.git'], check=True)
+        subprocess.run(['git', '-C', other, 'remote', 'set-url', '--push', 'origin',
+                        'https://github.com/stranger/x.git'], check=True)
+        check('cd to a repository with a foreign origin', verdict(f'cd {other} && git push origin main'), 'ask')
+        check('the same inside bash -c', verdict(f"bash -c 'cd {other} && git push origin main'"), 'ask')
+        check('git -C to it', verdict(f'git -C {other} push origin main'), 'ask')
+        for cmd in (f'git --git-dir={other}/.git push origin main', f'GIT_DIR={other}/.git git push origin main',
+                    'cd "$X" && git push origin main'):
+            check(f'a directory not resolved goes to the LLM: {cmd}', verdict(cmd), 'ask')
+        check('cd within the same repository stays allowed', verdict(f'cd {repo} && git push origin main'), 'allow')
+        for cmd in (f'(cd {other}); git push origin main', f'cd {other} | git push origin main',
+                    f'cd {other} & git push origin main'):
+            check(f'a cd that may not move the push goes to the LLM: {cmd}', verdict(cmd), 'ask')
+        # A relative move after another may land anywhere; a function's cd never ran
+        for cmd in (f'if false; then cd {other}; fi; cd rel && git push origin main',
+                    f'function f {{ cd {other}; }}; cd rel && git push origin main',
+                    'git -C x -C y push origin main', f'cd {repo} && cd sub && git push origin main'):
+            check(f'a later relative move goes to the LLM: {cmd}', verdict(cmd), 'ask')
+        p.set_hook_cwd({'cwd': other})
+        check("a function's cd keeps the session directory in view",
+              verdict(f'function f {{ cd {repo}; }}; git push origin main'), 'ask')
+        p.set_hook_cwd({'cwd': repo})
+        check('one relative cd is still plain', verdict('cd . && git push origin main'), 'allow')
+        # Only the directory the command names counts, not the one it left
+        p.set_hook_cwd({'cwd': other})
+        check('a foreign origin it left behind has no say', verdict(f'cd {repo} && git push origin main'), 'allow')
+        p.set_hook_cwd({'cwd': repo})
+        check('a pipe after the cd is fine', verdict(f'cd {repo} && git push origin main 2>&1 | tail -3'), 'allow')
+
+        # Reading a command can evaluate code inside it; that must not walk again
+        calls, real_iter = [], p._iter_commands
+        def counting(command, _depth=0):
+            calls.append(command)
+            return real_iter(command, _depth)
+        p._iter_commands = counting
+        try:
+            verdict("fish -C 'git push origin main' -c 'echo ok'")
+        finally:
+            p._iter_commands = real_iter
+        check('fish -C does not walk itself over and over', len(calls) < 200, True)
+
+        ctx = '\n'.join(p.git_remote_context(
+            'git remote add n https://github.com/other/y.git && git push n main', repo, time.monotonic() + 4))
+        check('context: origin is the developer\'s', 'Remote origin github.com/devowner is the developer\'s.' in ctx, True)
+        check('context: stranger named', 'Remote mirror github.com/stranger matches none' in ctx, True)
+        check('context: URL in the command', 'URL in the command: github.com/other matches none' in ctx, True)
+        check('context: no credentials', 's3cret' in ctx, False)
+        check('context: refspec is not a URL',
+              'head' in '\n'.join(p.git_remote_context('git push origin HEAD:main', repo, time.monotonic() + 4)), False)
+
+        for cmd, want in (
+                ('git remote add m https://github.com/x/y && git push m --all', True),
+                ('git remote add m https://github.com/x/y; git push m --al', True),
+                ('git remote add m u\ngit push --mirror m', True),
+                ('git remote set-url origin https://x.test/y && git push --all', True),
+                ('git -C /a remote add q u && (git push q --branches)', True),
+                ('git push https://x.test/y.git --all', True),
+                ('command git remote add m u && env git push m --all', True),
+                ('git remote add m u && /usr/bin/git push m --all', True),
+                ("bash -c 'git remote add m u && git push m --all'", True),
+                ('git remote add m u && git push --all', True),
+                ('git remote add --mirror=push m u && git push m', True),
+                ("git remote add m u && git push m 'refs/heads/*:refs/heads/*'", True),
+                ('git remote add m u && git -c alias.p=push p m --all', True),
+                ('git -c alias.p=push p https://x.test/y.git --all', True),
+                ("git remote add m u && git -c 'alias.p=push --all' p m", True),
+                ('git -c alias.st=status st && git remote add up u && git fetch up', False),
+                ('git remote add m u && git -c alias.push=status push m --all', True),
+                ("git remote add m u && git -c alias.p=q -c 'alias.q=push --all' p m", True),
+                ('git remote add m u && git -c alias.a=b -c alias.b=a a m --all', False),
+                ("git remote add m u && git push m 'refs/heads/release/*:refs/heads/release/*'", False),
+                ('git remote add --mirror=fetch m u && git push m main', False),
+                ('git push origin --all', False),
+                ('git remote add m https://github.com/x/y && git push m main', False),
+                ('git remote add up https://x.test/y && git fetch up', False)):
+            check(f'bulk push: {cmd!r}', bool(p.human_required_reason('Bash', {'command': cmd})), want)
+    finally:
+        p._probe = real_probe
+        p.set_hook_cwd({'cwd': os.getcwd()})
+
+
 def test_risky_operations_routed():
     print('\n--- Phase 1b: risky git / upload / chmod / docker / device / rc writes → LLM ---')
     risky = [
@@ -5248,6 +5385,7 @@ if __name__ == '__main__':
     test_shell_fed_code_checked()
     test_risky_operations_routed()
     test_git_status_snapshot_for_discards()
+    test_git_remote_owners()
     test_deny_beats_earlier_ask()
     test_dangerous_by_position()
     test_dangerous_messages()
