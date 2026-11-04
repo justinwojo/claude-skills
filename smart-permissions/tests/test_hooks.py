@@ -4067,6 +4067,94 @@ def test_git_status_snapshot_for_discards():
         f.write('edited inside the submodule\n')
     check('dirty submodule listed', ' M sub' in prompt('git reset --hard --recurse-submodules', cwd=outer), True)
 
+    # A linked worktree: labelled, and the snapshot follows a cd or -C to it
+    tree = os.path.join(tempfile.mkdtemp(prefix='sp-git-wt-'), 'nv1')
+    atexit.register(shutil.rmtree, os.path.dirname(tree), ignore_errors=True)
+    subprocess.run(git + ['worktree', 'add', '-q', '-b', 'nv1', tree], check=True)
+    atexit.register(subprocess.run, git + ['worktree', 'prune'], capture_output=True)
+    with open(os.path.join(tree, 'kept.txt'), 'w') as f:
+        f.write('edited in the worktree\n')
+    linked = 'is a linked git worktree'
+    real_tree = os.path.realpath(tree)
+    for label, user in (
+            ('cd', prompt(f'cd {tree} && git checkout -- kept.txt && git status --short')),
+            ('cwd', prompt('git checkout -- kept.txt', cwd=tree))):
+        check(f'worktree via {label}: labelled linked', f'{real_tree} {linked}' in user, True)
+        check(f'worktree via {label}: its edit listed', ' M kept.txt' in user, True)
+    user = prompt(f'cd {tree} && git checkout -- kept.txt')
+    check('cd first: main checkout not snapshotted', '?? new.txt' in user, False)
+    user = prompt(f'git -C {tree} checkout -- kept.txt')
+    check('git -C: worktree labelled', f'{real_tree} {linked}' in user, True)
+    check('git -C: both directories covered', ' M kept.txt' in user and '?? new.txt' in user, True)
+    user = prompt(f'cd {tree} && cd {repo} && git reset --hard')
+    check('cd back to main: both covered', ' M kept.txt' in user and ' M edited.txt' in user, True)
+    check('main checkout never labelled linked', f'{os.path.realpath(repo)} {linked}' in user, False)
+    check('main checkout alone: no label', linked in prompt('git checkout -- edited.txt'), False)
+    user = prompt('cd "$WT" && git checkout -- kept.txt')
+    check('dynamic cd: falls back to the cwd', ' M edited.txt' in user and linked not in user, True)
+    check('unbalanced quote: falls back to the cwd', ' M edited.txt' in prompt("git checkout -- x; echo 'y"), True)
+
+    # A bare repository's checkouts are all linked, the developer's own too
+    bare = tempfile.mkdtemp(prefix='sp-git-bare-')
+    atexit.register(shutil.rmtree, bare, ignore_errors=True)
+    subprocess.run(['git', 'clone', '-q', '--bare', repo, os.path.join(bare, 'r.git')],
+                   check=True, capture_output=True)
+    bare_tree = os.path.join(bare, 'main')
+    subprocess.run(['git', '-C', os.path.join(bare, 'r.git'), 'worktree', 'add', '-q', '--detach', bare_tree],
+                   check=True, capture_output=True)
+    check('bare repository checkout: no label', linked in prompt('git reset --hard', cwd=bare_tree), False)
+    dotgit = tempfile.mkdtemp(prefix='sp-git-baredot-')
+    atexit.register(shutil.rmtree, dotgit, ignore_errors=True)
+    subprocess.run(['git', 'clone', '-q', '--bare', repo, os.path.join(dotgit, '.git')],
+                   check=True, capture_output=True)
+    subprocess.run(['git', '-C', dotgit, 'worktree', 'add', '-q', '--detach', os.path.join(dotgit, 'main')],
+                   check=True, capture_output=True)
+    check('bare repository stored as .git: no label',
+          linked in prompt('git reset --hard', cwd=os.path.join(dotgit, 'main')), False)
+
+    # A main checkout with its git directory elsewhere still has linked worktrees
+    sep = tempfile.mkdtemp(prefix='sp-git-sep-')
+    atexit.register(shutil.rmtree, sep, ignore_errors=True)
+    sg = ['git', '-C', os.path.join(sep, 'co'), '-c', 'user.name=t', '-c', 'user.email=t@t',
+          '-c', 'commit.gpgsign=false']
+    subprocess.run(['git', 'init', '-q', '--separate-git-dir', os.path.join(sep, 'meta'),
+                    os.path.join(sep, 'co')], check=True)
+    subprocess.run(sg + ['commit', '-qm', 'init', '--allow-empty'], check=True)
+    subprocess.run(sg + ['worktree', 'add', '-q', '-b', 'w', os.path.join(sep, 'w')], check=True)
+    user = prompt('git reset --hard', cwd=os.path.join(sep, 'w'))
+    check('separate git directory: worktree labelled', linked in user, True)
+    check('separate git directory: main checkout not labelled',
+          linked in prompt('git reset --hard', cwd=os.path.join(sep, 'co')), False)
+
+    # Quoted special characters, and a literal target after a dynamic one
+    odd = os.path.join(tempfile.mkdtemp(prefix='sp-git-odd-'), 'nv[1]')
+    atexit.register(shutil.rmtree, os.path.dirname(odd), ignore_errors=True)
+    subprocess.run(git + ['worktree', 'add', '-q', '-b', 'odd', odd], check=True)
+    check('special characters in the path: labelled',
+          linked in prompt(f"cd '{odd}' && git reset --hard"), True)
+    check('absolute cd after a dynamic one: labelled',
+          linked in prompt(f'cd "$ROOT" && cd {tree} && git reset --hard'), True)
+
+    # GIT_DIR in the environment reaches the command, so the context follows it
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
+    import pretool_safety
+    saved = {k: os.environ.get(k) for k in ('GIT_DIR', 'GIT_WORK_TREE')}
+    os.environ.update(GIT_DIR=os.path.join(repo, '.git'), GIT_WORK_TREE=repo)
+    try:
+        ctx = pretool_safety.git_discard_context('git reset --hard', tree)
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+    check('inherited GIT_DIR: no linked label', any(linked in c for c in ctx), False)
+    check('inherited GIT_DIR: status of the real target', any(' M edited.txt' in c for c in ctx), True)
+    os.environ['GIT_WORK_TREE'] = repo
+    try:
+        ctx = pretool_safety.git_discard_context('git reset --hard', tree)
+    finally:
+        os.environ.pop('GIT_WORK_TREE') if saved['GIT_WORK_TREE'] is None \
+            else os.environ.__setitem__('GIT_WORK_TREE', saved['GIT_WORK_TREE'])
+    check('inherited GIT_WORK_TREE alone: no linked label', any(linked in c for c in ctx), False)
+
     check('other git risk (reset --hard) also gets it',
           'git status --short' in prompt('git reset --hard'), True)
     check('non-git command: no snapshot', 'git status --short' in prompt('flyctl deploy'), False)

@@ -85,10 +85,13 @@ upload needs explicit authorization.
   harness notices are never sent, so file or web content can't argue its way
   past the judge. For a Bash command that can discard work (`git checkout`,
   `restore`, `reset`, `clean`, `switch`, `stash`) it also gets a read-only
-  `git status --short` of the working directory (2s cap, 40 lines, ignored
-  files not listed), so a
+  `git status --short` of the working directory and of any literal `cd` or
+  `git -C` target (2s cap each, 40 lines, ignored files not listed), so a
   `git checkout --` of paths that hold no uncommitted or untracked changes
-  goes through, and one over real edits is still flagged. It also sees why the local rules sent the call (`Unknown
+  goes through, and one over real edits is still flagged. Git also says whether
+  each directory is a linked worktree: a discard there passes even over edits,
+  wherever the worktree lives. A checkout of a bare repository gets no such pass,
+  since the developer's own checkout is linked there too. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
   a hint about what to check.
 - **Messages are a partial view.** An agent often works from earlier
@@ -98,7 +101,7 @@ upload needs explicit authorization.
   for. Routine git housekeeping is named as safe: fetch, merge, pushes without
   `--force` (to `main` too), deleting branches other than the default, and
   removing worktrees, agent worktrees above all. Discarding uncommitted work
-  still counts, but only in your own checkout.
+  still counts, but only in your main checkout, not in a linked worktree.
 - **No cache.** Every call is judged afresh, so a verdict always reflects the
   current context. A timeout or error reports the total time spent
   (`LLM unavailable (…; 6.2s in all)`) and goes to you.

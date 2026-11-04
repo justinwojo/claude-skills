@@ -450,8 +450,9 @@ to or deletion of the default branch, broad refspecs, rewriting pushed history \
 on the default branch, and discarding uncommitted changes in the developer's own \
 checkout (git reset --hard, git checkout -- ., git clean -fdx) when nothing \
 shows it's wanted. Not the developer's own checkout: an agent worktree (a path \
-under .claude/worktrees/agent-…), where a discard is the agent's own \
-housekeeping, but only when the checkout the discard changes is that worktree \
+under .claude/worktrees/agent-…) or a directory the context labels a linked git \
+worktree, where a discard is the agent's own housekeeping, even over uncommitted \
+edits, but only when the checkout the discard changes is that worktree \
 (after any cd, git -C, --work-tree or --git-dir), not merely where it starts. Not lost: files under a build-output directory \
 (dist/, build/, out/, generated/) rebuilt from sources the command leaves in \
 place, even when uncommitted. Hand-written source, config or docs is never \
@@ -805,38 +806,131 @@ def recent_user_messages(transcript_path, limit=CONTEXT_MAX_MESSAGES):
 _GIT_DISCARD_HINT_RE = re.compile(r"\bgit\b[^\n;&|]*?\b(?:checkout|restore|reset|clean|switch|stash)\b")
 GIT_STATUS_TIMEOUT_S = 2
 GIT_STATUS_MAX_LINES = 40
+# All git probes for one call. On top of the LLM's 24s it stays under the 30s
+# at which Claude Code kills a hook.
+GIT_CONTEXT_BUDGET_S = 4
+GIT_CONTEXT_MAX_DIRS = 3
 
 
-def git_status_snapshot(cwd):
-    """`git status --short` of the repository at `cwd`, labelled for the LLM,
-    or '' (not a repository, git missing, slow or failing). It lets the LLM
-    see whether the paths a `git checkout --` / `reset --hard` / `clean`
-    would overwrite hold uncommitted or untracked work. No optional locks
-    (no index refresh racing the command itself) and no fsmonitor hook;
-    otherwise it is the plain `git status` the rules already allow. Dirty
-    submodules are listed; ignored files are not (named in the label)."""
+def _git_probe(path, args, deadline):
+    """stdout of a read-only `git <args>` in `path`, or None (not a repository,
+    git missing, slow, failing, or past `deadline`). No optional locks (no index
+    refresh racing the command itself) and no fsmonitor hook. GIT_DIR and the
+    like stay in the environment: the command inherits them too, so git's answer
+    is about the checkout the command would really change."""
     import subprocess
+    left = min(GIT_STATUS_TIMEOUT_S, deadline - time.monotonic())
+    if left <= 0:
+        return None
     try:
         out = subprocess.run(
-            ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", "status",
-             "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"],
-            cwd=cwd, capture_output=True, text=True, timeout=GIT_STATUS_TIMEOUT_S,
+            ["git", "-c", "core.fsmonitor=false", "--no-optional-locks", *args],
+            cwd=path, capture_output=True, text=True, timeout=left,
             stdin=subprocess.DEVNULL, env=dict(os.environ, GIT_OPTIONAL_LOCKS="0",
                                                GIT_TERMINAL_PROMPT="0"))
     except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def git_status_snapshot(cwd, deadline):
+    """`git status --short` of the repository at `cwd`, labelled for the LLM,
+    or '' when git can't say. It lets the LLM see whether the paths a `git
+    checkout --` / `reset --hard` / `clean` would overwrite hold uncommitted
+    or untracked work. Dirty submodules are listed; ignored files are not
+    (named in the label)."""
+    stdout = _git_probe(cwd, ["status", "--porcelain=v1", "--untracked-files=all",
+                              "--ignore-submodules=none"], deadline)
+    if stdout is None:
         return ""
-    if out.returncode != 0:
-        return ""
-    lines = out.stdout.splitlines()
-    head = (f"`git status --short` in {cwd}, taken before the command runs (a `cd` or "
-            "`git -C` in the command, or its own earlier steps, can make it not apply; "
-            "ignored files are not listed):")
+    lines = stdout.splitlines()
+    head = (f"`git status --short` in {cwd}, taken before the command runs (it does not "
+            "cover a directory the command moves to that isn't shown here, and the "
+            "command's own earlier steps can make it not apply; ignored files are not listed):")
     if not lines:
         return f"{head}\n(clean: no uncommitted changes and no untracked files; ignored files unknown)"
     body = "\n".join(lines[:GIT_STATUS_MAX_LINES])
     if len(lines) > GIT_STATUS_MAX_LINES:
         body += f"\n[… {len(lines) - GIT_STATUS_MAX_LINES} more entries not shown]"
     return f"{head}\n{body}"
+
+
+def git_linked_worktree_note(path, deadline):
+    """A sentence for the LLM when `path` is in a linked worktree of a repository
+    with a main checkout, else ''. Asks git, not the path's name, so any layout
+    counts. A bare repository gets no note: there every checkout is linked, the
+    developer's own included. Nor does an inherited GIT_DIR or GIT_WORK_TREE: the
+    metadata and the files changed may then belong to different checkouts."""
+    if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+        return ""
+    stdout = _git_probe(path, ["rev-parse", "--path-format=absolute", "--git-dir",
+                               "--git-common-dir", "--show-toplevel"], deadline)
+    lines = stdout.splitlines() if stdout else []
+    if len(lines) != 3 or os.path.realpath(lines[0]) == os.path.realpath(lines[1]):
+        return ""
+    # `worktree list` always starts with the main worktree.
+    listing = _git_probe(path, ["worktree", "list", "--porcelain"], deadline) or ""
+    main = listing.split("\n\n", 1)[0].splitlines()
+    if not main or not main[0].startswith("worktree ") or "bare" in main:
+        return ""
+    return (f"{lines[2]} is a linked git worktree of the repository at "
+            f"{main[0][len('worktree '):]}, not its main checkout.")
+
+
+def _git_context_dirs(command, cwd):
+    """Directories the LLM should know about for a discard: the working directory,
+    then each literal `cd`/`pushd` and `-C` target that exists. These are only
+    places to look: the LLM reads the command to see which one the discard changes,
+    so a stray match costs one extra true fact. An unparsable or dynamic target
+    adds nothing, and the working directory is what remains."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return [cwd]
+    dirs = [] if tokens and tokens[0] in ("cd", "pushd") else [cwd]
+    base = cwd
+
+    def resolve(word):
+        word = os.path.expanduser(word)
+        if word.startswith("-") or re.search(r"[\x00-\x1f\x7f]", word) \
+                or (base is None and not os.path.isabs(word)):
+            return None
+        path = os.path.realpath(os.path.join(base or "", word))
+        return path if os.path.isdir(path) else None
+
+    for i, tok in enumerate(tokens[:-1]):
+        if tok in ("cd", "pushd"):
+            j = i + 1
+            while j < len(tokens) - 1 and tokens[j] in ("-L", "-P", "-e", "-@", "--"):
+                j += 1
+            base = resolve(tokens[j])
+            if base:
+                dirs.append(base)
+        elif tok == "-C":
+            path = resolve(tokens[i + 1])
+            if path:
+                dirs.append(path)
+    seen, unique = set(), []
+    for d in dirs:
+        key = os.path.realpath(d)
+        if key not in seen:
+            seen.add(key)
+            unique.append(d)
+    return unique or [cwd]
+
+
+def git_discard_context(command, cwd):
+    """Blocks for the LLM on a command that can discard work: for each directory
+    involved, whether it is a linked worktree and its `git status`."""
+    deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S
+    parts = []
+    for path in _git_context_dirs(command, cwd)[:GIT_CONTEXT_MAX_DIRS]:
+        note = git_linked_worktree_note(path, deadline)
+        snapshot = git_status_snapshot(path, deadline)
+        parts.extend(p for p in (note, snapshot) if p)
+    return parts
 
 
 def build_llm_context(input_data):
@@ -851,9 +945,7 @@ def build_llm_context(input_data):
     command = tool_input.get("command") if tool == "Bash" else None
     if isinstance(cwd, str) and os.path.isabs(cwd) and isinstance(command, str) \
             and _GIT_DISCARD_HINT_RE.search(command):
-        snapshot = git_status_snapshot(cwd)
-        if snapshot:
-            parts.append(snapshot)
+        parts.extend(git_discard_context(command, cwd))
     messages = recent_user_messages(input_data.get("transcript_path"))
     if messages:
         parts.append("Developer's recent messages (oldest first):")

@@ -135,7 +135,10 @@ def build_context(p, case, tmpdir):
         for text in case["messages"]:
             f.write(json.dumps({"type": "user", "origin": {"kind": "human"},
                                 "message": {"role": "user", "content": text}}) + "\n")
-    return p.build_llm_context({"cwd": case["cwd"], "transcript_path": transcript})
+    context = p.build_llm_context({"cwd": case["cwd"], "transcript_path": transcript})
+    # What the hook would compute from a real repository (worktree note, git status).
+    before = case.get("context_before")
+    return f"{before}\n{context}" if before else context
 
 
 # ============================================================
