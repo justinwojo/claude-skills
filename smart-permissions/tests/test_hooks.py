@@ -4206,6 +4206,22 @@ def test_git_remote_owners():
         subprocess.run(['git', '-C', bare, 'remote', 'add', 'mirror', 'https://github.com/stranger/x.git'], check=True)
         p.set_hook_cwd({'cwd': bare})
         check('nothing to compare against goes to the LLM', verdict('git push mirror main'), 'ask')
+        ctx = '\n'.join(p.git_remote_context('git push mirror main', bare, time.monotonic() + 4))
+        check('no owners known: the owner is named', 'Remote mirror github.com/stranger.' in ctx, True)
+        check('no owners known: no mismatch claimed', 'matches none' in ctx, False)
+
+        # Azure DevOps over SSH keeps the organisation in the second segment
+        azure = tempfile.mkdtemp(prefix='sp-git-azure-')
+        atexit.register(shutil.rmtree, azure, ignore_errors=True)
+        subprocess.run(['git', '-C', azure, 'init', '-q'], check=True)
+        for name, url in (('origin', 'git@ssh.dev.azure.com:v3/Me/proj/repo'),
+                          ('other', 'git@ssh.dev.azure.com:v3/Stranger/proj/repo'),
+                          ('mine', 'git@ssh.dev.azure.com:v3/Me/other/repo')):
+            subprocess.run(['git', '-C', azure, 'remote', 'add', name, url], check=True)
+        p.set_hook_cwd({'cwd': azure})
+        check('another Azure organisation goes to the LLM', verdict('git push other main'), 'ask')
+        check('the same Azure organisation stays allowed', verdict('git push mine main'), 'allow')
+        check('a GitHub user named v3 is not read as Azure', p._remote_owner('git@github.com:v3/x.git'), 'github.com/v3')
         p.set_hook_cwd({'cwd': repo})
 
         # Git pushes to every push URL, so one stranger among them counts
@@ -4285,6 +4301,14 @@ def test_git_remote_owners():
                 ('git -c alias.p=push p https://x.test/y.git --all', True),
                 ("git remote add m u && git -c 'alias.p=push --all' p m", True),
                 ('git -c alias.st=status st && git remote add up u && git fetch up', False),
+                ('git remote add -t dev m u && git push m --all', True),
+                ('git remote add -m dev m u && git push m --all', True),
+                ('git remote add --track dev m u && git push m --all', True),
+                ('git remote add --mirror=push -t dev m u && git push m', True),
+                ("git -c 'alias.a=remote add -t dev' a m u && git push m --all", True),
+                ('git config remote.origin.pushurl https://x.test/y && git push --all', True),
+                ('git config remote.origin.url https://x.test/y && git push origin --all', True),
+                ('git config --get remote.origin.url && git push origin --all', False),
                 ('git remote add m u && git -c alias.push=status push m --all', True),
                 ("git remote add m u && git -c alias.p=q -c 'alias.q=push --all' p m", True),
                 ('git remote add m u && git -c alias.a=b -c alias.b=a a m --all', False),

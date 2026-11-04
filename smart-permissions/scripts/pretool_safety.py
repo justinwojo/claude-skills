@@ -992,7 +992,7 @@ def git_discard_context(command, cwd, deadline=None):
 # A URL's host and first path segment. A local path or file:// has no owner.
 _REMOTE_OWNER_RE = re.compile(
     r"(?:(?!file:)[\w+.-]+://(?:[^/@]*@)?(?P<host>[^/:]+)(?::\d+)?/"
-    r"|(?:[^/@:\s]+@)?(?P<scp>[^/:\s]+):(?!/))(?P<owner>[^/\s]+)(?:/.*)?")
+    r"|(?:[^/@:\s]+@)?(?P<scp>[^/:\s]+):(?!/))(?P<owner>[^/\s]+)(?:/(?P<rest>.*))?")
 _GIT_REMOTE_HINT_RE = re.compile(r"\bgit\b[^\n;&|]*?\b(?:remote|push)\b")
 GIT_OWNER_RULE_TIMEOUT_S = 1
 
@@ -1000,7 +1000,13 @@ GIT_OWNER_RULE_TIMEOUT_S = 1
 def _remote_owner(url):
     """`host/owner` of a remote URL, lowercased (no credentials), or None."""
     m = _REMOTE_OWNER_RE.fullmatch(url.strip())
-    return f"{m['host'] or m['scp']}/{m['owner']}".lower() if m else None
+    if not m:
+        return None
+    host, owner = m["host"] or m["scp"], m["owner"]
+    # Azure DevOps over SSH: git@ssh.dev.azure.com:v3/Org/project/repo
+    if owner == "v3" and m["rest"] and re.search(r"(?:azure|visualstudio)\.com$", host):
+        owner = m["rest"].split("/", 1)[0]
+    return f"{host}/{owner}".lower()
 
 
 def _git_remotes(path, deadline):
@@ -1077,6 +1083,8 @@ def git_remote_context(command, cwd, deadline):
         mine = _developer_owners(remotes, path, deadline)
 
         def verdict(label, owner):
+            if not mine:
+                return f"{label} {owner}."
             whose = "is the developer's" if owner in mine else "matches none of the developer's owners"
             return f"{label} {owner} {whose}."
 
@@ -1084,7 +1092,7 @@ def git_remote_context(command, cwd, deadline):
                   for name, urls in list(remotes.items())[:GIT_CONTEXT_MAX_DIRS * 4]
                   for url in urls["push"] if _remote_owner(url)]
         checks += [verdict("URL in the command:", _remote_owner(w)) for w in named]
-        known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here, so a mismatch proves little)"
+        known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here)"
         parts.append(f"Owner check in {path}, against origin's fetch URL and the gh login {known}:\n"
                      + "\n".join(checks))
     return parts
@@ -6672,7 +6680,7 @@ _EVERY_BRANCH_REFSPEC_RE = re.compile(r"\+?(?:refs/(?:heads/)?)?\*(?::.*)?")
 
 def _bulk_push_to_new_remote(command):
     """True when the command pushes every branch to a URL, or to a remote it adds or
-    repoints itself. Too rare in real work and too costly when wrong to leave to a
+    repoints itself (`git remote add`, `set-url`, or `git config` of its URL). Too rare in real work and too costly when wrong to leave to a
     verdict, however the LLM reads it. Every branch: --all, --branches, --mirror, a
     `*` refspec, or a remote added with --mirror or --mirror=push. A push naming no
     remote goes to whichever the config says, so it counts as going to the new one.
@@ -6693,11 +6701,25 @@ def _bulk_push_to_new_remote(command):
                 break
             args = aliases[args[0].lower()] + args[1:]
         sub, rest = (args[0], args[1:]) if args else (None, [])
-        plain = [a for a in rest if not a.startswith("-")]
-        if sub == "remote" and plain[:1] in (["add"], ["set-url"]) and len(plain) > 1:
-            new.add(plain[1])
-            if any(a in ("--mirror", "--mirror=push") for a in rest):
-                mirrored.add(plain[1])
+        if sub == "remote":
+            plain, j = [], 0
+            while j < len(rest):  # these take a value, and the next word isn't the remote
+                if rest[j] in ("-t", "--track", "-m", "--master"):
+                    j += 2
+                    continue
+                if not rest[j].startswith("-"):
+                    plain.append(rest[j])
+                j += 1
+            if plain[:1] in (["add"], ["set-url"]) and len(plain) > 1:
+                new.add(plain[1])
+                if any(a in ("--mirror", "--mirror=push") for a in rest):
+                    mirrored.add(plain[1])
+        elif sub == "config":  # a read names only the key
+            plain = [a for a in rest if not a.startswith("-")]
+            for key, value in zip(plain, plain[1:]):
+                m = re.fullmatch(r"remote\.(.+)\.(?:url|pushurl)", key, re.I)
+                if m:
+                    new.add(m[1])
         elif sub == "push":
             rest, positional = _git_push_positional(rest)
             repo = _git_push_repo(rest, positional)
