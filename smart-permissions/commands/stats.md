@@ -31,7 +31,7 @@ Read the JSONL (one JSON object per line). Each record has these fields:
 | `ts` | ISO timestamp (seconds) |
 | `hook` | `pretool` or `permission_request` |
 | `tool` | tool name (`Bash`, `Write`, `WebFetch`, `mcp__…`, …) |
-| `input` | the tool input, truncated to 500 chars (command / path / url) |
+| `input` | the tool input (command / path / url), truncated to 500 chars for an allow and 8000 for an ask or deny |
 | `decision` | `allow`, `deny`, or `ask` |
 | `source` | `rule`, `llm`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules); `llm-cache` in logs from versions that cached LLM allows |
 | `reason` | human-readable decision reason |

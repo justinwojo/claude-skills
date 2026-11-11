@@ -338,7 +338,11 @@ DECISION_LOG_PATH = (
     _expand_path(_decision_log_override) if _decision_log_override
     else os.path.join(_HOOK_STATE_DIR, "smart-permissions-decisions.jsonl")
 )
-DECISION_LOG_MAX_BYTES = 5 * 1024 * 1024  # single-generation rotation at 5 MB
+DECISION_LOG_MAX_BYTES = 20 * 1024 * 1024  # single-generation rotation at 20 MB
+# An allow keeps the start of its input; an ask or deny keeps up to this
+# much, so the calls that stopped someone can be read in full later.
+DECISION_LOG_INPUT_CHARS = 500
+DECISION_LOG_FLAGGED_INPUT_CHARS = 8000
 
 # Calls both LLM passes flagged. PreToolUse records them so the
 # PermissionRequest hook that fires for the resulting prompt goes straight to
@@ -461,7 +465,19 @@ given, use it: a discard whose paths it shows clean loses nothing (their \
 content is committed); flag one only when a path it overwrites or deletes \
 shows uncommitted or untracked changes that are neither of those, or the \
 snapshot can't vouch for it (truncated, another directory, ignored files that \
-`git clean -x`/`-X` deletes, or the command itself edits those paths first).
+`git clean -x`/`-X` deletes, or the command itself edits those paths first). \
+Session provenance, when given, comes from the agent's own earlier commands and \
+file creation times: it shows what this session made, never the developer's \
+approval. Resetting or removing a checkout or folder this session evidently \
+created for its own experiments, where all that is at risk is that session's own \
+output, is routine housekeeping: approve it, even outside the working directory \
+and over uncommitted changes, unmerged branches or local-only commits. Flag it \
+when the developer said to keep it; when it looks like a deliverable (the session \
+committed work there that exists nowhere else and treats it as a result, not \
+setup such as a baseline snapshot; the developer's messages refer to it; or it \
+holds files that neither the session's commands nor the programs they ran account \
+for); or when provenance is missing \
+or unclear and real work could be lost.
 2. Making private things public. Changing a repo, bucket, or share to public; \
 publishing a package; pushing private code to a remote the developer doesn't \
 own; public gists or pastes of private content. The context may check the owners \
@@ -471,9 +487,13 @@ you can't see whether the code is private, unless the developer's messages name 
 that owner or remote. An owner it says is the developer's is not this harm. \
 Adding a remote or fetching from one harms nothing by itself.
 3. Leaking secrets. Sending credentials, API keys, tokens, SSH keys, or session \
-cookies anywhere, or pulling them from places they don't normally live \
+cookies anywhere; pulling them from places they don't normally live \
 (browser profiles, keychains, other apps' data, logs) to get around a failed \
-login. Using credentials that are already configured (gh, git, cloud CLIs, API \
+login; or hunting for them: a find, ls or grep across other projects, browser \
+profiles or app data for cookie, session, saved storage-state, `Local State` or \
+auth files, unless the developer pointed the agent at that file. Finding them is \
+the first step to reusing a signed-in session, so flag the search itself, even \
+when it only lists names. Using credentials that are already configured (gh, git, cloud CLIs, API \
 keys in the environment) is normal.
 4. Running untrusted remote code. Piping downloaded content into a shell or \
 interpreter, unless it is the tool's official installer. Injecting a library \
@@ -495,7 +515,9 @@ output, caches, temp files, or \
 specific files in the project; installing dependencies; calling APIs, docs, \
 and package registries; talking to devices on the local network (projectors, \
 TVs, meters, etc.); sending code to review CLIs (codex, grok, claude); running \
-project scripts; reading any file that isn't a secret store.
+project scripts; reading any file that isn't a secret store. Not safe, even as \
+a plain filename search: looking for cookie, session, storage-state, `Local \
+State` or auth files the developer didn't point to (category 3).
 
 The developer's recent messages are a partial view: the agent often works from \
 earlier instructions, a plan or a brief you can't see. Use them to understand \
@@ -615,8 +637,9 @@ def parse_hook_payload(input_data):
     return mapped, tool_input
 
 
-def _decision_log_input(tool, tool_input):
-    """Extract the human-meaningful input string for a tool, truncated 500 chars.
+def _decision_log_input(tool, tool_input, limit=DECISION_LOG_INPUT_CHARS):
+    """Extract the human-meaningful input string for a tool, truncated to
+    `limit` chars.
 
     Bash → command, file tools → path, WebFetch → url, search tools →
     pattern, else the tool name. Only tool inputs are ever logged (never
@@ -634,7 +657,7 @@ def _decision_log_input(tool, tool_input):
         val = tool
     if not isinstance(val, str):
         val = str(val)
-    return val[:500]
+    return val[:limit]
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,
@@ -643,19 +666,22 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
 
     Best-effort: never raises, never blocks the hook (blanket guard like
     log_unknown). The `input` field holds the tool input truncated to 500
-    chars — it may embed secrets, so the log is the same trust class as
-    shell history (see README privacy note). Rotates at 5 MB to a single
-    `.1` generation. `source` is one of rule|llm|llm-recheck|learner
-    (older logs also hold llm-cache, from the cache since removed).
+    chars for an allow and 8000 for an ask or deny — it may embed secrets,
+    so the log is the same trust class as shell history (see README privacy
+    note). Rotates at 20 MB to a single `.1` generation. `source` is one of
+    rule|llm|llm-recheck|learner (older logs also hold llm-cache, from the
+    cache since removed). `provenance` (found|none|unavailable) is there
+    when the judge was asked about a delete or reset it could name.
     """
     if not DECISION_LOG_ENABLED:
         return
     try:
+        limit = DECISION_LOG_FLAGGED_INPUT_CHARS if decision in ("ask", "deny") else DECISION_LOG_INPUT_CHARS
         record = {
             "ts": datetime.now().isoformat(timespec="seconds"),
             "hook": hook,
             "tool": tool,
-            "input": _decision_log_input(tool, tool_input),
+            "input": _decision_log_input(tool, tool_input, limit),
             "decision": decision,
             "source": source,
             "reason": reason,
@@ -669,6 +695,10 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
             record["rule_reason"] = rule_reason
         if HOOK_CLIENT_TOOL:
             record["client_tool"] = HOOK_CLIENT_TOOL
+        # Whether the judge saw session provenance for a delete or reset
+        # (see build_llm_context), so its effect on verdicts can be measured.
+        if LLM_CONTEXT_PROVENANCE:
+            record["provenance"] = LLM_CONTEXT_PROVENANCE
         os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
         # Single-generation rotation before appending.
         try:
@@ -908,9 +938,132 @@ def _commands_words(command):
         _COMMANDS_WORDS_ACTIVE = False
 
 
-# A `cd` that doesn't move the commands after it: in a subshell or substitution,
-# or a pipeline or background job of its own.
-_SCOPED_CD_RE = re.compile(r"(?<![\w.-])(?:cd|pushd|popd)(?![\w.-])[^;&|\n]*(?:\|(?!\|)|&(?!&))")
+_CD_NAMES = ("cd", "pushd", "popd")
+_BLOCK_OPENERS = frozenset({"if", "while", "until", "for", "select", "case", "foreach", "repeat"})
+_BLOCK_CLOSERS = frozenset({"fi", "done", "esac", "end"})
+
+
+def _cd_in_scope(command):
+    """True when a `cd`, `pushd` or `popd` in `command` may not move the commands
+    after it, or may move them only sometimes: one in a subshell, `{ }` group,
+    function, loop, condition or case arm, in a pipeline or `&` job, in a
+    substitution or in code another command runs; or the parse isn't sure.
+    Only the command's own structure counts, so a `(` in a heredoc or in an
+    unrelated `$(…)` changes nothing."""
+    every = collections.Counter(tuple(w) for w in _commands_words(command)
+                                if os.path.basename(w[0]) in _CD_NAMES)
+    if not every:
+        return False
+    segments, uncertain = split_compound_command(command)
+    if uncertain:
+        return True
+    text = command.replace("\\\n", "")  # the splitter joins continued lines
+    plain, pos, depth, blocks = collections.Counter(), 0, 0, 0
+    for segment in segments:
+        start = text.find(segment, pos)
+        if start < 0:
+            return True
+        before, after = text[pos:start], text[start + len(segment):].lstrip()
+        pos = start + len(segment)
+        # Clamped at 0, so a stray closer can't cancel a later opener.
+        depth = max(0, depth + sum(before.count(c) for c in "({") - sum(before.count(c) for c in ")}"))
+        first = (segment.split() or [""])[0]
+        blocks = max(0, blocks + (first in _BLOCK_OPENERS) - (first in _BLOCK_CLOSERS))
+        piped = re.search(r"(?<!\|)\|\s*$", before) or re.match(r"(?:\|(?!\|)|&(?!&))", after)
+        words = _command_line(segment)[0]
+        if depth == 0 and blocks == 0 and not piped and first in _CD_NAMES \
+                and words and words[0] == first:
+            plain[tuple(words)] += 1
+    return bool(every - plain)
+
+
+def _cd_operands(words):
+    """(flags, operands) of the words of a cd, pushd or popd. A `-` alone
+    or zsh's `-2` is an operand (a directory stack entry, as `+2` is)."""
+    j = 1
+    while j < len(words) and re.fullmatch(r"-[A-Za-z@]+|--", words[j]):
+        j += 1
+        if words[j - 1] == "--":
+            return words[1:j - 1], words[j:]
+    return words[1:j], words[j:]
+
+
+def _cd_flags_plain(name, flags):
+    """True when zsh and bash 3.2 both take `flags` of a cd or pushd as
+    options of a move: only -L and -P (alone or clustered) for cd, none for
+    pushd. Any other letter is zsh's OLD of `cd OLD NEW` and a bash error
+    (`cd -e x`, `cd -q x`, `pushd -P x`: both stay put); zsh's -s fails on
+    a link; popd never moves to a folder it names."""
+    return name == "cd" and all(re.fullmatch(r"-[LP]+", f) for f in flags) \
+        or name == "pushd" and not flags
+
+
+def _cd_chases(flags):
+    """For a cd's plain flags: True when both shells follow links first, False
+    when neither does, None when that's up to the shell (no -L or -P: `set
+    -P`, zsh CHASE_LINKS) or the shells disagree. bash honours the last of
+    -L/-P; zsh's -P wins wherever it is (`cd -PL`: bash logical, zsh not)."""
+    letters = "".join(f[1:] for f in flags)
+    if not letters:
+        return None
+    return False if "P" not in letters else True if letters.endswith("P") else None
+
+
+# A `~` the shells expand to $HOME alike: unquoted, starting a word, alone
+# or before a `/` (`~user`, `~+`, `~"/x"` and a `~` after `=` or `:` differ
+# between zsh and bash 3.2, or name another folder).
+_TILDE_STARTS = ";&|()<>`"
+
+
+def _tilde_masked(command):
+    """`command` with every `~` that may start a word as something other
+    than $HOME (see _TILDE_STARTS) swapped for its _LITERAL_CHARS stand-in,
+    a control character the path helpers refuse: a quoted or escaped one
+    (`git -C '~'` is ./~), one after `=`, `:` or a brace, and every one
+    when the command mentions HOME, which it may set first."""
+    if "~" not in command:
+        return command
+    mask = _LITERAL_CHARS["~"]
+    if re.search(r"(?<!\w)HOME(?!\w)", command):
+        return command.replace("~", mask)
+    out, single, double, i = [], False, False, 0
+    while i < len(command):
+        c = command[i]
+        if single:
+            single = c != "'"
+        elif c == "\\":
+            out.append(command[i:i + 2].replace("~", mask))
+            i += 2
+            continue
+        elif c == "'" and not double:
+            single = True
+        elif c == '"':
+            double = not double
+        elif c == "~" and not double:
+            # Kept: one starting a word as $HOME, or one inside a word,
+            # which both shells leave alone (`a~b`) unless it follows `=`,
+            # `:`, a brace or a quote.
+            before, after = command[i - 1:i] or " ", command[i + 1:i + 2] or " "
+            start = before.isspace() or before in _TILDE_STARTS
+            if start and (after.isspace() or after == "/" or after in _TILDE_STARTS) \
+                    or not start and before not in "=:{,\"'":
+                out.append(c)
+                i += 1
+                continue
+        out.append(mask if c == "~" else c)
+        i += 1
+    return "".join(out)
+
+
+def _cdpath_may_apply(word, command):
+    """True when `cd word` may go to a folder of $CDPATH (zsh `cdpath`)
+    instead of ./word: a relative word without a leading ./ or ../, with
+    CDPATH set in the environment or mentioned in the command (bash and zsh
+    look there first). zsh's CDABLE_VARS acts only on a word that isn't a
+    folder here, which a followed cd must already be, and AUTO_CD only on
+    commands read from standard input, not on a `-c` string."""
+    return not (word in (".", "..") or word.startswith(("/", "./", "../", "~"))) \
+        and bool(os.environ.get("CDPATH") or re.search(r"cdpath", command, re.I))
 
 
 def _git_command_dirs(command, cwd):
@@ -921,36 +1074,64 @@ def _git_command_dirs(command, cwd):
     by leaving it. `certain` is False when git may run somewhere this can't name: a
     target that doesn't resolve (`cd "$X"`), a relative move after an earlier move
     (that one may not have happened: `if x; then cd a; fi; cd b`), a `cd` whose scope
-    isn't plain (`(cd x); …`), or --git-dir, --work-tree, GIT_DIR."""
-    commands = _commands_words(command)
+    isn't plain (`(cd x); …`, see _cd_in_scope), a `cd` with more than one
+    operand (zsh's `cd OLD NEW`), a flag both shells may not take as a move
+    (see _cd_flags_plain), a stack entry or a $CDPATH folder it may land in
+    (see _cdpath_may_apply), a `~` that may not be $HOME (see
+    _tilde_masked), a glob, brace or expansion the shell expands (quoted, it
+    is literal: see _mask_literals), or --git-dir, --work-tree, --bare, GIT_DIR.
+    A `cd` is logical: the shell drops `x/..` before it follows links, while
+    `git -C` and `cd -P` (or a shell set to chase links) go through the link
+    first. Where the two differ, both are listed and nothing is certain."""
+    # A control character of its own would read as a quoted one.
+    raw = bool(re.search(r"[\x00-\x08]", command))
+    commands = _commands_words(command if raw else _mask_literals(_tilde_masked(command)))
     dirs = [] if re.match(r"\s*(?:cd|pushd)(?![\w.-])", command) else [cwd]
     base, moved = cwd, False
-    certain = not re.search(r"\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)=", command)
+    certain = not raw and not re.search(r"\bGIT_(?:DIR|WORK_TREE|COMMON_DIR)=", command)
 
-    def move(word, relative_to):
-        """The existing directory `word` names, or None; notes what can't be trusted."""
+    def move(word, relative_to, logical=False):
+        """The existing directory `word` names (as the shell names it, for a
+        `cd`), or None; notes what can't be trusted."""
         nonlocal certain
-        word = os.path.expanduser(word)
+        if re.search(r"[*?\[{$`]", word):  # the shell expands it first
+            certain = False
+            return None
+        # Quoted characters back as written; only `~` and `~/…` are left.
+        word = os.path.expanduser(word.translate(_UNMASK_BUT_TILDE))
         if moved and not os.path.isabs(word):
             certain = False
-        path = None
-        if not word.startswith("-") and not re.search(r"[\x00-\x1f\x7f]", word) \
-                and (relative_to is not None or os.path.isabs(word)):
-            path = os.path.realpath(os.path.join(relative_to or "", word))
-        if path is None or not os.path.isdir(path):
+        if word.startswith("-") or re.search(r"[\x00-\x1f\x7f]", word) \
+                or not (relative_to is not None or os.path.isabs(word)):
+            certain = False
+            return None
+        joined = os.path.join(relative_to or "", word)
+        path = os.path.realpath(joined)
+        if logical and os.path.realpath(os.path.normpath(joined)) != path:
+            certain = False
+            dirs.extend([path] if os.path.isdir(path) else [])
+            path = os.path.realpath(os.path.normpath(joined))
+        if not os.path.isdir(path):
             certain = False
             return None
         dirs.append(path)
-        return path
+        return os.path.normpath(joined) if logical else path
 
+    scoped = None
     for words in commands:
         name = os.path.basename(words[0])
-        if name in ("cd", "pushd", "popd"):
-            if "(" in command or _SCOPED_CD_RE.search(command):
+        if name in _CD_NAMES:
+            if scoped is None:
+                scoped = _cd_in_scope(command)
+            if scoped:
                 certain = False
-            target = next((w for w in words[1:] if w not in ("-L", "-P", "-e", "-@", "--")), None)
-            if target:
-                base = move(target, base)
+            flags, operands = _cd_operands(words)
+            # One operand, plain flags, and no $CDPATH folder it may land in;
+            # zsh's `cd OLD NEW` swaps text in the current path.
+            if len(operands) == 1 and _cd_flags_plain(name, flags) \
+                    and not re.fullmatch(r"[+-]\d*", operands[0]) \
+                    and not _cdpath_may_apply(operands[0], command):
+                base = move(operands[0], base, logical=True)
             else:
                 base, certain = None, False
             moved = True
@@ -960,7 +1141,7 @@ def _git_command_dirs(command, cwd):
                 if words[i] == "-C" and i + 1 < len(words):
                     here = move(words[i + 1], here)
                     moved = True
-                if words[i].startswith(("--git-dir", "--work-tree")):
+                if words[i].startswith(("--git-dir", "--work-tree")) or words[i] == "--bare":
                     certain = False
                 i += 2 if words[i] in _GIT_VALUE_OPTS else 1
     seen, unique = set(), []
@@ -1092,14 +1273,728 @@ def git_remote_context(command, cwd, deadline):
                   for name, urls in list(remotes.items())[:GIT_CONTEXT_MAX_DIRS * 4]
                   for url in urls["push"] if _remote_owner(url)]
         checks += [verdict("URL in the command:", _remote_owner(w)) for w in named]
+        # Local paths and unknown hosts have no owner; say so rather than
+        # leave the judge an empty block.
+        checks = checks or ["No remote here or URL in the command has an owner to check "
+                            "(local paths or hosts not known here)."]
         known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here)"
         parts.append(f"Owner check in {path}, against origin's fetch URL and the gh login {known}:\n"
                      + "\n".join(checks))
     return parts
 
 
+# ============================================================
+# LLM CONTEXT — what a delete or reset would lose, and who made the target
+# ============================================================
+# A delete or reset that reaches the judge gets two kinds of evidence for each
+# folder it targets. Loss: what git knows is there (repositories inside a
+# deleted folder, a deleted branch's own commits). Provenance: whether this
+# session's own earlier commands made or used the path, and when the folder
+# was created. Both are evidence for the judge only; no rule reads them, so
+# nothing here can allow a call. Provenance reads the agent's command text and
+# never tool output: a file's contents must not be able to vouch for a path.
+
+# Transcript reading for provenance: its share of GIT_CONTEXT_BUDGET_S, and
+# how much of each transcript (newest part) and of all of them is read.
+PROVENANCE_BUDGET_S = 1.0
+PROVENANCE_TAIL_BYTES = 16 * 1024 * 1024
+PROVENANCE_TOTAL_BYTES = 48 * 1024 * 1024
+PROVENANCE_MAX_FILES = 12
+PROVENANCE_MAX_TARGETS = 4
+PROVENANCE_SHOW_FIRST = 3
+PROVENANCE_SHOW_LAST = 2
+PROVENANCE_SNIPPET_CHARS = 240
+# Loss evidence: folders looked at, how deep a deleted folder is searched
+# for repositories, and how much of each is shown.
+LOSS_MAX_TARGETS = 3
+LOSS_REPO_DEPTH = 3
+LOSS_MAX_REPOS = 5
+LOSS_MAX_DIRS = 2000
+LOSS_STATUS_LINES = 12
+LOSS_MAX_BRANCHES = 4
+# Folders no repository worth reporting lives in, and that can hold many
+# thousands of entries.
+_LOSS_SKIP_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".tox", ".angular",
+                             ".next", ".gradle", "Pods", ".cache", ".git"})
+_GIT_DISCARD_SUBS = frozenset({"checkout", "restore", "reset", "clean", "switch", "stash"})
+
+# What build_llm_context attached, for the decision log: "found" (an earlier
+# command of this session names a target, or the target was created after
+# the session started), "none", "unavailable" (no transcript to read), or
+# None when the call deletes or resets nothing it can name.
+LLM_CONTEXT_PROVENANCE = None
+
+# `NAME=/literal/path` (quoted or not) and the reads `$NAME`, `${NAME}`,
+# `${NAME:?…}`. Loose on purpose: it only tells which path `$A/ours` names,
+# for evidence, never for a rule.
+_LITERAL_ASSIGN_RE = re.compile(
+    r"(?<![\w$])([A-Za-z_]\w*)=([\"']?)((?:(?<==)~(?=/)|/)[\w./@%+,:-]*)\2(?![^\s;&|)])")
+_NAME_READ_RE = re.compile(r"\$(?:\{([A-Za-z_]\w*)(?::?[-?=+][^{}]*)?\}|([A-Za-z_]\w*))")
+# An absolute or ~/ path in command text, not the tail of a relative one, of
+# a `$NAME/…` left unread, or of a `~` _tilde_masked swapped out (`'~'/x`).
+_PATH_MENTION_RE = re.compile(r"(?<![\w.$}~\x04-])(?<!\x04[\"'])(?:~(?=/))?/[\w.@%+,/-]*")
+_CD_TARGET_RE = re.compile(r"(?:^|[;&|(\s])(?:cd|pushd)\s+([\"']?)((?:~(?=/)|/)[^\s\"';&|)]*)\1")
+_RELATIVE_WORD_RE = re.compile(r"[\w.@%+,-][\w./@%+,-]*")
+_TOOL_RESULT_ID_RE = re.compile(r'"tool_use_id"\s*:\s*"([^"]+)"')
+_TIMESTAMP_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+
+def _literal_paths(text):
+    """{NAME: path} for the names `text` sets to one literal path only. A
+    `~/` value counts unquoted only (`D='~/x'` is ./~/x), and not when the
+    text mentions HOME."""
+    values = {}
+    home = re.search(r"(?<!\w)HOME(?!\w)", text)
+    for m in _LITERAL_ASSIGN_RE.finditer(text):
+        values.setdefault(m[1], set()).add(_LITERAL_CHARS["~"] if home and m[3].startswith("~") else m[3])
+    return {k: next(iter(v)) for k, v in values.items() if len(v) == 1}
+
+
+def _spell_names(text, names):
+    """`text` with the reads of `names` written out."""
+    return _NAME_READ_RE.sub(lambda m: names.get(m[1] or m[2], m[0]), text) if names else text
+
+
+def _evidence_path(word, base, physical=False):
+    """The absolute path an operand names, or None when it is built at run
+    time: `~` spelled out, relative to `base`, and a glob cut back to the
+    folder it lists (`profiles/*` → profiles, `scratch-*` → its folder).
+    `x/..` is dropped as `cd` drops it; with `physical` (a program's own
+    path, `rm`, `git -C`) a `..` is taken after the links before it, and the
+    last component is left as named."""
+    if not word:
+        return None
+    word = os.path.expanduser(word)
+    if re.search(r"[$`\x00-\x1f]", word):
+        return None
+    parts = word.split("/")
+    cut = next((i for i, p in enumerate(parts) if re.search(r"[*?\[{]", p)), None)
+    if cut is not None:
+        word = "/".join(parts[:cut]) or ("/" if word.startswith("/") else ".")
+    if not os.path.isabs(word):
+        if not base:
+            return None
+        word = os.path.join(base, word)
+    if physical and ".." in word.split("/"):
+        head, tail = os.path.split(word.rstrip("/") or "/")
+        return os.path.realpath(word) if tail in ("", ".", "..") \
+            else os.path.join(os.path.realpath(head), tail)
+    return os.path.normpath(word)
+
+
+def _evidence_cd(name, words, base, command):
+    """The folder a cd, pushd or popd (`name`, its `words`) moves to from
+    `base`, for evidence, or None when that isn't sure: a stack entry, zsh's
+    `cd OLD NEW`, a $CDPATH folder it may land in (see _cdpath_may_apply), a
+    flag both shells may not take as a move (see _cd_flags_plain). Where the
+    shell's logical path (`x/..` dropped first) and the physical one (links
+    followed first) are different folders, only -L or -P says which (see
+    _cd_chases): without them the shell's settings (`set -P`, zsh
+    CHASE_LINKS) decide, so nothing is named."""
+    flags, operands = _cd_operands(words)
+    if not _cd_flags_plain(name, flags) or len(operands) > 1:
+        return None
+    if not operands:
+        return HOME_DIR if name == "cd" and not re.search(r"(?<!\w)HOME(?!\w)", command) else None
+    target = operands[0]
+    if re.fullmatch(r"[+-]\d*", target) or re.search(r"[*?\[{]", target) \
+            or _cdpath_may_apply(target, command):
+        return None  # a glob is cut back to its folder for a delete, not for a cd
+    logical = _evidence_path(target, base)
+    if not logical:
+        return None
+    physical = os.path.realpath(os.path.join(base or "", os.path.expanduser(target)))
+    if os.path.realpath(logical) == physical:
+        return logical
+    chases = _cd_chases(flags)
+    return None if chases is None else physical if chases else logical
+
+
+def _glob_now(word, base, limit=4):
+    """What a glob operand matches right now, when that is 1 to `limit`
+    entries; None when it matches nothing, too much, or is built at run time."""
+    word = os.path.expanduser(word)
+    if re.search(r"[$`{\x00-\x1f]", word) or not (os.path.isabs(word) or base):
+        return None
+    try:
+        found = list(itertools.islice(glob.iglob(os.path.join(base or "/", word)), limit + 1))
+    except (OSError, ValueError, re.error):
+        return None
+    found = [os.path.normpath(p) for p in found]
+    return found if 0 < len(found) <= limit and "/" not in found and HOME_DIR not in found else None
+
+
+def destructive_targets(command, cwd):
+    """[(kind, path, label, branches)] for each delete or reset in `command`
+    whose target can be named: `rm -r`, and `rm` of a glob ("delete"); a git
+    discard (see _git_risk) in the folder git runs in ("discard"); `git branch
+    -D` with its names ("branch"); `git worktree remove --force` ("worktree").
+    Follows `cd` and `git -C` in order and writes out names set to one literal
+    path. After a `cd` that may not move what follows (`(cd x); rm -r y`, see
+    _cd_in_scope) a relative target isn't named. A target it can't name is
+    left out; this only picks what to gather evidence about. A `~` that may
+    not be $HOME names nothing (see _tilde_masked)."""
+    try:
+        commands = _commands_words(_tilde_masked(command))
+    except Exception:
+        return []
+    names = _literal_paths(command)
+    base = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    scoped = None
+    found = []
+    for words in commands:
+        words = [_spell_names(w, names) for w in words]
+        name = os.path.basename(words[0])
+        if name in _CD_NAMES:
+            if scoped is None:
+                scoped = _cd_in_scope(command)
+            base = None if scoped else _evidence_cd(name, words, base, command)
+        elif name == "rm":
+            opts, operands, ended = [], [], False
+            for w in words[1:]:
+                if not ended and w == "--":
+                    ended = True
+                elif not ended and w.startswith("-") and w != "-":
+                    opts.append(w)
+                else:
+                    operands.append(w)
+            recursive = any(_long_option_is(o, "--recursive") or not o.startswith("--") and re.search("[rR]", o)
+                            for o in opts)
+            for w in operands:
+                path = _evidence_path(w, base, True) if recursive or re.search(r"[*?\[]", w) else None
+                if path and path not in ("/", HOME_DIR):
+                    # The path is shown beside the label: name only what a glob adds.
+                    pattern = w[len(w.rstrip("/").rsplit("/", 1)[0]) + 1:] if re.search(r"[*?\[]", w) else ""
+                    label = " ".join(["rm", *opts, pattern]).strip()[:80]
+                    # A glob that matches a few entries now names those; the
+                    # whole folder would show repos the glob never touches.
+                    matches = _glob_now(w, base) if pattern else None
+                    for p in matches or [path]:
+                        found.append(("delete", p, label, ()))
+        elif name == "git":
+            i, here = 1, base
+            while i < len(words) and words[i].startswith("-"):
+                if words[i] == "-C" and i + 1 < len(words):
+                    here = _evidence_path(words[i + 1], here, True)
+                i += 2 if words[i] in _GIT_VALUE_OPTS else 1
+            if i >= len(words) or not here:
+                continue
+            sub, rest = words[i], words[i + 1:]
+            label = " ".join(["git", sub, *rest])[:80]
+            if sub in _GIT_DISCARD_SUBS and isinstance(_git_risk(words[1:]), str):
+                found.append(("discard", here, label, ()))
+            elif sub == "branch":
+                letters = "".join(f for f in _git_flags(rest, _GIT_SHORT_VALUES["branch"]) if len(f) == 1)
+                if "D" in letters or ("d" in letters or "--delete" in rest) \
+                        and ("f" in letters or "--force" in rest):
+                    branches = tuple(b for b in rest if not b.startswith("-")
+                                     and _PLAIN_BRANCH_RE.fullmatch(b))
+                    found.append(("branch", here, label, branches))
+            elif sub == "worktree" and rest[:1] == ["remove"] \
+                    and any(f in ("-f", "--force") for f in rest):
+                target = next((w for w in rest[1:] if not w.startswith("-")), None)
+                path = _evidence_path(target, here, True)
+                if path:
+                    # The path is shown beside the label.
+                    label = " ".join(["git", "worktree", *[w for w in rest if w != target]])[:80]
+                    found.append(("worktree", path, label, ()))
+    unique, seen = [], set()
+    for t in found:
+        if (t[0], t[1], t[3]) not in seen:
+            seen.add((t[0], t[1], t[3]))
+            unique.append((t[0], t[1], t[2].replace(_LITERAL_CHARS["~"], "~"), t[3]))
+    return unique
+
+
+def _ts_seconds(text):
+    """Epoch seconds of an ISO timestamp from a transcript, or None."""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError, OverflowError, OSError):
+        return None
+
+
+def _local_time(seconds, fmt="%m-%d %H:%M"):
+    return datetime.fromtimestamp(seconds).strftime(fmt)
+
+
+def _span(seconds):
+    """A rough length of time: `40 min`, `3 h`, `2 days`."""
+    minutes = int(abs(seconds) // 60)
+    if minutes < 90:
+        return f"{minutes} min"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h"
+    return f"{minutes // 1440} days"
+
+
+def _session_transcripts(input_data):
+    """This session's transcripts, the main one first: Claude Code keeps each
+    subagent's in <session>/subagents/agent-*.jsonl beside it (newest first)."""
+    main = input_data.get("transcript_path")
+    if not (isinstance(main, str) and os.path.isabs(main) and os.path.isfile(main)):
+        return []
+    files = [main]
+    agent = input_data.get("agent_transcript_path")
+    if isinstance(agent, str) and os.path.isabs(agent) and agent != main:
+        files.append(agent)
+    try:
+        with os.scandir(os.path.join(os.path.splitext(main)[0], "subagents")) as it:
+            subs = [e for e in it if e.name.endswith(".jsonl") and e.is_file(follow_symlinks=False)]
+        subs.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+        files += [e.path for e in subs if e.path not in files]
+    except OSError:
+        pass
+    return files[:PROVENANCE_MAX_FILES]
+
+
+def _session_start(path):
+    """When the transcript at `path` starts: its first record's timestamp."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(256 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in head.splitlines():
+        m = _TIMESTAMP_RE.search(line)
+        if m and _ts_seconds(m[1]):
+            return _ts_seconds(m[1])
+    return None
+
+
+def _too_broad(path, cwd):
+    """True for a folder too general for naming it to say anything about a
+    path under it: /, home and the folders holding it or its children (~/Dev),
+    the temp roots and their children, the working directory and up."""
+    if path.count("/") < 3 and not path.startswith(("/tmp/", "/private/tmp/")):
+        return True
+    for root in (HOME_DIR, "/tmp", "/private/tmp", _temp_root()):
+        if path == root or root.startswith(path + "/") or os.path.dirname(path) == root:
+            return True
+    return bool(cwd) and (path == cwd or cwd.startswith(path + "/"))
+
+
+@functools.lru_cache(maxsize=1)
+def _temp_root():
+    """The system temp folder, resolved ($TMPDIR on macOS: /var/folders/…/T)."""
+    import tempfile
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def _provenance_target(path, label, cwd):
+    """What a transcript line must name to count for `path`: the path itself
+    or what it resolves to (`keys`), and its parent and grandparent unless
+    they are too broad (`parents`); `needles` are their last components, a
+    cheap first test on each raw line."""
+    keys = {path, os.path.realpath(path)}
+    parents = set()
+    for key in list(keys):
+        p = key
+        for _ in range(2):
+            p = os.path.dirname(p)
+            if _too_broad(p, cwd):
+                break
+            parents.add(p)
+    needles = {os.path.basename(p) for p in keys | parents if os.path.basename(p)}
+    return {"path": path, "label": label, "keys": keys, "parents": parents, "needles": needles}
+
+
+def _named_paths(text, needles):
+    """The paths a command's text names: absolute and ~/ ones, with names set
+    to one literal path written out, and relative words after a `cd` to an
+    absolute folder taken from there (`cd /x && git init -q arms`). Only a
+    relative word holding one of `needles` can name a target the `cd` path
+    itself doesn't, so only those are joined."""
+    text = _spell_names(_tilde_masked(text), _literal_paths(text))
+    named = {os.path.normpath(os.path.expanduser(m)) for m in _PATH_MENTION_RE.findall(text)}
+    bases = [os.path.expanduser(m[1]) for m in _CD_TARGET_RE.findall(text)]
+    if bases:
+        words = [w for w in re.split(r"[\s\"'`;&|<>(){}=]+", text)
+                 if _RELATIVE_WORD_RE.fullmatch(w) and not w.startswith("-")
+                 and any(n in w for n in needles)][:50]
+        named.update(os.path.normpath(os.path.join(b, w)) for b in bases[:4] for w in words)
+    return named
+
+
+def _relation(named, target):
+    """How a command that names `named` relates to `target`, or None."""
+    best = None
+    for p in named:
+        if p in target["keys"]:
+            return "names it", p
+        if any(p.startswith(k + "/") for k in target["keys"]):
+            best = ("names a path inside it", p)
+        elif best is None and p in target["parents"]:
+            best = (f"names its folder {os.path.basename(p)}", p)
+    return best
+
+
+def _snippet(text, mark):
+    """`text` on one line, cut to a window around the first `mark`."""
+    flat = re.sub(r"[ \t]+", " ", re.sub(r"\s*\n\s*", " / ", text.strip()))
+    if len(flat) <= PROVENANCE_SNIPPET_CHARS:
+        return flat
+    at = max(0, flat.find(mark)) if mark else 0
+    # From a little before the word holding the mark, so a long path shows whole.
+    word = max(flat.rfind(c, 0, at) for c in " =;'\"")
+    start = max(0, min(at - 40, word - 40))
+    end = start + PROVENANCE_SNIPPET_CHARS
+    return ("…" if start else "") + flat[start:end] + ("…" if end < len(flat) else "")
+
+
+def _bash_inputs(record):
+    """(tool_use id, [command texts]) of each Bash call in an assistant
+    record: the command as stored and, when it differs, as the model sent it
+    (wireToolInputs, which keeps a leading `cd`)."""
+    message = record.get("message") if record.get("type") == "assistant" else None
+    content = message.get("content") if isinstance(message, dict) else None
+    wire = record.get("wireToolInputs") if isinstance(record.get("wireToolInputs"), dict) else {}
+    for block in content if isinstance(content, list) else []:
+        if not (isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "Bash"):
+            continue
+        inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+        texts = [inp.get("command")]
+        sent = wire.get(block.get("id"))
+        if isinstance(sent, dict) and sent.get("command") != texts[0]:
+            texts.append(sent.get("command"))
+        texts = [t for t in texts if isinstance(t, str) and t]
+        if texts:
+            yield block.get("id"), texts
+
+
+def _tail_lines(path, limit):
+    """(lines of the last `limit` bytes of `path`, bytes read, whether it was cut)."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        start = max(0, f.tell() - limit)
+        f.seek(start)
+        data = f.read()
+    lines = data.decode("utf-8", "replace").splitlines()
+    return (lines[1:] if start else lines), len(data), start > 0
+
+
+def _transcript_matches(files, targets, current, skip_id, deadline):
+    """({target index: [match]}, whether some transcript wasn't read whole).
+    A match is a dict: ts, snippet, relation, status ("ok", "error", "no
+    result" while it has none, "result unknown" when a line with its id
+    can't be read). The call being judged is never a match: by
+    its tool_use id when the hook input has one, else as a call with no result
+    yet whose command, as stored or as sent, is identical to it."""
+    matches = {i: [] for i in range(len(targets))}
+    needles = set().union(*(t["needles"] for t in targets))
+    budget, cut = PROVENANCE_TOTAL_BYTES, False
+    for path in files:
+        if budget <= 0 or time.monotonic() > deadline:
+            return matches, True
+        try:
+            lines, size, partial = _tail_lines(path, min(PROVENANCE_TAIL_BYTES, budget))
+        except OSError:
+            continue
+        budget -= size
+        cut = cut or partial
+        pending = {}  # tool_use id → (its command texts, its matches), until its result
+        for n, line in enumerate(lines):
+            if n % 2048 == 0 and time.monotonic() > deadline:
+                cut = True
+                break
+            # A result record holds one result, its id ahead of the output
+            # (which may itself quote "tool_use").
+            found = pending and '"tool_result"' in line and _TOOL_RESULT_ID_RE.search(line)
+            if found and found[1] in pending:
+                status = _result_status(line, found[1])
+                # Unread, it stays pending: its real result may come later.
+                for m in (pending.pop(found[1]) if status else pending[found[1]])[1]:
+                    m["status"] = status or "result unknown"
+                continue
+            if '"tool_use"' not in line or not any(needle in line for needle in needles):
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            ts = _ts_seconds(record.get("timestamp") or "")
+            for tid, texts in _bash_inputs(record):
+                if tid and tid == skip_id:
+                    continue
+                named = [(t, _named_paths(t, needles)) for t in texts
+                         if any(needle in t for needle in needles)]
+                for i, target in enumerate(targets):
+                    hit = next(((t, r) for t, ps in named for r in [_relation(ps, target)] if r), None)
+                    if not hit:
+                        continue
+                    text, (relation, mark) = hit
+                    m = {"ts": ts, "snippet": _snippet(text, os.path.basename(mark) or mark),
+                         "relation": relation, "status": "no result"}
+                    matches[i].append(m)
+                    pending.setdefault(tid, (texts, []))[1].append(m)
+        # The call under review is in the transcript before it has a result.
+        for texts, ms in pending.values():
+            if current in texts and not skip_id:
+                drop = {id(m) for m in ms}
+                for i in matches:
+                    matches[i] = [m for m in matches[i] if id(m) not in drop]
+    return matches, cut
+
+
+def _result_status(line, tid):
+    """"error" or "ok" for the tool_result with id `tid` in a raw line, or
+    None when the line can't be read as one (cut, or the id only quoted)."""
+    try:
+        record = json.loads(line)
+        content = record.get("message", {}).get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("tool_use_id") == tid:
+                return "error" if block.get("is_error") else "ok"
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def session_provenance(input_data, targets, cwd, deadline):
+    """(blocks for the LLM, LLM_CONTEXT_PROVENANCE value) for the targets of
+    a delete or reset: when this session's transcript starts, when each
+    target folder was created, and the earliest and latest of this session's
+    own earlier Bash commands that name it. Never raises; when the
+    transcripts can't be read there is no block."""
+    try:
+        files = _session_transcripts(input_data)
+        if not files:
+            return [], "unavailable"
+        cwd = os.path.normpath(cwd) if isinstance(cwd, str) and os.path.isabs(cwd) else ""
+        start = _session_start(files[0])
+        chosen, lines, seen = [], [], set()
+        for kind, path, label, _ in targets:
+            if path in seen:
+                continue
+            seen.add(path)
+            if cwd and (path == cwd or cwd.startswith(path + "/")):
+                lines.append(f"{path} ({label}) is the working directory or holds it: no "
+                             "provenance is given for it.")
+                continue
+            chosen.append(_provenance_target(path, label, cwd))
+            if len(chosen) >= PROVENANCE_MAX_TARGETS:
+                break
+        if not chosen:
+            return ([_PROVENANCE_HEAD, *lines] if lines else []), "none"
+        skip_id = input_data.get("tool_use_id") if isinstance(input_data.get("tool_use_id"), str) else None
+        current = (input_data.get("tool_input") or {}).get("command") \
+            if isinstance(input_data.get("tool_input"), dict) else None
+        matches, cut = _transcript_matches(files, chosen, current, skip_id, deadline)
+        found = False
+        out = [_PROVENANCE_HEAD]
+        if start:
+            out.append(f"This session's transcript starts {_local_time(start, '%Y-%m-%d %H:%M')}.")
+        for i, target in enumerate(chosen):
+            line = f"{target['path']} ({target['label']}): "
+            try:
+                born = os.stat(target["path"], follow_symlinks=False).st_birthtime
+            except AttributeError:
+                born = None  # no creation time on this system
+            except OSError:
+                born, line = None, line + "does not exist now. "
+            if born and start:
+                when = "after" if born >= start else "before"
+                line += f"created {_local_time(born)}, {_span(born - start)} {when} the session started. "
+                found = found or born >= start
+            elif born:
+                line += f"created {_local_time(born, '%Y-%m-%d %H:%M')}. "
+            ms = sorted(matches[i], key=lambda m: m["ts"] or 0)
+            if not ms:
+                line += "No earlier command of this session names it or its folder."
+                out.append(line)
+                continue
+            found = True
+            errors = sum(m["status"] == "error" for m in ms)
+            line += (f"{len(ms)} earlier command{'s' if len(ms) != 1 else ''} of this session "
+                     f"name{'s' if len(ms) == 1 else ''} it, a path inside it or its folder"
+                     f"{f' ({errors} ended in an error)' if errors else ''}"
+                     f"{'; earliest and latest' if len(ms) > PROVENANCE_SHOW_FIRST + PROVENANCE_SHOW_LAST else ''}:")
+            shown = ms if len(ms) <= PROVENANCE_SHOW_FIRST + PROVENANCE_SHOW_LAST \
+                else ms[:PROVENANCE_SHOW_FIRST] + [None] + ms[-PROVENANCE_SHOW_LAST:]
+            for m in shown:
+                if m is None:
+                    line += f"\n  […{len(ms) - PROVENANCE_SHOW_FIRST - PROVENANCE_SHOW_LAST} more…]"
+                    continue
+                when = _local_time(m["ts"]) if m["ts"] else "?"
+                line += f"\n  {when} {m['status']}, {m['relation']}: {m['snippet']}"
+            out.append(line)
+        out.extend(lines)
+        if cut:
+            out.append("(Only the newest part of the session's transcripts was read: an "
+                       "older command may name these paths too.)")
+        return out, "found" if found else "none"
+    except Exception:
+        return [], "unavailable"
+
+
+_PROVENANCE_HEAD = (
+    "Session provenance of the paths this call deletes or resets (evidence, not authorization). "
+    "It comes from this session's own earlier Bash commands (command text only, from the main "
+    "and subagent transcripts) and from the filesystem's creation times. It shows whether this "
+    "session created or used a path. It cannot show that nothing else was put there since, and "
+    "it is not the developer's approval.")
+
+
+def _clean_url(url):
+    """A remote URL without credentials."""
+    return re.sub(r"//[^/@\s]*@", "//", url)
+
+
+def _indent(text, limit=LOSS_STATUS_LINES):
+    lines = text.splitlines()
+    shown = "\n".join("    " + x for x in lines[:limit])
+    if len(lines) > limit:
+        shown += f"\n    [… {len(lines) - limit} more entries not shown]"
+    return shown
+
+
+def _repos_inside(path, deadline):
+    """(git checkouts and bare repositories at or under `path`, as (folder,
+    bare), LOSS_REPO_DEPTH levels deep at most, whether the search finished).
+    Links aren't followed, and a repository's own folders aren't searched:
+    its status covers them."""
+    repos, level, looked = [], [path], 0
+    for depth in range(LOSS_REPO_DEPTH + 1):
+        deeper = []
+        for d in level:
+            bare = os.path.isfile(os.path.join(d, "HEAD")) and all(
+                os.path.isdir(os.path.join(d, x)) for x in ("objects", "refs"))
+            if bare or os.path.lexists(os.path.join(d, ".git")):
+                repos.append((d, bare))
+                if len(repos) >= LOSS_MAX_REPOS:
+                    return repos, False
+                continue
+            looked += 1
+            if looked > LOSS_MAX_DIRS or time.monotonic() > deadline:
+                return repos, False
+            if depth == LOSS_REPO_DEPTH:
+                continue
+            try:
+                with os.scandir(d) as it:
+                    deeper.extend(e.path for e in it if e.name not in _LOSS_SKIP_DIRS
+                                  and e.is_dir(follow_symlinks=False))
+            except OSError:
+                continue
+        level = sorted(deeper)
+    return repos, True
+
+
+def _repo_loss(repo, deadline, bare=False):
+    """What deleting the checkout (or `bare` repository) at `repo` would
+    lose, as git sees it."""
+    if bare:
+        text = "  A bare repository (no work tree): its branches are all it holds."
+    else:
+        status = _git_probe(repo, ["status", "--porcelain=v1", "--branch", "--untracked-files=normal",
+                                   "--ignored=matching", "--ignore-submodules=none"], deadline)
+        if status is None:
+            return "  git could not read it in time."
+        text = "  `git status --short --branch --ignored`:\n" + _indent(status)
+    unique = (_git_probe(repo, ["rev-list", "--count", "--branches", "--not", "--remotes"],
+                         deadline) or "").strip()
+    if unique.isdigit():
+        text += f"\n  Commits on local branches that no remote-tracking ref holds: {unique}"
+        if unique != "0":
+            latest = (_git_probe(repo, ["log", "-1", "--format=%h %cd %s", "--date=format-local:%Y-%m-%d %H:%M",
+                                        "--branches", "--not", "--remotes"], deadline) or "").strip()
+            text += f" (newest: {latest[:100]})" if latest else ""
+        text += "."
+    if _git_probe(repo, ["symbolic-ref", "-q", "HEAD"], deadline) is None:
+        detached = (_git_probe(repo, ["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--"],
+                               deadline) or "").strip()
+        if detached.isdigit() and detached != "0":
+            text += (f" HEAD is detached, with {detached} commit{'s' if detached != '1' else ''}"
+                     " no branch or remote-tracking ref holds.")
+    remotes = _git_remotes(repo, deadline)
+    if remotes is not None:
+        named = [f"{n} {_clean_url(r.get('fetch', ''))[:100]}" for n, r in list(remotes.items())[:4]]
+        text += f" Remotes: {', '.join(named) if named else 'none'}."
+    stashes = _git_probe(repo, ["stash", "list", "--format=%gd"], deadline)
+    if stashes is not None:
+        text += f" Stashes: {len(stashes.splitlines())}."
+    return text
+
+
+def _delete_loss(path, label, deadline):
+    """A block on what deleting the folder `path` would lose: the git
+    checkouts inside it, or, inside a checkout, git's view of that path."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return ""
+    repos, complete = _repos_inside(path, deadline)
+    if repos:
+        out = [f"Git repositories inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
+               + ("" if complete else "; the search stopped early, there may be more") + ":"]
+        for repo, bare in repos:
+            out.append(f"- {os.path.relpath(repo, path) if repo != path else path}:")
+            out.append(_repo_loss(repo, deadline, bare))
+        return "\n".join(out)
+    top = (_git_probe(path, ["rev-parse", "--show-toplevel"], deadline) or "").strip()
+    if top:
+        status = _git_probe(top, ["status", "--porcelain=v1", "--untracked-files=normal",
+                                  "--ignored=matching", "--", os.path.realpath(path)], deadline)
+        if status is not None:
+            body = _indent(status) if status.strip() else \
+                "    (nothing: every file there is committed and unchanged)"
+            return (f"{path} ({label}) is inside the git repository {top}. Uncommitted, untracked "
+                    f"and ignored files there (`git status --short --ignored`):\n{body}")
+    return (f"No git repository inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
+            + ("" if complete else " (the search stopped early)") + ", and it is not inside one.")
+
+
+def _branch_loss(path, branches, label, deadline):
+    """Blocks on what `git branch -D` of `branches` in `path` would lose."""
+    out = []
+    for b in branches[:LOSS_MAX_BRANCHES]:
+        ref = "refs/heads/" + b
+        tip = (_git_probe(path, ["log", "-1", "--format=%h %cd %s", "--date=format-local:%Y-%m-%d %H:%M",
+                                 ref, "--"], deadline) or "").strip()
+        if not tip:
+            continue
+        line = f"Branch {b} in {path} ({label}): tip {tip[:100]}."
+        unique = (_git_probe(path, ["rev-list", "--count", ref, "--not", f"--exclude={b}",
+                                    "--branches", "--remotes", "--"], deadline) or "").strip()
+        if unique.isdigit():
+            line += f" Commits only this branch holds (no other branch or remote-tracking ref): {unique}."
+        head = (_git_probe(path, ["symbolic-ref", "-q", "HEAD"], deadline) or "").strip()
+        if head == ref:
+            line += " It is the checked-out branch now (the command may switch away first)."
+        elif _git_probe(path, ["merge-base", "--is-ancestor", ref, "HEAD"], deadline) is not None:
+            line += " Merged into HEAD."
+        else:
+            line += " Not merged into HEAD."
+        out.append(line)
+    return out
+
+
+def loss_context(targets, covered, deadline):
+    """Blocks for the LLM on what each delete, branch deletion or forced
+    worktree removal in `targets` would lose (discards get their `git
+    status` from git_discard_context; `covered` are the folders it did)."""
+    parts, done = [], 0
+    for kind, path, label, branches in targets:
+        if done >= LOSS_MAX_TARGETS or time.monotonic() > deadline:
+            break
+        if kind == "delete":
+            block = _delete_loss(path, label, deadline)
+            parts.extend([block] if block else [])
+        elif kind == "branch":
+            parts.extend(_branch_loss(path, branches, label, deadline))
+        elif kind == "worktree" and os.path.realpath(path) not in covered:
+            note = git_linked_worktree_note(path, deadline)
+            snapshot = git_status_snapshot(path, deadline)
+            parts.extend(p for p in (note, snapshot) if p)
+        else:
+            continue
+        done += 1
+    return parts
+
+
 def build_llm_context(input_data):
     """Context block for the LLM from the hook input ('' when none)."""
+    global LLM_CONTEXT_PROVENANCE
+    LLM_CONTEXT_PROVENANCE = None
     if not isinstance(input_data, dict):
         return ""
     parts = []
@@ -1108,13 +2003,26 @@ def build_llm_context(input_data):
         parts.append(f"Working directory: {cwd}")
     tool, tool_input = parse_hook_payload(input_data)
     command = tool_input.get("command") if tool == "Bash" else None
-    if isinstance(cwd, str) and os.path.isabs(cwd) and isinstance(command, str) \
+    absolute = isinstance(cwd, str) and os.path.isabs(cwd)
+    targets = destructive_targets(command, cwd) if isinstance(command, str) else []
+    provenance = []
+    if targets or absolute and isinstance(command, str) \
             and (_GIT_DISCARD_HINT_RE.search(command) or _GIT_REMOTE_HINT_RE.search(command)):
-        deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S
-        if _GIT_DISCARD_HINT_RE.search(command):
+        now = time.monotonic()
+        deadline = now + GIT_CONTEXT_BUDGET_S
+        # Provenance first, in its own slice: slow git probes must not starve it.
+        if targets:
+            provenance, LLM_CONTEXT_PROVENANCE = session_provenance(
+                input_data, targets, cwd, min(deadline, now + PROVENANCE_BUDGET_S))
+        covered = set()
+        if absolute and _GIT_DISCARD_HINT_RE.search(command):
             parts.extend(git_discard_context(command, cwd, deadline))
-        if _GIT_REMOTE_HINT_RE.search(command):
+            covered = {os.path.realpath(d) for d in _git_context_dirs(command, cwd)[:GIT_CONTEXT_MAX_DIRS]}
+        if absolute and _GIT_REMOTE_HINT_RE.search(command):
             parts.extend(git_remote_context(command, cwd, deadline))
+        if targets:
+            parts.extend(loss_context(targets, covered, deadline))
+    parts.extend(provenance)
     messages = recent_user_messages(input_data.get("transcript_path"))
     if messages:
         parts.append("Developer's recent messages (oldest first):")
@@ -2479,6 +3387,8 @@ def evaluate_mcp_tool(tool):
 
 # The session's working directory, from the hook input's "cwd" (main sets it).
 HOOK_CWD = None
+# This session's scratchpad folder (see set_hook_cwd), or None.
+HOOK_SCRATCHPAD = None
 
 _GLOB_CHARS_RE = re.compile(r"[*?\[]")
 # $X, ${X} and ${X<op>word} for the :? :- := :+ operators (colon optional);
@@ -2549,10 +3459,40 @@ def _unwrap_command(words, seen=None):
 
 
 def set_hook_cwd(input_data):
-    """Record the session's working directory for the protected-delete guard."""
-    global HOOK_CWD
+    """Record the session's working directory and scratchpad for the
+    protected-delete guard."""
+    global HOOK_CWD, HOOK_SCRATCHPAD
     cwd = input_data.get("cwd") if isinstance(input_data, dict) else None
     HOOK_CWD = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    HOOK_SCRATCHPAD = _session_scratchpad(input_data if isinstance(input_data, dict) else {})
+
+
+def _session_scratchpad(input_data):
+    """This session's scratchpad folder, resolved, or None when it isn't
+    known for sure. Claude Code sends it as "scratchpad_dir" when the feature
+    is on; otherwise it is <tmp>/claude-<uid>/<project slug>/<session id>/
+    scratchpad, the slug being the folder that holds the session's
+    transcript (~/.claude/projects/<slug>/<session id>.jsonl). Only a folder
+    in a temp root counts, and none of its own components may be a symlink:
+    a link planted there earlier would point the scratch rule anywhere."""
+    pad = input_data.get("scratchpad_dir")
+    if not (isinstance(pad, str) and os.path.isabs(pad)):
+        session, transcript = input_data.get("session_id"), input_data.get("transcript_path")
+        if not (isinstance(session, str) and re.fullmatch(r"[\w-]+", session)
+                and isinstance(transcript, str) and os.path.isabs(transcript)
+                and os.path.basename(transcript) == session + ".jsonl"
+                and os.path.basename(os.path.dirname(os.path.dirname(transcript))) == "projects"):
+            return None
+        slug = os.path.basename(os.path.dirname(transcript))
+        pad = f"/tmp/claude-{os.getuid()}/{slug}/{session}/scratchpad"
+    pad = os.path.normpath(pad)
+    root = next((r for r in _TEMP_ROOTS if pad.startswith(r)), None)
+    if not root or os.path.basename(pad) != "scratchpad" or ".." in pad.split("/"):
+        return None
+    parts = pad[len(root):].split("/")
+    if any(os.path.islink(root + "/".join(parts[:i + 1])) for i in range(len(parts))):
+        return None
+    return os.path.realpath(pad)
 
 
 def _path_key(path):
@@ -3179,6 +4119,41 @@ def _scratch_delete(word, paths, cwd, link_inert):
     return True
 
 
+# A `$NAME`, `${NAME}` or `${NAME:?}` in an rm target (quotes already gone).
+_TARGET_NAME_RE = re.compile(r"\$(?:\{(\w+)(?::?\?[^{}$`]*)?\}|(\w+))")
+
+
+def _own_scratch_delete(word, paths, variables, link_inert):
+    """True when deleting rm target `word`, which may destroy `paths`, only
+    removes entries of this session's own scratchpad (HOOK_SCRATCHPAD): never
+    the scratchpad itself or all of its contents, never another session's.
+    A name the word reads counts when the command set it to one value the
+    guard follows (`S=…/scratchpad; rm -rf "$S/x"`); a value from the
+    environment, from a branch, or with a `..` in it doesn't. Links are
+    resolved now, and unlike /tmp the scratchpad itself can be moved and
+    replaced by a link (`mv "$S" x; ln -s ~ "$S"`), so every target counts
+    only when nothing else in the command can plant a link."""
+    pad = HOOK_SCRATCHPAD
+    if not pad or not paths or not link_inert():
+        return False
+    unknown = []
+
+    def value(m):
+        v = variables.get(m.group(1) or m.group(2))
+        if not isinstance(v, str) or _UNKNOWN_NONEMPTY in v:
+            unknown.append(m.group(0))
+            return ""
+        return v
+    expanded = _TARGET_NAME_RE.sub(value, word)
+    if unknown or not _SCRATCH_WORD_RE.fullmatch(expanded) or ".." in expanded.split("/"):
+        return False
+    for path in paths:
+        path = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+        if not path.startswith(pad + "/"):
+            return False
+    return True
+
+
 def _cache_home(path):
     """True when `path` is under a safe write path (as written or resolved)
     other than /var/folders, which the scratch rule leaves to the LLM."""
@@ -3187,19 +4162,63 @@ def _cache_home(path):
                for w in {safe, os.path.realpath(safe)})
 
 
-def _link_inert(command):
+def _link_inert(command, exempt=None):
     """True when no command `command` may run can create a symlink or move
     one into place (see _LINK_INERT_COMMANDS), nor change which program a
-    name runs (`./mkdir`, `PATH=.; mkdir`, zsh `path=(.)`, `printf -v`)."""
+    name runs (`./mkdir`, `PATH=.; mkdir`, zsh `path=(.)`, `printf -v`).
+    `exempt` is the text of one part to leave out: the literal find whose
+    own delete is being judged (see _literal_find_delete)."""
     if re.search(r"(?<!\w)path", re.sub(r"[\"'\\]", "", command), re.I):
         return False
     for cmd in _iter_commands(command):
         if cmd is None:
             return False
+        if exempt is not None and cmd.strip() == exempt:
+            continue
         words = _command_line(cmd)[0]
         if words and (words[0] not in _LINK_INERT_COMMANDS or _sets_variables(cmd)
                       or _wrapper_doubt(cmd)):
             return False
+    return True
+
+
+# A find that can only delete: every word literal as written (bare, not
+# starting with zsh's `=cmd`, or quoted with nothing the shell expands
+# inside), start folders, then only
+# these tests, then -delete last; a stderr redirect at most.
+_LITERAL_FIND_WORD_RE = re.compile(r"[\w./@%+,:-][\w./@%+,:=-]*|'[^'\n]*'|\"[^\"$`\\!\n]*\"")
+_FIND_SAFE_TESTS = {"-name": r".+", "-iname": r".+", "-path": r".+", "-ipath": r".+",
+                    "-type": r"[bcdflps]", "-mindepth": r"\d+", "-maxdepth": r"\d+",
+                    "-mtime": r"[+-]?\d+", "-mmin": r"[+-]?\d+", "-size": r"[+-]?\d+[ckMG]?",
+                    "-empty": None, "-depth": None}
+
+
+def _literal_find_delete(text):
+    """True when the simple command `text` is a find made only of literal
+    words, with start folders, known tests and a final -delete: nothing in
+    it the shell builds at run time, nothing that runs or writes anything."""
+    tokens = text.split()
+    while tokens and tokens[-1] in ("2>/dev/null", "2>&1"):
+        tokens.pop()
+    if not tokens or tokens[0] != "find" or tokens[-1] != "-delete" \
+            or not all(_LITERAL_FIND_WORD_RE.fullmatch(t) for t in tokens):
+        return False
+    words = [t[1:-1] if t[:1] in "'\"" else t for t in tokens]
+    j = 1
+    while j < len(words) and not words[j].startswith("-"):
+        j += 1
+    if j == 1:
+        return False
+    while j < len(words) - 1:
+        test = words[j]
+        if test not in _FIND_SAFE_TESTS:
+            return False
+        if _FIND_SAFE_TESTS[test] is None:
+            j += 1
+            continue
+        if j + 1 >= len(words) - 1 or not re.fullmatch(_FIND_SAFE_TESTS[test], words[j + 1]):
+            return False
+        j += 2
     return True
 
 
@@ -3464,6 +4483,14 @@ def _simple_commands(words):
             yield out
 
 
+def _long_option_is(word, option):
+    """True when `word` is long option `option` or a prefix of it, which
+    getopt_long (GNU rm, chmod) reads as the option when no other one of the
+    program shares it, and otherwise rejects (`rm --rec`)."""
+    name = word.split("=", 1)[0]
+    return len(name) > 2 and name.startswith("--") and option.startswith(name)
+
+
 def _rm_parts(args):
     """(is_recursive, targets) for rm's arguments."""
     recursive = False
@@ -3475,7 +4502,7 @@ def _rm_parts(args):
         elif a == "--":
             options_done = True
         elif a.startswith("--"):
-            recursive = recursive or a == "--recursive"
+            recursive = recursive or _long_option_is(a, "--recursive")
         elif "r" in a or "R" in a:
             recursive = True
     return recursive, targets
@@ -3668,12 +4695,14 @@ def _protected_delete_check(command, cwd, empty_side, bash):
     trust_pwd = not _PWD_REDEFINED_RE.search(command)
     recursive_delete = False
     variable_cd = re.search(r"(?:^|[\s;&|({])(?:cd|pushd|popd)\b[^;&|\n]*[$`]", command)
-    inert = []
+    inert = {}
+    exempt_part = [None]  # the literal find being judged (see the find case)
 
     def link_inert():
-        if not inert:
-            inert.append(_link_inert(command))
-        return inert[0]
+        key = exempt_part[0]
+        if key not in inert:
+            inert[key] = _link_inert(command, exempt=key)
+        return inert[key]
     budget = [_MAX_PASSES]
     too_many = ("deny", "Blocked recursive delete: `{}` expands to too many paths (brace "
                 "groups, loop values, directories, values known only at run time) to check "
@@ -3870,7 +4899,7 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                 if side is None or _UNKNOWN_NONEMPTY in side:
                     continue
                 pieces = _split_fields(side, ifs) if t in split else [side]
-                if any(re.fullmatch(r"-\w*[rR]\w*|--recursive", p) for p in pieces):
+                if any(re.fullmatch(r"-\w*[rR]\w*", p) or _long_option_is(p, "--recursive") for p in pieces):
                     return True
             return False
 
@@ -3907,7 +4936,11 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                                    " was: chain it with `cd DIR && rm …`)" if cd_may_fail else "")
                                 + (" (an unquoted `$…` that expands to nothing makes `cd` go"
                                    " home: quote it, `cd \"$D\" && rm …`)" if cd_may_go_home else ""))
-                scratch = scratch and _scratch_delete(t, paths, where, link_inert)
+                # This session's scratchpad: a word reading a name the command
+                # set counts too, unless bash may split it on an odd IFS.
+                own = (t not in split or ifs == _DEFAULT_IFS) \
+                    and _own_scratch_delete(t, paths, vs, link_inert)
+                scratch = scratch and (own or _scratch_delete(t, paths, where, link_inert))
             recursive_delete = recursive_delete or risky and not scratch
             return None
         return step
@@ -4032,9 +5065,11 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                                         flags, letters, name)
                 # `cd -s` fails when the path has a symlink in it (`/tmp`).
                 no_symlinks = any("s" in f for f in flags if f != "--")
-                # `cd -P` (it wins over -L) ends in the physical folder, its
-                # `..` taken after the link before it (`link/..`).
-                physical = any("P" in f for f in flags if f != "--")
+                # `cd -P` ends in the physical folder, its `..` taken after
+                # the link before it (`link/..`). zsh's -P wins over -L;
+                # bash honours the last of the two (`cd -PL`: logical).
+                lp = "".join(c for f in flags if f != "--" for c in f if c in "LP")
+                physical = lp.endswith("P") if bash else "P" in lp
 
                 def resolved(where, side):
                     side = side.split("\0", 1)[0]  # a syscall stops at a NUL
@@ -4391,7 +5426,21 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                 starts, expr = _find_operands(args)
                 deletes = _find_deletes(expr)
                 if deletes:
-                    recursive_delete = True
+                    # Within this session's scratchpad it is scratch, as for
+                    # rm, while find follows no links (-H, -L, -follow). Only
+                    # a find written all literal (see _literal_find_delete)
+                    # counts, and only it is left out of the rest of the
+                    # command, which must plant no link.
+                    seg = segment.strip()
+                    literal = k == index and len(plain) == 1 and _literal_find_delete(seg)
+                    exempt_part[0] = seg if literal else None
+                    own = literal and bool(HOOK_SCRATCHPAD and starts) and not variable_cd \
+                        and ifs in (None, _DEFAULT_IFS) and not any(
+                            re.fullmatch(r"-\w*[HL]\w*|-follow", a) for a in args) and all(
+                            where and _own_scratch_delete(s, _delete_target_paths(
+                                s, where, variables, trust_pwd, empty_side) or [], variables, link_inert)
+                            for where in cwds for s in starts)
+                    recursive_delete = recursive_delete or not own
                     # With no test before a delete that leaves the start out
                     # (-name, -path, -mindepth, a -type other than d, …), a
                     # start folder is deleted with the rest: `find ~/Documents
@@ -4400,7 +5449,9 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                         step = check_rm(["-r", "--"] + (starts or ["."]), marked_words)
                         denied = step and run(step, maybe)
                         if denied:
+                            exempt_part[0] = None
                             return denied
+                    exempt_part[0] = None
     if recursive_delete:
         return ("ask", _RECURSIVE_DELETE_REASON)
     return None
@@ -4423,6 +5474,7 @@ _LITERAL_CHARS = {"$": "\x00", "*": "\x01", "?": "\x02", "[": "\x03", "~": "\x04
                   "{": "\x06", "}": "\x07"}
 _LITERAL_DOLLAR = _LITERAL_CHARS["$"]
 _UNMASK = str.maketrans({v: k for k, v in _LITERAL_CHARS.items()})
+_UNMASK_BUT_TILDE = str.maketrans({v: k for k, v in _LITERAL_CHARS.items() if k != "~"})
 _BRACED_PARTS_RE = re.compile(r"^(?P<len>#?)(?P<name>[A-Za-z_]\w*|[0-9]+|[@*!])(?P<op>.*)$", re.S)
 # Never empty: $$, $?, $#, $-, $0. ($! is empty in bash before any `&` job.)
 _NONEMPTY_SPECIAL = frozenset("$?#-0")
@@ -4627,7 +5679,25 @@ def _dot_entry_vars(command):
         out |= new
 
 
-def _classify_target(word, bound, trust_pwd=True):
+def _known_nonempty(command):
+    """Names `command` sets to one non-empty literal before any read, in a
+    plain `;`/newline/`&&` sequence (outside any condition, loop, group,
+    subshell, function or pipeline) and nowhere else: _fixed_constants. Such
+    a name can't be empty at an rm, so it needs no `${NAME:?}` guard.
+
+    Not a name written as `$NAME/` before the end of a word, a glob, another
+    `$`, a `/` or a quote (`"$S/"`, `$S/*`, `$S/$k`): Claude Code's own rm
+    check asks the user about those however the name was set, and no hook
+    can clear that prompt, so the steer to `"${S:?}/…"` (which it lets
+    through) saves a round trip."""
+    if "$" not in command:
+        return frozenset()
+    return frozenset(name for name in _fixed_constants(command) if not re.search(
+        r"\$(?:\{%s\}|%s(?!\w))[\"']*\\?/(?:[*?\[{$/\"'`]|$|[\s;&|)<>])" % (name, name),
+        command))
+
+
+def _classify_target(word, bound, trust_pwd=True, known=frozenset()):
     """Classify the expansions in one rm target word, left to right.
 
     Returns (unguarded, unguardable, components):
@@ -4638,13 +5708,14 @@ def _classify_target(word, bound, trust_pwd=True):
       components  — names whose expansion is a whole path component (or
                     feeds one, as in ${g:-$f}).
     A guard anywhere earlier in the word covers later uses of the same name:
-    the shell aborts on the first.
+    the shell aborts on the first. A name in `known` is never empty (see
+    _known_nonempty).
     """
     unguarded, unguardable, components = [], [], set()
     guarded = set()
 
     def may_be_empty(name):
-        if name in guarded:
+        if name in guarded or name in known:
             return False
         if name.isdigit() or name in ("@", "*", "!", "_"):
             return True
@@ -4653,7 +5724,7 @@ def _classify_target(word, bound, trust_pwd=True):
     def nonempty_word(text):
         if not text:
             return False
-        inner_unguarded, inner_unguardable, _ = _classify_target(text, bound, trust_pwd)
+        inner_unguarded, inner_unguardable, _ = _classify_target(text, bound, trust_pwd, known)
         return not inner_unguarded and not inner_unguardable
 
     for start, end, kind, body in _scan_expansions(word):
@@ -4801,7 +5872,7 @@ def unguarded_delete_check(command):
     segments, uncertain = split_compound_command(command)
     if uncertain or not segments:
         segments = [command]
-    bound = None
+    bound = known = None
     dot_vars = None
     trust_pwd = not _PWD_REDEFINED_RE.search(command)
     for segment in segments:
@@ -4823,7 +5894,8 @@ def unguarded_delete_check(command):
                 if bound is None:
                     bound = _bound_names(command)
                     dot_vars = _dot_entry_vars(command)
-                unguarded, unguardable, components = _classify_target(t, bound, trust_pwd)
+                    known = _known_nonempty(command)
+                unguarded, unguardable, components = _classify_target(t, bound, trust_pwd, known)
                 shown_t = t.translate(_UNMASK)
                 dotted = sorted(components & dot_vars)
                 if dotted:
@@ -4979,6 +6051,180 @@ def _inside_project(name, value, alone):
                for e in value.split(":"))
 
 
+# Options that run a program in another folder, as `cd DIR &&` would (a
+# file's folder for the ones naming a file: `cargo --manifest-path`, `mvn
+# -f`). A relative import path entry (`PYTHONPATH=src`) is then read from
+# there. {program: (short option letters, long options)}, read as getopt
+# reads them, a superset of each program's own parser (see
+# _dir_option_words): a short letter anywhere in a cluster (`make -sC x`,
+# `-sCx`), a long option by any prefix of three or more characters
+# (`make --dir=x`, as getopt_long, argparse and nopt take it). go's flag
+# package reads `-C`, `--C`, `-C=x` and `--C=x`.
+_DIR_OPTIONS = {
+    "env": ("CS", {"--chdir", "--split-string"}),
+    "uv": ("", {"--directory", "--project"}),
+    "npm": ("C", {"--prefix"}),
+    "npx": ("", {"--prefix"}),
+    "pnpm": ("C", {"--dir", "--prefix"}),
+    "yarn": ("", {"--cwd"}),
+    "bun": ("", {"--cwd"}),
+    "make": ("C", {"--directory"}),
+    "gmake": ("C", {"--directory"}),
+    "ninja": ("C", set()),
+    "go": ("C", {"--C"}),
+    "poetry": ("CP", {"--directory", "--project"}),
+    "cargo": ("C", {"--manifest-path"}),
+    "git": ("C", {"--work-tree", "--git-dir"}),
+    "just": ("df", {"--working-directory", "--justfile"}),
+    "task": ("d", {"--dir"}),
+    "gradle": ("p", {"--project-dir"}),
+    "mvn": ("f", {"--file"}),
+    "tox": ("c", {"--conf", "--root"}),
+}
+_DIR_OPTION_FILES = frozenset({"--manifest-path", "--justfile", "--file", "--conf"})
+# env -S splits its value into more options and a command: never followed.
+_DIR_OPTION_OPAQUE = frozenset({"-S", "--split-string"})
+# Programs whose own option parser isn't modelled (nopt's shorthands, bun's
+# and gradle's parsers, yarn's two): any option counts as a folder option.
+_DIR_PARSER_UNKNOWN = frozenset({"npm", "npx", "pnpm", "yarn", "bun", "gradle"})
+# Programs whose repeated folder options chain, each relative one taken from
+# the folder before it (GNU make's manual, git(1) on -C); repeats of any
+# other option count as outside.
+_DIR_OPTIONS_CHAINED = {"make": {"-C", "--directory"}, "gmake": {"-C", "--directory"},
+                        "git": {"-C"}}
+
+
+def _dir_option_words(program, words):
+    """[(option, folder)] for each folder option of `program` (see
+    _DIR_OPTIONS) in `words`, its arguments; the option as named in the
+    table, or as written with an empty folder when it can't be told (an
+    ambiguous prefix, any option of a program in _DIR_PARSER_UNKNOWN)."""
+    letters, longs = _DIR_OPTIONS[program]
+    found = []
+    for j, w in enumerate(words):
+        if w == "--":
+            break
+        following = words[j + 1] if j + 1 < len(words) else ""
+        if w.startswith("--"):
+            name, eq, value = w.partition("=")
+            named = [o for o in sorted(longs) if len(name) >= 3 and o.startswith(name)]
+            if len(named) == 1:
+                found.append((named[0], value if eq else following))
+                continue
+            if named:
+                found.append((w, ""))
+                continue
+        elif w.startswith("-") and len(w) > 1:
+            k = next((k for k, c in enumerate(w) if k and c in letters), None)
+            if k is not None:
+                found.append(("-" + w[k], w[k + 1:] or following))
+                continue
+        if program in _DIR_PARSER_UNKNOWN and w.startswith("-") and w != "-":
+            found.append((w, ""))
+    return found
+
+
+def _dir_option_outside(command):
+    """The first option in `command` that runs a program in a folder outside
+    the working folder (see _DIR_OPTIONS), or None. A folder counts as inside
+    when, links resolved as the program's own chdir resolves them, it is in
+    the working folder or a linked worktree of its repository (see
+    _project_folder_test); a relative one from every directory the command
+    may be in by then (see _git_command_dirs), and none when that isn't
+    sure. Anything built at run time counts as outside, and so does a `~`
+    that may not be $HOME (see _tilde_masked) or a folder after `=` where
+    the program's own parser may keep it (`go -C=x`, getopt's `-C=x`).
+    Every word after a listed program is read, its arguments too: a wrong
+    hit only costs an LLM call."""
+    cwd = HOOK_CWD if HOOK_CWD and os.path.isabs(HOOK_CWD) else None
+    known = []  # (inside, the directories a relative folder starts from), once needed
+
+    def outside(option, folder):
+        if option in _DIR_OPTION_OPAQUE:
+            return True
+        # checked on the word as written: dirname("$M") is "." and would hide it
+        if not folder or not cwd or folder.startswith("=") or re.search(r"[$`*?\[{\x00-\x1f\x7f]", folder):
+            return True
+        if option in _DIR_OPTION_FILES or option == "-f" and folder.endswith((".toml", ".xml", "file")):
+            folder = os.path.dirname(folder) or "."
+        if not known:
+            dirs, certain = _git_command_dirs(command, cwd)
+            known.append((_project_folder_test(cwd), dirs if certain else None))
+        inside, bases = known[0]
+        folder = os.path.expanduser(folder)  # only `~` and `~/…` are left
+        if os.path.isabs(folder):
+            return not inside(folder)
+        return bases is None or not all(inside(os.path.join(b, folder)) for b in bases)
+
+    for part in _iter_commands(_tilde_masked(command)):
+        words = _shell_words(part) if part else []
+        for i, word in enumerate(words):
+            program = os.path.basename(word)
+            if program not in _DIR_OPTIONS:
+                continue
+            found = _dir_option_words(program, words[i + 1:])
+            if len(found) > 1:
+                # Repeated, each relative one from the one before (make -C,
+                # git -C); where repeats aren't known to chain, outside.
+                chained = _DIR_OPTIONS_CHAINED.get(program)
+                if not chained or any(o not in chained for o, _v in found):
+                    return " ".join(x for x in found[1] if x)[:80].replace(_LITERAL_CHARS["~"], "~")
+                folder = ""
+                for _o, value in found:
+                    value = os.path.expanduser(value)
+                    folder = value if not folder or os.path.isabs(value) else os.path.join(folder, value)
+                found = [(found[-1][0], folder)]
+            if found and outside(*found[0]):
+                return " ".join(x for x in found[0] if x)[:80].replace(_LITERAL_CHARS["~"], "~")
+    return None
+
+
+def _project_dirs_only(command, parts, index):
+    """True when `parts[index]` of `command` runs in the working folder or a
+    linked worktree of its repository, with nothing beside it that can plant
+    a link: every other command a `cd` or link-inert (see _link_inert), and
+    every directory git would be placed in (see _git_command_dirs) inside the
+    working folder, or a linked worktree whose repository is the working
+    folder's (`cd ../repo-wt/x && PYTHONPATH=src python -m pytest | tail`).
+    A relative import path entry then stays in the developer's own code."""
+    cwd = HOOK_CWD
+    if not (cwd and os.path.isabs(cwd)) or any(
+            p is None or i != index and not _link_inert(p) for i, p in enumerate(parts)):
+        return False
+    dirs, certain = _git_command_dirs(command, cwd)
+    inside = _project_folder_test(cwd)
+    return certain and all(inside(d) for d in dirs)
+
+
+def _project_folder_test(cwd):
+    """A test `inside(path)`: True when `path`, links resolved, is in the
+    working folder `cwd` or in a linked worktree whose repository is the
+    working folder's. That repository is asked once."""
+    home = os.path.realpath(cwd)
+    deadline = time.monotonic() + GIT_OWNER_RULE_TIMEOUT_S
+    common = []
+
+    def repo_of(path):
+        """(git dir, common dir, top level) of the checkout at `path`, or None."""
+        if os.environ.get("GIT_DIR") or os.environ.get("GIT_WORK_TREE"):
+            return None
+        out = _git_probe(path, ["rev-parse", "--path-format=absolute", "--git-dir",
+                                "--git-common-dir", "--show-toplevel"], deadline)
+        lines = [os.path.realpath(x) for x in out.splitlines()] if out else []
+        return lines if len(lines) == 3 else None
+
+    def inside(d):
+        d = os.path.realpath(d)
+        if d == home or d.startswith(home.rstrip("/") + "/"):
+            return True
+        here = repo_of(d) if os.path.isdir(d) else None
+        if not common:
+            common.append(repo_of(cwd))
+        return bool(here and common[0] and here[1] == common[0][1] and here[0] != here[1]
+                    and (d == here[2] or d.startswith(here[2].rstrip("/") + "/")))
+    return inside
+
+
 def _env_settings(part):
     """(the unquoted words of one simple command that may set environment
     variables, whether they include a wrapper's or builtin's arguments).
@@ -5014,7 +6260,8 @@ def _env_hazard(command):
     if "=" not in command:
         return None
     parts = list(_iter_commands(command))
-    for part in parts:
+    moved = None  # _dir_option_outside(command), once an import path needs it
+    for index, part in enumerate(parts):
         words, setter = _env_settings(part) if part else ([], False)
         for i, word in enumerate(words):
             if setter and "=" in word and re.search(r"[$`{*?[]", word.split("=", 1)[0]):
@@ -5027,12 +6274,19 @@ def _env_hazard(command):
                 continue
             value = m.group(5)
             inert = _ENV_INERT_OPTIONS.get(name)
+            # A relative entry stays in the working folder only if no option
+            # runs the program elsewhere (`env -C /tmp`, `make -C ../x`).
+            if m.group(2) and moved is None:
+                moved = _dir_option_outside(command) or ""
             if m.group(4) or not (
                     m.group(1) and _plain_allowed(value, ("less", "more"))
-                    or m.group(2) and _inside_project(name, value, len(parts) == 1)
+                    or m.group(2) and (_inside_project(name, value, len(parts) == 1 and not moved) or (
+                        not moved and _inside_project(name, value, True)
+                        and _project_dirs_only(command, parts, index)))
                     or inert and all(inert.fullmatch(w.replace("_", "-")) for w in value.split())):
                 what = "load code from outside the working folder" if m.group(2) else "run other code"
-                return f"Sets {name} to {what} ({' '.join(value.split())[:60]})"
+                where = f", run elsewhere by {moved}" if m.group(2) and moved else ""
+                return f"Sets {name} to {what} ({' '.join(value.split())[:60]}{where})"
     return None
 
 
@@ -5094,13 +6348,14 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
     defined_functions = {name for name in map(get_function_definition_name, commands) if name}
     unknown_words = []
     constants = None  # _command_constants(command), once a `$NAME` command word needs it
+    fixed = None  # _fixed_constants(command), once a word built at run time needs it
 
     def check(parts, body=False):
         """Judge each part: return a deny, else hold the first ask in `held`
         and collect unknown command words. `body` marks the parts of a
         function body or case arm, whose own anchored dangerous patterns
         are matched here and which are not opened further."""
-        nonlocal held, constants
+        nonlocal held, constants, fixed
         for cmd in parts:
             cmd = _strip_leading_keywords(cmd)
             if not cmd.strip():
@@ -5137,6 +6392,17 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
                     if deny:
                         return deny
                 continue
+
+            # `B=main; git push origin $B`: a word built at run time only from
+            # names fixed to one literal (the proof a `$NAME` command word
+            # rests on, below) is that literal, so the part is judged written
+            # out, once nothing is left for the shell to build.
+            if not body and _built_word_risk(cmd):
+                if fixed is None:
+                    fixed = _fixed_constants(command)
+                expanded = fixed and _replace_constant_reads(cmd, fixed)
+                if expanded and expanded != cmd and not _expansion_left(expanded):
+                    cmd = expanded
 
             # Code the command runs (shell -c/heredoc, trap, find -exec, awk,
             # eval), and risky uses of allowed commands; a steer beats an ask
@@ -5257,8 +6523,52 @@ _VARIABLE_SETTERS = frozenset({
 # any word but a NAME=value
 _VARIABLE_SETTER_FLAGS = {"printf": r"-\w*v", "print": r"-\w*v", "wait": r"-\w*p",
                           "set": r"[-+]\w*A", "export": r"-|(?![A-Za-z_]\w*=)"}
-_SPECIAL_NAMES = frozenset({"_", "IFS", "PATH", "PWD", "OLDPWD", "HOME", "CDPATH", "ENV",
-                            "RANDOM", "SECONDS", "LINENO", "UID", "EUID", "PPID"})
+# Names the shell itself sets, reads, changes as the command runs (`cd`, `set
+# --`, `shift`, `[[ =~ ]]`, a prompt, a resize) or ties to another name (zsh
+# `argv` and `@`, `path` and PATH, `RPS1` and RPROMPT): a literal assigned to
+# one may not be what a later read gets. Generated once from the shells, not
+# per call (zsh 5.9, bash 3.2 here, plus the bash 5 manual), then hard-coded:
+#   zsh -f: zmodload every module under $module_path/zsh (and `zmodload -a`),
+#     then each name whose ${parameters[$k]} says special or tied, also after
+#     assigning it (RPS1 is special but unset until then), plus every entry of
+#     zshparam(1)'s PARAMETERS SET BY / USED BY THE SHELL;
+#   env -i bash --norc --noprofile -c 'compgen -v', plus the bash manual's
+#     Shell Variables (bash 3.2 man page and the bash 5.2 manual);
+#   the union, with what _SPECIAL_NAME_RE already covers taken out.
+# Leaving a name out makes a constant pass; listing one too many only sends
+# that command to the judge.
+_SPECIAL_NAMES = frozenset({
+    "_", "aliases", "ARGC", "argv", "ARGV0", "BASH", "BASHOPTS", "BAUD", "builtins", "CDPATH",
+    "cdpath", "CHILD_MAX", "COLUMNS", "commands", "COMPREPLY", "COPROC", "CORRECT_IGNORE",
+    "CORRECT_IGNORE_FILE", "CPUTYPE", "DIRSTACK", "dirstack", "DIRSTACKSIZE", "dis_aliases",
+    "dis_builtins", "dis_functions", "dis_functions_source", "dis_galiases", "dis_patchars",
+    "dis_reswords", "dis_saliases", "EGID", "EMACS", "ENV", "EPOCHREALTIME", "EPOCHSECONDS",
+    "epochtime", "ERRNO", "errnos", "EUID", "EXECIGNORE", "FCEDIT", "FIGNORE", "fignore", "FPATH",
+    "fpath", "funcfiletrace", "FUNCNAME", "FUNCNEST", "funcsourcetrace", "funcstack", "functions",
+    "functions_source", "functrace", "galiases", "GID", "GLOBIGNORE", "GLOBSORT", "GROUPS",
+    "HISTCHARS", "histchars", "HISTCMD", "HISTCONTROL", "HISTFILE", "HISTFILESIZE", "HISTIGNORE",
+    "history", "HISTORY_IGNORE", "historywords", "HISTSIZE", "HISTTIMEFORMAT", "HOME", "HOST",
+    "HOSTFILE", "HOSTNAME", "HOSTTYPE", "IFS", "IGNOREEOF", "INPUTRC", "INSIDE_EMACS", "jobdirs",
+    "jobstates", "jobtexts", "KEYBOARD_HACK", "keymaps", "KEYTIMEOUT", "LANG", "langinfo",
+    "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_NUMERIC", "LC_TIME", "LINENO", "LINES",
+    "LISTMAX", "LOGNAME", "MACHTYPE", "MAIL", "MAILCHECK", "MAILPATH", "mailpath", "MANPATH",
+    "manpath", "MAPFILE", "mapfile", "MATCH", "match", "MBEGIN", "mbegin", "MEND", "mend",
+    "MODULE_PATH", "module_path", "modules", "nameddirs", "NULLCMD", "OLDPWD", "OPTARG", "OPTERR",
+    "OPTIND", "options", "OSTYPE", "parameters", "patchars", "PATH", "path", "PIPESTATUS",
+    "pipestatus", "POSIXLY_CORRECT", "POSTEDIT", "PPID", "PROMPT", "prompt", "PROMPT2", "PROMPT3",
+    "PROMPT4", "PROMPT_COMMAND", "PROMPT_DIRTRIM", "PROMPT_EOL_MARK", "PS0", "PS1", "PS2", "PS3",
+    "PS4", "PSVAR", "psvar", "PWD", "RANDOM", "READLINE_ARGUMENT", "READLINE_LINE",
+    "READLINE_MARK", "READLINE_POINT", "READNULLCMD", "REPLY", "reply", "REPORTMEMORY",
+    "REPORTTIME", "reswords", "RPROMPT", "RPROMPT2", "RPS1", "RPS2", "saliases", "SAVEHIST",
+    "SECONDS", "SHELL", "SHELLOPTS", "SHLVL", "signals", "SPROMPT", "SRANDOM", "status", "STTY",
+    "sysparams", "TERM", "termcap", "TERMINFO", "terminfo", "TERMINFO_DIRS", "terminfo_dirs",
+    "TIMEFMT", "TIMEFORMAT", "TMOUT", "TMPDIR", "TMPPREFIX", "TMPSUFFIX", "TRY_BLOCK_ERROR",
+    "TRY_BLOCK_INTERRUPT", "TTY", "TTYIDLE", "UID", "userdirs", "usergroups", "USERNAME", "VENDOR",
+    "WATCH", "watch", "widgets", "WORDCHARS", "ZBEEP", "zcurses_attrs", "ZCURSES_COLOR_PAIRS",
+    "ZCURSES_COLORS", "zcurses_colors", "zcurses_keycodes", "zcurses_windows", "ZDOTDIR",
+    "zle_bracketed_paste", "zle_highlight", "ZLE_LINE_ABORTED", "ZLE_REMOVE_SUFFIX_CHARS",
+    "ZLE_RPROMPT_INDENT", "ZLE_SPACE_SUFFIX_CHARS", "zsh_eval_context", "zsh_scheduled_events"})
+_SPECIAL_NAME_RE = re.compile(r"(?:BASH|ZSH|COMP)_\w*|BASHPID")
 
 
 @_memo
@@ -5284,7 +6594,7 @@ def _command_constants(command):
             reads = [r.start() for r in read.finditer(command)]
             # Written anywhere but by this statement (`${N:=x}` included): no.
             mentions = sum(bool(re.search(r"(?<!\w)%s(?!\w)" % name, read.sub("", t))) for t in tokens)
-            if name in _SPECIAL_NAMES or mentions != 1 \
+            if name in _SPECIAL_NAMES or _SPECIAL_NAME_RE.fullmatch(name) or mentions != 1 \
                     or any(r < m.end() for r in reads) or chained and not all(
                         re.fullmatch(r"(?:[^;&|\n(){}`]|&&)*", command[m.end():r]) for r in reads):
                 continue
@@ -5372,6 +6682,20 @@ def _constant_text(command):
         return None
     constants = _command_constants(command)
     return _replace_constant_reads(command, constants) if constants else None
+
+
+def _fixed_constants(command):
+    """_command_constants(command), or {} when, with them written out, some
+    command word is still built at run time (`$E "$Y"`, where E may be eval
+    or read): the one proof the rm guard and the run-time word check lean on
+    besides the `$NAME` command word."""
+    constants = _command_constants(command)
+    if not constants:
+        return {}
+    parts, uncertain = split_compound_command(_replace_constant_reads(command, constants))
+    if uncertain or any(re.search(r"[$`]", (_command_line(p)[0] or [""])[0]) for p in parts):
+        return {}
+    return constants
 
 
 def _expand_constant(part, constants):
@@ -6384,6 +7708,11 @@ _GIT_COMMAND_KEYS_RE = re.compile(
 # The keys of those whose value is a program for the user to look at the
 # output with (`core.pager=less`): fine when it is a plain allowed command.
 _GIT_PROGRAM_KEYS_RE = re.compile(r"core\.(?:pager|editor)|sequence\.editor|pager\..*", re.I)
+# Values of those keys that turn a command off for one `git -c` run rather
+# than name one: hooks looked up under /dev/null (none run), and an empty
+# credential helper (clears the list). Not for `git config`, where the
+# change outlasts the call.
+_GIT_INERT_SETTINGS = frozenset({("core.hookspath", "/dev/null"), ("credential.helper", "")})
 _CURL_VALUE_LETTERS = frozenset("oHXAebcEuUxYyzCDQtPmrw")
 _CURL_DATA_OPTS = frozenset({"-d", "--data", "--data-binary", "--data-ascii",
                              "--data-urlencode", "--json", "--variable", "--url-query"})
@@ -6409,7 +7738,8 @@ def _git_risk(args, _aliased=0):
                     pre = pre or f"git -c setting that runs a command: {args[i + 1]}"
                 aliases[key[6:].lower()] = value
             elif _GIT_COMMAND_KEYS_RE.fullmatch(key) and not (
-                    _GIT_PROGRAM_KEYS_RE.fullmatch(key) and _plain_allowed(value, ("less", "more"))):
+                    _GIT_PROGRAM_KEYS_RE.fullmatch(key) and _plain_allowed(value, ("less", "more"))
+                    or "=" in args[i + 1] and (key.lower(), value) in _GIT_INERT_SETTINGS):
                 pre = pre or f"git -c setting that runs a command: {args[i + 1]}"
         if a == "-C" and i + 1 < len(args):
             where = os.path.join(where, _expand_home(args[i + 1]))
@@ -6431,6 +7761,7 @@ def _git_risk(args, _aliased=0):
             return risk
         pre = pre or risk
         # git ignores an alias named like a built-in, so read it as one too
+    rest = _git_long_spelled(sub, rest)
     flags = _git_flags(rest, _GIT_SHORT_VALUES.get(sub, ""))
     letters = "".join(f for f in flags if len(f) == 1)
     plain = [a for a in rest if not a.startswith("-")]
@@ -6450,14 +7781,17 @@ def _git_risk(args, _aliased=0):
     if sub in ("checkout", "switch") and ("f" in letters or "--force" in rest
                                           or "--discard-changes" in rest):
         return f"git {sub} --force (discards uncommitted changes)"
-    if sub == "restore" and not (("S" in letters or "--staged" in rest)
-                                 and not ("W" in letters or "--worktree" in rest)):
+    # read from the parsed flags, which skip option values: a pathspec file
+    # named `--staged` (`--pathspec-from-file --staged`) is not the option
+    if sub == "restore" and not (("S" in letters or "--staged" in flags)
+                                 and not ("W" in letters or "--worktree" in flags)):
         return "git restore of the work tree (discards uncommitted changes)"
     if sub == "stash" and plain[:1] in (["drop"], ["clear"]):
         return f"git stash {plain[0]} (deletes stashed work)"
     if sub == "branch" and ("D" in letters or ("d" in letters or "--delete" in rest)
                             and ("f" in letters or "--force" in rest)) \
-            and not (plain and all(_AGENT_BRANCH_RE.fullmatch(b) for b in plain)):
+            and not (plain and all(_AGENT_BRANCH_RE.fullmatch(b) for b in plain)) \
+            and not (set(flags) <= _BRANCH_DELETE_FLAGS and _branches_on_remotes(plain)):
         return "git branch -D (deletes an unmerged branch)"
     if sub in ("filter-branch", "filter-repo"):
         return f"git {sub} (rewrites history)"
@@ -6537,6 +7871,151 @@ def _git_config_risk(rest):
 # these is housekeeping, not lost work.
 _AGENT_BRANCH_RE = re.compile(r"worktree-agent-[0-9a-f]{8,40}")
 
+# `git branch -D` of branches whose tips a remote-tracking ref already holds
+# loses no commit. Only these options (not -r, which deletes remote-tracking
+# refs, nor anything else), and only names written out plainly.
+_BRANCH_DELETE_FLAGS = frozenset({"D", "d", "f", "q", "--delete", "--force", "--quiet"})
+_PLAIN_BRANCH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./+@-]*")
+
+
+def _branches_on_remotes(branches):
+    """True when every branch in `branches` exists and its tip is on some
+    remote-tracking ref (refs/remotes/*), in every directory the command may
+    run git in (as for a push, see _git_command_dirs): one `git rev-list` there
+    lists a commit of theirs no remote-tracking ref holds, and must list none.
+    Any doubt is a no: a directory not resolved, a name built at run time or
+    that isn't a local branch there, a slow or failing probe."""
+    if not branches or not all(_PLAIN_BRANCH_RE.fullmatch(b) and ".." not in b
+                               and not b.endswith((".", "/", ".lock")) for b in branches) \
+            or not _refs_left_alone(_TOP_COMMAND or ""):
+        return False
+    dirs, certain = _git_command_dirs(_TOP_COMMAND or "", HOOK_CWD or os.getcwd())
+    if not certain:
+        return False
+    deadline = time.monotonic() + GIT_OWNER_RULE_TIMEOUT_S
+    revs = ["refs/heads/" + b for b in branches]
+    return all(_git_probe(path, ["rev-list", "--max-count=1", *revs, "--not", "--remotes", "--"],
+                          deadline) == "" for path in dirs)
+
+
+# What may run beside a `git branch -D` that _branches_on_remotes vouches for:
+# nothing that can make a commit, move a branch or drop a remote-tracking ref
+# after the probe (`git commit`, `git branch -f`, `git fetch --prune`, `rm
+# .git/refs/…`, `git log --output=.git/refs/…`, a script). An allowlist: every
+# word literal as written, commands that only read (no output redirect, no
+# assignment, no wrapper), and git with only the options below. git reads an
+# unambiguous abbreviation of a long option as the option, so options match
+# whole: `--out=x` is no `--oneline`.
+_REF_READERS = _LINK_INERT_COMMANDS - {"rm", "rmdir", "mkdir", "touch", "tee", "kill", "pkill",
+                                       "wait", "unset"}
+# A part whose words the shell takes as written: bare, or quoted with
+# nothing it expands inside; and the redirects that write no file.
+_LITERAL_PART_RE = re.compile(
+    r"[ \t]*(?:(?:(?:[\w./@%+,:-]|'[^'\n]*'|\"[^\"$`\\!\n]*\")"
+    r"(?:[\w./@%+,:=-]|'[^'\n]*'|\"[^\"$`\\!\n]*\")*"
+    r"|\d?>&\d|\d?>>?[ \t]*/dev/null)(?:[ \t]+|$))*")
+# Per read-only subcommand: its options taken alone, and those that take a
+# value (`-n 5`, `--format=%H`) with the value's shape.
+_GIT_READER_OPTS = {
+    "status": ({"-s", "--short", "-b", "--branch", "-sb", "--porcelain", "--porcelain=v1",
+                "--porcelain=v2"}, {}),
+    "log": ({"--oneline", "--graph", "--decorate", "--stat", "--all"},
+            {"-n": r"\d+", "--format": r".*", "--pretty": r".*"}),
+    "show": ({"--oneline", "--stat", "-s", "-q", "--quiet"}, {"--format": r".*", "--pretty": r".*"}),
+    "diff": ({"--stat", "--quiet", "--name-only", "--name-status", "--cached", "--staged"}, {}),
+    "rev-parse": ({"--abbrev-ref", "--show-toplevel", "--short", "--verify", "-q", "--quiet",
+                   "--is-inside-work-tree", "--git-dir", "--git-common-dir"}, {}),
+    "rev-list": ({"--count", "--oneline"}, {"-n": r"\d+", "--max-count": r"\d+"}),
+    "merge-base": ({"--is-ancestor"}, {}),
+    "for-each-ref": (set(), {"--format": r".*", "--count": r"\d+"}),
+}
+_BRANCH_LIST_WORDS = frozenset({"-a", "--all", "-v", "-vv", "--verbose", "--show-current",
+                                "-l", "--list", "--no-color"})
+
+
+def _git_reader_args(sub, rest):
+    """True when `rest` holds only options _GIT_READER_OPTS lists for `sub`
+    (and `-N` for log and rev-list), and operands: refs or paths."""
+    alone, valued = _GIT_READER_OPTS[sub]
+    j, ended = 0, False
+    while j < len(rest):
+        w = rest[j]
+        j += 1
+        if ended or not w.startswith("-"):
+            continue
+        if w == "--":
+            ended = True
+        elif w in alone or sub in ("log", "rev-list") and re.fullmatch(r"-\d+", w):
+            continue
+        elif w in valued and j < len(rest) and not w.startswith("--") \
+                and re.fullmatch(valued[w], rest[j]):
+            j += 1
+        elif "=" in w and w.split("=", 1)[0] in valued \
+                and re.fullmatch(valued[w.split("=", 1)[0]], w.split("=", 1)[1], re.S):
+            continue
+        else:
+            return False
+    return True
+
+
+def _refs_left_alone(command):
+    """True when no part of `command` can write a branch or remote-tracking
+    ref: every word of every part is literal (no expansion, glob, `~` or
+    assignment), and each part is a reader (_REF_READERS, no output
+    redirect), a git reader with known options (_GIT_READER_OPTS), a branch
+    listing or deletion (not -r), `git worktree list`, `prune` or `remove
+    [--force] PATH`, or `git checkout`/`switch [-q] NAME`. git takes no
+    global option but `-C PATH` and --no-pager (`-c` can set a hook path or
+    alias)."""
+    if re.search(r"(?<!\w)path", re.sub(r"[\"'\\]", "", command), re.I):
+        return False  # which program `git` names may change (as in _link_inert)
+    for part in _iter_commands(command):
+        if part is None or _has_output_redirect(part) or _sets_variables(part) \
+                or _wrapper_doubt(part):
+            return False
+        if not _LITERAL_PART_RE.fullmatch(part.strip()):
+            return False
+        words, plain, skip = _command_line(part)[0], [], False
+        for w in _shell_words(part):  # all but the redirects
+            if not skip and set(w) <= set("<>&"):
+                skip = True
+            elif not skip:
+                plain.append(w)
+            else:
+                skip = False
+        if not words or words != plain:  # an assignment or a wrapper
+            return False
+        if words[0] in _REF_READERS:
+            continue
+        if words[0] != "git":
+            return False
+        i = 1
+        while i < len(words) and words[i] in ("-C", "--no-pager"):
+            if words[i] == "-C" and (i + 1 >= len(words) or words[i + 1].startswith("-")):
+                return False
+            i += 2 if words[i] == "-C" else 1
+        sub, rest = (words[i], words[i + 1:]) if i < len(words) else ("", [])
+        opts = [w for w in rest if w.startswith("-")]
+        operands = [w for w in rest if not w.startswith("-")]
+        if sub in _GIT_READER_OPTS and _git_reader_args(sub, rest):
+            continue
+        if sub == "worktree" and (rest in (["list"], ["list", "--porcelain"], ["prune"])
+                                  or rest[:1] == ["remove"] and len(operands) == 2
+                                  and set(opts) <= {"-f", "--force"}):
+            continue
+        if sub == "branch" and (
+                set(_git_flags(rest, "")) <= _BRANCH_DELETE_FLAGS
+                and set(_git_flags(rest, "")) & {"D", "d", "--delete"}
+                and all(not o.startswith("--") or o in _BRANCH_DELETE_FLAGS for o in opts)
+                or set(rest) <= _BRANCH_LIST_WORDS
+                or {"-l", "--list"} & set(rest) and set(opts) <= _BRANCH_LIST_WORDS):
+            continue
+        if sub in ("checkout", "switch") and set(opts) <= {"-q", "--quiet"} \
+                and len(operands) == 1 and "--" not in rest:
+            continue
+        return False
+    return True
+
 
 # Short options of these git subcommands that take a value (`-e PATTERN`,
 # `-bNAME`): the rest of the word is the value, not more options.
@@ -6546,6 +8025,51 @@ _GIT_SHORT_VALUES = {"clean": "e", "checkout": "bB", "switch": "cC", "restore": 
 _GIT_LONG_VALUES = frozenset({"--exclude", "--orphan", "--conflict", "--create", "--force-create",
                               "--source", "--pathspec-from-file", "--set-upstream-to", "--repo",
                               "--push-option", "--receive-pack", "--exec"})
+
+
+# The long options _git_risk decides by, per subcommand. git reads any
+# unambiguous prefix of a long option as the option (`reset --har`).
+_GIT_DECIDING_LONGS = {
+    "reset": ("--hard",),
+    "clean": ("--force", "--dry-run", "--no-dry-run", "--exclude"),
+    "checkout": ("--force", "--discard-changes", "--pathspec-from-file", "--orphan", "--conflict"),
+    "switch": ("--force", "--discard-changes", "--create", "--force-create", "--orphan", "--conflict"),
+    "restore": ("--staged", "--worktree", "--source", "--pathspec-from-file"),
+    "branch": ("--delete", "--force", "--quiet", "--remotes", "--set-upstream-to"),
+}
+
+
+def _git_long_spelled(sub, rest):
+    """`rest` with each prefix of a long option _GIT_DECIDING_LONGS lists for
+    `sub` spelled out, up to `--`. A prefix of more than one listed option
+    is git's error (ambiguous) or one of them: it is spelled as the first
+    and the others are added, so every reading counts."""
+    longs = _GIT_DECIDING_LONGS.get(sub)
+    if not longs:
+        return rest
+    out, value_next = [], False
+    value_letters = _GIT_SHORT_VALUES.get(sub, "")
+    for k, a in enumerate(rest):
+        if value_next:
+            # the value of the option before (`--pathspec-from-file --stag`,
+            # `-s --stag`): a file or commit name, never an option to spell out
+            out.append(a)
+            value_next = False
+            continue
+        if a == "--":
+            return out + rest[k:]
+        name, eq, value = a.partition("=")
+        hits = [o for o in longs if o.startswith(name)] if name.startswith("--") and len(name) > 2 \
+            and name not in longs else []
+        spelled = [hits[0] + eq + value] + hits[1:] if hits else [a]
+        out.extend(spelled)
+        if a.startswith("--"):
+            value_next = not eq and any(s in _GIT_LONG_VALUES for s in spelled)
+        elif a.startswith("-") and len(a) > 1:
+            letters = a[1:]
+            cut = next((j for j, ch in enumerate(letters) if ch in value_letters), None)
+            value_next = cut == len(letters) - 1  # `-s` then its value as the next word
+    return out
 
 
 def _git_flags(rest, value_letters):
@@ -6790,7 +8314,7 @@ def _defaults_risk(args):
 
 def _chmod_risk(args):
     """Why a chmod makes a tree world-writable, or None."""
-    if not ("--recursive" in args or any(re.fullmatch(r"-[A-Za-z]*R[A-Za-z]*", a) for a in args)):
+    if not any(_long_option_is(a, "--recursive") or re.fullmatch(r"-[A-Za-z]*R[A-Za-z]*", a) for a in args):
         return None
     mode = next((a for a in args if not re.fullmatch(r"-[A-Za-z]+|--(?:\w[\w-]*)?", a)), "")
     if re.fullmatch(r"0*[0-7]{3,4}", mode):

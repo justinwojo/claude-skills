@@ -15,7 +15,17 @@ tells the agent to write `"${T:?}/${k:?}"`: the shell then aborts instead of
 deleting when a value is empty, which proves the empty case away at run time,
 and Claude Code runs it without asking. The rule covers targets that start with
 `/`, `~`, `$VAR` or `$(…)`, and requires a guard on every variable that the
-command sets or unsets itself or that is unset or empty in the environment. It
+command sets or unsets itself or that is unset or empty in the environment.
+The exception is a name the command sets once to a non-empty literal before
+any read, at the top level of a plain `;`/newline/`&&` sequence (not inside
+`if`, a loop, `case`, `( )`, `{ }`, a function or a pipeline, not after `||`)
+and never sets, unsets, exports or reads in again: `S=/tmp/x; rm -rf "$S/t5"`
+needs no guard. A name the shell sets itself or ties to another (`argv`,
+`PWD`, `PATH`/`path`, `PS1`/`prompt`, `REPLY`, `BASH_*`, …) never counts. Where Claude Code's own check asks however the name was set
+(`$S/` at the end of a word, or followed by a glob, `$`, `/` or a quote:
+`"$S/"`, `$S/*`, `$S/$k`), the rewrite is still given, since that prompt
+can't be cleared and the guarded form passes it. A command with a heredoc, a
+comment or a function gets no such names. It
 also covers `"$D"/*` and `/tmp/$k`, which Claude Code's own check lets through;
 the rewrite keeps globs, brace groups and a leading `~` outside the quotes
 (`"${D:?}/"*`). A
@@ -115,7 +125,10 @@ any characters at all (any stretch of the value is a possible word; past 256
 characters only at each one, or all its punctuation, and the LLM judges the rest). Quoted
 text beside the value (`"a b"$X`), and a quoted `for` word, are never split. `$"…"` is a plain quoted string, and a
 `$'…'` string ends at a NUL, so `$'\0'`, `$'\c@'` and `$'\400'` are empty. A `~` after a quote
-(`''~/x`) is not home. `cd` takes only `-L`, `-P`, `-e` and `-@`, and
+(`''~/x`) is not home. `cd` takes only `-L`, `-P`, `-e` and `-@` (bash 3.2 only
+`-L` and `-P`: it fails on the others and stays put, as zsh's reading of them
+as `cd OLD NEW` mostly does too), the last of `-L` and `-P` decides (`cd -PL`
+is logical, where zsh's `-P` wins wherever it is), and
 `pushd`/`popd` only `-n`, which doesn't change directory (though a later
 `popd` may go to what `pushd -n` pushed, an expanded or split one too). Any other `-x` there, including
 `cd -1`, fails and leaves the shell where it was. A second operand makes
@@ -156,6 +169,32 @@ change which program a name runs (`./mkdir`, `export`, `printf -v` and a call
 that mentions `PATH` don't count). `/var/folders`, `build`, `dist`, `node_modules` and `target` are
 not on the list, and one target off the list sends the whole delete to the LLM.
 The protected-folder deny still comes first.
+
+A third kind is this session's own scratchpad
+(`/private/tmp/claude-<uid>/<project>/<session>/scratchpad`, from the hook
+input's `scratchpad_dir`, or worked out from the session id and the transcript's
+folder). An `rm -r` or a `find … -delete` (without `-H`, `-L` or `-follow`) is
+allowed when every path it may destroy, symlinks resolved, is strictly inside
+it: never the scratchpad itself or all of its contents, never another
+session's. Here an `rm` target may read a name the command set once to a
+literal (`S=…/scratchpad; rm -rf "$S/t5"`; see the constants rule above), but
+not one from the environment, from a branch, or with a `..`. A `find` must be
+written all literal (no `$`, `~` or unquoted glob), with start folders, then
+only `-name`, `-iname`, `-path`, `-ipath`, `-type`, `-mindepth`, `-maxdepth`,
+`-mtime`, `-mmin`, `-size`, `-empty` or `-depth`, and `-delete` last. The same
+link rule applies to every target, the first level too: unlike `/tmp`, the
+scratchpad itself can be moved aside and replaced by a link. Only that literal
+`find` itself is left out of the rule; any other `find` beside a delete keeps
+it from passing.
+
+A delete that reaches the LLM carries evidence about each target it can name
+(a literal path, after `cd` and names set once to a literal; a glob is named by
+what it matches now, up to four entries, else by its folder): the git checkouts
+the delete would take with it and what they hold that exists nowhere else, and
+this session's own earlier Bash commands that name the target, with the
+folder's creation time against the session's start (see the README's "How the
+LLM judges a call"). That evidence only informs the judge: no target is
+allowed by rule because this session made it.
 
 ## Known limits
 

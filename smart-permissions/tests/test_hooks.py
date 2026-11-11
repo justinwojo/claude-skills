@@ -21,6 +21,8 @@ import tempfile
 import shutil
 import atexit
 import time
+import datetime
+import re
 
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
 PRETOOL = os.path.join(SCRIPT_DIR, 'pretool_safety.py')
@@ -1412,12 +1414,22 @@ def test_c1_decision_log():
     check('learner parse-error logged', any('parse' in r.get('reason', '').lower()
                                            for r in recs), True)
 
-    # Input truncated to 500 chars.
+    # An allow's input is truncated to 500 chars.
     cfg, cp = _fresh_cfg()
     longcmd = 'echo ' + ('x' * 2000)
     _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': longcmd}}, cp)
     recs = _decision_records(cfg)
-    check('input truncated to 500', all(len(r.get('input', '')) <= 500 for r in recs), True)
+    check('allow input truncated to 500', all(len(r.get('input', '')) <= 500 for r in recs), True)
+
+    # An ask keeps its input whole, up to 8000 chars.
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy ' + 'y' * 2000}}, cp)
+    recs = [r for r in _decision_records(cfg) if r.get('decision') == 'ask']
+    check('ask input kept whole', bool(recs) and len(recs[-1].get('input', '')) == 2014, True)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'flyctl deploy ' + 'y' * 20000}}, cp)
+    recs = [r for r in _decision_records(cfg) if r.get('decision') == 'ask']
+    check('ask input capped at 8000', bool(recs) and len(recs[-1].get('input', '')) == 8000, True)
 
     # Disabled via config → no log file written.
     cfg, cp = _fresh_cfg({'decision_log': False})
@@ -1426,15 +1438,21 @@ def test_c1_decision_log():
 
 
 def test_c1_log_rotation():
-    print('\n--- C1: decision log 5MB single-generation rotation ---')
+    print('\n--- C1: decision log 20MB single-generation rotation ---')
     cfg, cp = _fresh_cfg()
     logdir = os.path.join(cfg, 'hooks')
     os.makedirs(logdir, exist_ok=True)
     logpath = os.path.join(logdir, 'smart-permissions-decisions.jsonl')
-    # Pre-fill just over 5 MB so the next write rotates.
+    # Just under 20 MB: the next write appends.
     with open(logpath, 'w') as f:
-        f.write('{"old": "line"}\n' * 350000)
-    check('pre-roll log > 5MB', os.path.getsize(logpath) > 5 * 1024 * 1024, True)
+        f.write('{"old": "line"}\n' * 1300000)
+    check('log under 20MB', os.path.getsize(logpath) < 20 * 1024 * 1024, True)
+    _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, cp)
+    check('no rotation under 20MB', os.path.exists(logpath + '.1'), False)
+    # Pre-fill just over 20 MB so the next write rotates.
+    with open(logpath, 'w') as f:
+        f.write('{"old": "line"}\n' * 1350000)
+    check('pre-roll log > 20MB', os.path.getsize(logpath) > 20 * 1024 * 1024, True)
     _run_cfg(PRETOOL, {'tool_name': 'Bash', 'tool_input': {'command': 'ls'}}, cp)
     check('rotated .1 created', os.path.exists(logpath + '.1'), True)
     # Live log now holds only the fresh record(s).
@@ -2503,14 +2521,14 @@ def test_unguarded_delete_steer():
         ('VD0kKGdldGNvbmYgREFSV0lOX1VTRVJfVEVNUF9ESVIpOyBmb3IgayBpbiAkKGNvbW0gLTEzIDwoZWNobyAi'
          'JGEiKSA8KGVjaG8gIiRiIikpOyBkbyBybSAtcmYgIiRULyRrIjsgZG9uZQ==', '"${T:?}/${k:?}"'),
         ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJEQiLyo=', '"${D:?}/"*'),  # the glob stays unquoted
-        ('WD14OyBybSAtcmYgfi9jYWNoZS8kWA==', '~/"cache/${X:?}"'),  # so does the ~
+        ('WD0kKGNhdCBmKTsgcm0gLXJmIH4vY2FjaGUvJFg=', '~/"cache/${X:?}"'),  # so does the ~
         ('WD14OyBybSAtcmYgIi90bXAvYSBiLyRYIi8q', '"/tmp/a b/${X:?}/"*'),  # the space stays quoted
         ('RD0vdG1wL3g7IHJtIC1yZiAiJEQiL3thLGJ9', '"${D:?}/"{a,b}'),  # brace expansion stays unquoted
         ('RD0vdG1wL3g7IHJtIC1yZiAiJEQve2EsYn0i', '"${D:?}/{a,b}"'),
-        ('WD14OyBYWT15OyBybSAtcmYgIi90bXAvJFgvJFhZIg==', '"/tmp/${X:?}/${XY:?}"'),  # $X vs $XY
+        ('WD0kKGNhdCBmKTsgWFk9JChjYXQgZyk7IHJtIC1yZiAiL3RtcC8kWC8kWFki', '"/tmp/${X:?}/${XY:?}"'),  # $X vs $XY
         ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJEQvKiI=', '"${D:?}/*"'),  # a quoted * stays literal
         ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJHtEOi19L2xlYWYi', '"${D:?}/leaf"'),  # ${D:-}
-        ('az14OyBybSAtcmYgL3RtcC8kaw==', '"/tmp/${k:?}"'),
+        ('az0kKGNhdCBmKTsgcm0gLXJmIC90bXAvJGs=', '"/tmp/${k:?}"'),
         ('cm0gLXJmICIkU1BfVEVTVF9VTlNFVF9WQVIvZm9vIg==', '"${SP_TEST_UNSET_VAR:?}/foo"'),
         ('RD0vdG1wL3NwLXg7IHJtIC1yZiAiJHtEOj99LyRrIg==', '"${D:?}/${k:?}"'),
         ('WD0iIjsgcm0gLXJmICIke1g/fS95Ig==', '"${X:?}/y"'),
@@ -5309,6 +5327,732 @@ def test_llm_judge_gaps_routed():
         check(f'openai {name} flag recorded for the learner',
               _cache_key('Bash', {'command': 'frobnicate'}) in _read_json(_flag_file(cfg), {}), True)
 
+
+def _git(*args):
+    subprocess.run(['git', *args], check=True, capture_output=True,
+                   env=dict(os.environ, GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+                            GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t'))
+
+
+def test_friction_batch():
+    print('\n--- Fewer round trips: constants, scratchpad, git -c, PYTHONPATH, branch -D ---')
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
+    import pretool_safety as p
+    rmrf = d('cm0gLXJm')
+    base = os.path.realpath(tempfile.mkdtemp(prefix='sp-friction-', dir='/tmp'))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    real_probe = p._probe
+    p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
+
+    def verdict(cmd):
+        return p.evaluate_bash(cmd, log_unknowns=False)[0]
+
+    def expect(label, cases, want):
+        for cmd in cases:
+            check(f'{label} → {want}: {cmd.replace(base, "B")!r}', verdict(cmd), want)
+
+    # A repository with a bare remote, a linked worktree, another repository
+    remote, repo, other = (os.path.join(base, n) for n in ('remote.git', 'repo', 'other'))
+    _git('init', '-q', '--bare', remote)
+    _git('init', '-q', '-b', 'main', repo)
+    _git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'one')
+    _git('-C', repo, 'remote', 'add', 'origin', remote)
+    _git('-C', repo, 'branch', 'feat')
+    _git('-C', repo, 'push', '-q', 'origin', 'main', 'feat')
+    _git('-C', repo, 'branch', 'wip')
+    _git('-C', repo, 'checkout', '-q', 'wip')
+    _git('-C', repo, 'commit', '-q', '--allow-empty', '-m', 'unpushed')
+    _git('-C', repo, 'checkout', '-q', 'main')
+    wt = os.path.join(base, 'wt', 'eb1')
+    _git('-C', repo, 'worktree', 'add', '-q', '-b', 'eb1', wt)
+    _git('init', '-q', '-b', 'main', other)
+    _git('-C', other, 'commit', '-q', '--allow-empty', '-m', 'x')
+    os.makedirs(os.path.join(wt, 'sub'))
+    wt2 = os.path.join(base, 'wt', 'other')
+    _git('-C', other, 'worktree', 'add', '-q', '-b', 'o1', wt2)
+
+    # Session scratchpads: this session's and another's
+    pad = os.path.join(base, 'claude-0', '-slug', 'sess-a', 'scratchpad')
+    pad_b = os.path.join(base, 'claude-0', '-slug', 'sess-b', 'scratchpad')
+    for d_ in (pad, pad_b, os.path.join(base, 'outside')):
+        os.makedirs(d_)
+    os.symlink(os.path.join(base, 'outside'), os.path.join(pad, 'l'))
+    session = {'cwd': repo, 'scratchpad_dir': pad}
+    p.set_hook_cwd(session)
+    try:
+        # 1. Where the scratchpad is: sent, or derived from the transcript
+        uid = os.getuid()
+        check('scratchpad from the hook input', p.HOOK_SCRATCHPAD, pad)
+        check('scratchpad derived from session and transcript', p._session_scratchpad(
+            {'session_id': 'abc-1', 'transcript_path': '/Users/x/.claude/projects/-Users-x-p/abc-1.jsonl'}),
+            os.path.realpath(f'/tmp/claude-{uid}/-Users-x-p/abc-1/scratchpad'))
+        for label, data in (
+                ('transcript of another session', {'session_id': 'abc-1',
+                                                   'transcript_path': '/u/.claude/projects/s/abc-2.jsonl'}),
+                ('a session id with a slash', {'session_id': '../x',
+                                               'transcript_path': '/u/.claude/projects/s/../x.jsonl'}),
+                ('no session at all', {}),
+                ('a scratchpad outside the temp roots', {'scratchpad_dir': '/Users/x/scratchpad'}),
+                ('a scratchpad reached through a link', {'scratchpad_dir': os.path.join(pad, 'l', 'scratchpad')}),
+                ('not named scratchpad', {'scratchpad_dir': os.path.dirname(pad)})):
+            check(f'no scratchpad: {label}', p._session_scratchpad(data), None)
+
+        # 2 and 6. A name set once to a literal is not empty; this session's
+        # scratchpad is deleted by rule
+        expect('own scratchpad', [
+            f'S={pad}; {rmrf} $S/t5', f'S={pad}; {rmrf} "$S/t5"', f'S={pad} && {rmrf} "$S"/t5',
+            f'S={pad}; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/a/b"',
+            f'find {pad}/t5 -delete', f'cd {pad} && find t5 -delete',
+            f'cd {pad} && {rmrf} t5', f"find {pad}/t5 -name '*.o' -delete"], 'allow')
+        expect('constant, not scratch', [f'S=/opt/sp-x; {rmrf} $S/build', f'k=x; {rmrf} /tmp/$k',
+                                         f'X=x; {rmrf} ~/cache/$X'], 'ask')
+        expect('still steered', [
+            f'if true; then S={pad}; fi; {rmrf} $S/t5', f'S=$(pwd); {rmrf} $S/t5',
+            f'S={pad}; S=$(pwd); {rmrf} $S/t5', f'S={pad}; read S; {rmrf} $S/t5',
+            f'for S in {pad}; do {rmrf} $S/t5; done', f'false || S={pad}; {rmrf} $S/t5',
+            f'S={pad} | cat; {rmrf} $S/t5', f'S={pad}; unset S; {rmrf} $S/t5',
+            f'(S={pad}); {rmrf} $S/t5', f'f() {{ S={pad}; }}; f; {rmrf} $S/t5',
+            f'S={pad}; $E "$Y"; {rmrf} $S/t5', f'{rmrf} $S/t5; S={pad}', f'S=; {rmrf} $S/t5',
+            f'S={pad}; export S; {rmrf} $S/t5', f'S={pad} # c\n{rmrf} $S/t5',
+            f'S={pad}; case x in x) S=;; esac; {rmrf} $S/t5', f'S={pad}; {rmrf} $S/../t5',
+            # shapes Claude Code itself asks about however S was set
+            f'S={pad}; {rmrf} $S/', f'S={pad}; {rmrf} "$S/"', f'S={pad}; {rmrf} $S/*',
+            f'S={pad}; {rmrf} "$S"/*', f'S={pad}; {rmrf} $S/$k', f'X=x; XY=y; {rmrf} "/tmp/$X/$XY"'], 'deny')
+        expect('not this session\'s scratch', [
+            f'S={pad}; {rmrf} "${{S:?}}"', f'S={pad}; {rmrf} "${{S:?}}"/', f'find {pad} -delete',
+            f'find {pad} -name x -delete', f'S={pad_b}; {rmrf} "${{S:?}}/t5"', f'find {pad_b}/t5 -delete',
+            f'S={pad}/..; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/l/x"',
+            f'find {pad}/l/ -delete', f'find -L {pad}/t5 -delete', f'find {pad}/t5 -follow -delete',
+            f'S={pad}; ln -s ~ $S/n; {rmrf} "${{S:?}}/n/x"', f'{rmrf} "${{S:?}}/t5"',
+            f'if true; then S={pad}; fi; {rmrf} "${{S:?}}/t5"', f'S=$(pwd); {rmrf} "${{S:?}}/t5"',
+            f'find {base}/x -delete', f'IFS=/; S={pad}; find $S/t5 -delete',
+            # a filtered find elsewhere still goes to the LLM, not to a deny
+            'find ~/Documents -name x.o -delete', f'cd "$X" && find {pad}/t5 -delete'], 'ask')
+        p.set_hook_cwd({'cwd': repo})
+        expect('no scratchpad known', [f'S={pad}; {rmrf} "${{S:?}}/t5"', f'find {pad}/t5 -delete'], 'ask')
+        p.set_hook_cwd(session)
+
+        # 2. A word built only from such names is judged written out
+        expect('constant words', ['B=main; git push origin $B', f'R={repo}; git -C $R status',
+                                  'M=755; chmod $M x.sh'], 'allow')
+        expect('built words', ['F=hard; git reset --$F', 'if true; then F=soft; fi; git reset --$F',
+                               'F=$(echo soft); git reset --$F', 'F=soft; F=hard; git reset --$F',
+                               'F=soft; git reset --$F$G', 'git reset --$F'], 'ask')
+        check('a written-out reset keeps its own reason', 'reset --hard' in p.evaluate_bash(
+            'F=hard; git reset --$F', log_unknowns=False)[1], True)
+
+        # 3. Only a cd the structure scopes counts, not a ( in some text
+        heredoc = f"cd {repo} && git commit -qF - <<'EOF'\nfix (x)\nEOF\ngit push origin main"
+        for cmd in (f'cd {repo} && git commit -qm "fix (x)" && git push origin main', heredoc,
+                    f'cd {repo}; echo "a)"; git push origin main'):
+            check(f'cd still followed: {cmd.replace(base, "B")!r}', p._git_command_dirs(cmd, base),
+                  ([repo], True))
+        check('a $(git …) before the cd runs where the command starts', p._git_command_dirs(
+            f'X=$(git rev-parse HEAD); cd {repo} && git push origin main', base), ([base, repo], True))
+        for cmd in (f'(cd {other}); git push', f'{{ cd {other}; }} | cat; git push',
+                    f'if x; then cd {other}; fi; git push', f'cd {other} | git push',
+                    f'cd {other} & git push', f'f() {{ cd {other}; }}; git push',
+                    f'for x in 1; do cd {other}; done; git push', f'bash -c "cd {other}"; git push'):
+            check(f'a scoped cd is doubted: {cmd.replace(base, "B")!r}',
+                  p._git_command_dirs(cmd, base)[1], False)
+
+        # 4. git -c settings that switch something off for one run
+        expect('inert -c', ['git -c core.hooksPath=/dev/null commit -qm x',
+                            'git -c CORE.HOOKSPATH=/dev/null commit -qm x',
+                            'git -c credential.helper= fetch origin'], 'allow')
+        expect('-c that runs something', [
+            'git -c core.hooksPath=/some/dir commit -qm x', 'git -c core.hooksPath=/dev/null/x commit -qm x',
+            'git -c credential.helper=x fetch origin', 'git -c credential.helper fetch origin',
+            'git -c credential.helper=" " fetch origin',
+            'git config core.hooksPath /dev/null', 'git config credential.helper ""'], 'ask')
+
+        # 5. A relative import path in the working folder or a linked worktree
+        tail = 'PYTHONPATH=src python3 -m pytest 2>&1 | tail -5'
+        expect('import path in the project', [f'cd {wt} && {tail}', tail, f'grep -q x y; {tail}',
+                                             f'cd {wt}/sub && {tail}'], 'allow')
+        expect('import path elsewhere', [
+            f'cd {base} && {tail}', f'cd {wt2} && {tail}', f'ln -s /x y; {tail}',
+            f'cd {wt} && PYTHONPATH=../src python3 -m pytest | tail -5',
+            'PYTHONPATH=/tmp/x python3 -m pytest | tail -5', f'(cd {base}); {tail}',
+            f'cd {wt} && git status && {tail}', f'cd "$X" && {tail}'], 'ask')
+
+        # 7. A branch whose tip a remote-tracking ref holds loses nothing
+        expect('branch on a remote', ['git branch -D feat', 'git branch -d -f feat',
+                                      'git branch --delete --force feat',
+                                      f'cd {repo} && git branch -D feat', f'git -C {repo} branch -D feat'],
+               'allow')
+        expect('branch with work only here', [
+            'git branch -D wip', 'git branch -D feat wip', 'git branch -D nosuch',
+            'git branch -D -r origin/feat', 'git branch -D $B', 'B=feat; git branch -D $B x',
+            'cd "$X" && git branch -D feat', f'git -C {other} branch -D feat',
+            f'(cd {other}); git branch -D feat', 'git branch -D --contains HEAD feat',
+            'git branch -D feat..wip'], 'ask')
+
+        # Review fixes: a pass on probed state needs the rest of the command
+        # unable to change it, and paths resolved as the shell resolves them.
+        # C1: the scratchpad itself can be swapped for a link
+        swap = f'S={pad}; mv "$S" "$S-old"; ln -s ~ "$S"; '
+        expect('scratchpad swapped for a link', [f'{swap}{rmrf} "${{S:?}}/Documents"',
+                                                 f'{swap}find "$S/Documents" -delete',
+                                                 f'S={pad}; python3 x.py; {rmrf} "${{S:?}}/t5"'], 'ask')
+        # C2: names the shell sets or ties are no constants
+        expect('special names', ['argv=--dry-run; set --; git clean -f $argv',
+                                 'PS1=-n; prompt=-x; git clean -f $PS1'], 'ask')
+        expect('plain name', ['N=-n; git clean -f $N'], 'allow')
+        # C3: nothing beside the deletion may move a branch or drop a remote ref
+        expect('branch moved first', [
+            'git switch feat && git add x && git commit -m r && git switch main && git branch -D feat',
+            'git branch -f feat wip && git branch -D feat', 'git checkout -B feat wip; git branch -D feat',
+            'git fetch && git branch -D feat', 'git branch -dr origin/feat; git branch -D feat',
+            'echo x > .git/refs/heads/feat; git branch -D feat', 'make; git branch -D feat',
+            'git -c core.hooksPath=/x switch main && git branch -D feat'], 'ask')
+        expect('branch beside readers', [
+            'git switch main && git branch -D feat', 'git status && git branch -D feat 2>&1 | tail -1',
+            'git log -1 feat; git branch -D feat; git branch -a'], 'allow')
+        # C4: `cd x/..` drops x before following it, as the shell does
+        os.makedirs(os.path.join(repo, 'sub', 'x'))
+        os.makedirs(os.path.join(repo, 'other'))
+        os.symlink(os.path.join(repo, 'sub'), os.path.join(base, 'lnk'))
+        _git('-C', other, 'branch', 'feat')  # not on any remote
+        cmd = f'cd {base}/lnk/../other && git branch -D feat'
+        check('logical cd: the shell\'s folder is named, nothing certain',
+              p._git_command_dirs(cmd, repo), ([os.path.join(repo, 'other'), other], False))
+        expect('logical cd', [cmd], 'ask')
+        check('cd through a link without ..: certain', p._git_command_dirs(f'cd {base}/lnk/x', repo),
+              ([os.path.join(repo, 'sub', 'x')], True))
+        # C5: a wrapper's relative folder is resolved
+        os.symlink(os.path.join(base, 'outside'), os.path.join(wt, 'linked'))
+        expect('wrapper folder through a link', [f'cd {wt} && PYTHONPATH=src make -C linked test',
+                                                 'PYTHONPATH=src make -C ../wt test'], 'ask')
+        expect('wrapper folder in the project', [f'cd {wt} && PYTHONPATH=src make -C sub test',
+                                                 f'PYTHONPATH=src make -C {wt} test'], 'allow')
+
+        # Review round 2: allow only what is known safe
+        # C2: zsh-tied prompt names (and every other shell-set name) are no constants
+        expect('special names (zsh tied)', ['RPS1=-n; RPROMPT=-x; git clean -f $RPS1',
+                                            'TIMEFMT=-n; git clean -f $TIMEFMT'], 'ask')
+        # C12: a find counts as link-free only when it is the literal delete judged
+        rest = f'{rmrf} {pad}/n/x'
+        expect('find built at run time beside a scratch delete', [
+            f'E=$(printf %s -exec); find {pad}/a "$E" ln -s ~ {pad}/n \\; ; {rest}',
+            f'E=$(printf %s -exec); find /tmp/sp-a "$E" ln -s ~ /tmp/sp-a/n \\; ; {rmrf} /tmp/sp-a/n/x',
+            f'find {pad}/a -name x; {rest}', f'S={pad}; find "$S/t5" -delete',
+            f'find {pad}/t5 -newer x -delete', f'find {pad}/t5 -delete -print'], 'ask')
+        check('zsh =cmd is no literal find word', p._literal_find_delete('find =ls -delete'), False)
+        expect('literal scratch find', [f'find {pad}/t5 -type f -name "*.log" -delete',
+                                        f'find {pad}/t5 -mindepth 1 -delete 2>/dev/null'], 'allow')
+        # C13: the commands beside `git branch -D` are allowlisted word by word
+        expect('branch deletion beside a built or unknown word', [
+            'O=--output=.git/refs/remotes/origin/feat; git log -1 --format=%H main "$O"; git branch -D feat',
+            'git log -1 --outp=.git/refs/remotes/origin/feat main; git branch -D feat',
+            'git log -1 --ou .git/refs/remotes/origin/feat main; git branch -D feat',
+            'GIT_DIR=x git log -1; git branch -D feat', 'env git status; git branch -D feat',
+            'git rev-parse --git-path x; git branch -D feat', 'git -c x=y status; git branch -D feat',
+            'git switch -c x && git branch -D feat'], 'ask')
+        # (3) the protected shapes
+        wt3 = os.path.join(base, 'wt', 'feat')
+        _git('-C', repo, 'worktree', 'add', '-q', wt3, 'feat')
+        expect('branch on a remote beside known readers', [
+            f'git worktree remove {wt3} && git branch -D feat',
+            f'git worktree remove --force {wt3} && git branch -D feat',
+            'git switch main && git branch -D feat', 'git checkout -q main && git branch -D feat',
+            'git log --oneline -3 feat && git branch -D feat 2>&1 | tail -1',
+            f'git -C {repo} status --short && git branch -D feat'], 'allow')
+        # C14/C15: where cd lands is not followed when the words can't say
+        check('zsh cd OLD NEW: not certain', p._git_command_dirs(f'cd {base} wt && git push', repo)[1], False)
+        check('cd under CDPATH: not certain',
+              p._git_command_dirs(f'CDPATH={wt}; cd sub && git push', repo)[1], False)
+        check('zsh cdpath: not certain', p._git_command_dirs(f'cdpath=({wt}); cd sub; git push', repo)[1], False)
+        check('cd +1: not certain', p._git_command_dirs('cd +1 && git push', repo)[1], False)
+        check('cd ./x under CDPATH: certain', p._git_command_dirs(
+            f'CDPATH={base}; cd ./sub && git push', repo), ([repo, os.path.join(repo, 'sub')], True))
+        old_cdpath = os.environ.get('CDPATH')
+        os.environ['CDPATH'] = base
+        try:
+            check('cd under an exported CDPATH: not certain', p._git_command_dirs('cd sub && git push', repo)[1],
+                  False)
+            expect('import path after a cd CDPATH may redirect', [f'cd sub && {tail}'], 'ask')
+        finally:
+            os.environ.pop('CDPATH') if old_cdpath is None else os.environ.__setitem__('CDPATH', old_cdpath)
+        expect('import path after cd OLD NEW', [f'cd {wt} sub && {tail}'], 'ask')
+        # C16: repeated folder options chain, or count as outside
+        expect('repeated folder options', [f'PYTHONPATH=src make -C {wt} -C linked test',
+                                           'PYTHONPATH=src ninja -C sub -C sub',
+                                           f'PYTHONPATH=src uv run --directory {wt} --project sub pytest'], 'ask')
+        expect('repeated make -C inside', [f'PYTHONPATH=src make -C {wt} -C sub test'], 'allow')
+
+        # Review round 3, from a checkout where feat has work only here
+        p.set_hook_cwd({'cwd': other})
+        # G1: a flag zsh reads as cd OLD NEW and bash 3.2 rejects: both stay put
+        expect('cd flag that may not move', [f'cd -e {repo}; git branch -D feat',
+                                             f'pushd -P {repo}; git branch -D feat',
+                                             f'cd -q {repo}; git branch -D feat',
+                                             f'popd {repo}; git branch -D feat'], 'ask')
+        expect('cd -L/-P: both shells move', [f'cd -LP {repo}; git branch -D feat'], 'allow')
+        # C18: a quoted or escaped ~ is a folder named ~, not $HOME
+        os.makedirs(os.path.join(other, '~'))
+        old_home = os.environ['HOME']
+        os.environ['HOME'] = repo
+        try:
+            expect('quoted ~', ["git -C '~' branch -D feat", 'git -C "~" branch -D feat',
+                                'git -C \\~ branch -D feat', "cd '~' && git branch -D feat",
+                                'git -C ~"/" branch -D feat', f'HOME={repo}; git -C ~ branch -D feat'], 'ask')
+            check("quoted ~: not certain", p._git_command_dirs("git -C '~' push", other)[1], False)
+            check('unquoted ~ is $HOME', p._git_command_dirs('cd ~/ && git -C ~ push', other),
+                  ([repo], True))
+        finally:
+            os.environ['HOME'] = old_home
+        # Sweep: a glob or brace in a cd target is expanded first
+        os.makedirs(os.path.join(other, '{x,}'))  # `cd {x,}` is `cd x`
+        check('cd into a brace: not certain', p._git_command_dirs('cd {x,} && git push', other)[1], False)
+        check('git --bare: not certain', p._git_command_dirs('git --bare push', other)[1], False)
+        check("cd into a quoted brace: that folder", p._git_command_dirs("cd '{x,}' && git push", other),
+              ([os.path.join(other, '{x,}')], True))
+        p.set_hook_cwd(session)
+        # Sweep: git reads a unique prefix of a long option as the option
+        expect('git long option abbreviated', ['git reset --har', 'git clean --forc -d',
+                                               'git checkout --forc main', 'git branch --dele --forc wip',
+                                               'git switch --disc main'], 'ask')
+        expect('git long option abbreviated, harmless', ['git clean -f --dry', 'git restore --stag x'],
+               'allow')
+        # C21: an option's value that looks like a prefix stays a value
+        expect('option value never spelled out', ['git restore --pathspec-from-file --stag',
+                                                  'git restore -s --stag f',
+                                                  'git restore --source --stag f',
+                                                  'git restore --pathspec-from-file --staged'], 'ask')
+        expect('restore --staged still index-only', ['git restore --staged f',
+                                                     'git restore --pathspec-from-file=list --staged'],
+               'allow')
+        # ... as GNU rm and chmod read a prefix of --recursive
+        expect('--recursive abbreviated', [d('cm0gLS1yZWMgLWYgL29wdC9zcC14L2J1aWxk'), d('Y2htb2QgLS1yZWMgNzc3IGRpcg==')],
+               'ask')
+    finally:
+        p._probe = real_probe
+        p.set_hook_cwd({})
+
+
+def _iso_ago(minutes):
+    """A transcript timestamp `minutes` ago, as Claude Code writes them."""
+    t = datetime.datetime.fromtimestamp(time.time() - 60 * minutes, datetime.timezone.utc)
+    return t.strftime('%Y-%m-%dT%H:%M:%S.') + f'{t.microsecond // 1000:03d}Z'
+
+
+def _bash_use(tid, cmd, minutes, wire=None):
+    """An assistant record holding one Bash tool_use, in Claude Code's format."""
+    rec = {'type': 'assistant', 'timestamp': _iso_ago(minutes), 'sessionId': 'sess-1',
+           'isSidechain': False, 'cwd': '/x',
+           'message': {'role': 'assistant', 'model': 'm', 'content': [
+               {'type': 'tool_use', 'id': tid, 'name': 'Bash',
+                'input': {'command': cmd, 'description': 'd'}}]}}
+    if wire:
+        rec['wireToolInputs'] = {tid: {'command': wire, 'description': 'd'}}
+    return rec
+
+
+def _bash_result(tid, minutes, error=False, text='(output)'):
+    return {'type': 'user', 'timestamp': _iso_ago(minutes), 'sessionId': 'sess-1',
+            'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': tid, 'content': text, 'is_error': error}]},
+            'toolUseResult': {'stdout': text, 'stderr': '', 'interrupted': False}}
+
+
+def test_session_provenance_and_loss_evidence():
+    print('\n--- Deletes and resets: session provenance and loss evidence for the judge ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety as p
+    rmrf = d('cm0gLXJm')
+    # The system temp folder: deletes there reach the judge (/tmp ones don't).
+    base = os.path.realpath(tempfile.mkdtemp(prefix='sp-prov-'))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    arms, plain, remote = (os.path.join(base, n) for n in ('wdf-arms', 'plain', 'remote.git'))
+    ours, brain = os.path.join(arms, 'ours'), os.path.join(arms, 'brain')
+    cwd = os.path.join(base, 'proj')
+    os.makedirs(cwd)
+    os.makedirs(plain)
+    _git('init', '-q', '--bare', remote)
+    _git('init', '-q', '-b', 'main', ours)
+    with open(os.path.join(ours, 'a.txt'), 'w') as f:
+        f.write('v1\n')
+    _git('-C', ours, 'add', 'a.txt')
+    _git('-C', ours, 'commit', '-q', '-m', 'one')
+    _git('-C', ours, 'remote', 'add', 'origin', remote)
+    _git('-C', ours, 'push', '-q', 'origin', 'main')
+    _git('-C', ours, 'checkout', '-q', '-b', 'exp')
+    _git('-C', ours, 'commit', '-q', '--allow-empty', '-m', 'unpushed work')
+    _git('-C', ours, 'checkout', '-q', 'main')
+    for text in ('v2\n', 'v3\n'):
+        with open(os.path.join(ours, 'a.txt'), 'w') as f:
+            f.write(text)
+        if text == 'v2\n':
+            _git('-C', ours, 'stash', '-q')
+    os.makedirs(os.path.join(ours, 'sub'))
+    for path in (os.path.join(ours, 'new.txt'), os.path.join(ours, 'sub', 'x.txt'),
+                 os.path.join(plain, 'f.txt')):
+        with open(path, 'w') as f:
+            f.write('x\n')
+    _git('init', '-q', '-b', 'work', brain)
+    _git('-C', brain, 'commit', '-q', '--allow-empty', '-m', 'b')
+    with open(os.path.join(brain, 'out.txt'), 'w') as f:
+        f.write('x\n')
+
+    # ---- which deletes and resets are named ----
+    def targets(cmd, here=cwd):
+        return [(k, path, label, br) for k, path, label, br in p.destructive_targets(cmd, here)]
+
+    t = targets(f'git -C {ours} reset --hard')
+    check('discard: git -C folder', [(k, path) for k, path, _, _ in t], [('discard', ours)])
+    check('rm -rf: absolute path', [path for _, path, _, _ in targets(f'{rmrf} {plain}')], [plain])
+    check('rm -rf: after cd', [path for _, path, _, _ in targets(f'cd {arms} && {rmrf} brain')], [brain])
+    check('rm -rf: literal assignment written out',
+          [path for _, path, _, _ in targets(f'D={plain}; {rmrf} "$D"')], [plain])
+    check('rm -rf: unknown variable names nothing', targets(f'{rmrf} "$X"'), [])
+    check('rm -rf: / and ~ never targets', targets(f'{rmrf} / ~'), [])
+    check('rm glob: names what it matches now',
+          sorted(path for _, path, _, _ in targets(f'rm -r {arms}/*')), [brain, ours])
+    check('rm glob matching nothing: its folder',
+          [path for _, path, _, _ in targets(f'rm {arms}/zz-*')], [arms])
+    check('rm glob: label keeps the pattern',
+          [label for _, _, label, _ in targets(f'{rmrf} {brain}/*.txt')], [rmrf + ' *.txt'])
+    check('plain rm of a file: not a target', targets(f'rm {plain}/f.txt'), [])
+    check('branch -D: names and folder', targets(f'git -C {ours} branch -D exp'),
+          [('branch', ours, 'git branch -D exp', ('exp',))])
+    check('branch -d without force: not a target', targets(f'git -C {ours} branch -d exp'), [])
+    t = targets(f'git -C {ours} worktree remove --force ../wt')
+    check('worktree remove --force: path, label without it',
+          [(k, path, label) for k, path, label, _ in t],
+          [('worktree', os.path.join(arms, 'wt'), 'git worktree remove --force')])
+    check('read-only command: no targets', targets(f'ls -la {plain} && git -C {ours} status'), [])
+
+    # ---- a session transcript in Claude Code's format, with a subagent ----
+    proj = os.path.join(base, 'claude-projects', '-slug')
+    sess = os.path.join(proj, 'sess-1.jsonl')
+    agent = os.path.join(proj, 'sess-1', 'subagents', 'agent-a1.jsonl')
+    os.makedirs(os.path.dirname(agent))
+    current = f'git -C {ours} checkout -- . && {rmrf} {brain} {plain} {base}/never-made'
+    _transcript(sess, [
+        {'type': 'last-prompt', 'lastPrompt': 'x', 'sessionId': 'sess-1'},
+        {'type': 'user', 'isMeta': True, 'timestamp': _iso_ago(120), 'sessionId': 'sess-1',
+         'message': {'role': 'user', 'content': 'start'}},
+        _human(f'look at {plain} later'),  # the developer's words are not provenance
+        _bash_use('t1', f'mkdir -p {arms} && git init -q -b main {ours}', 100),
+        _bash_result('t1', 100),
+        # The stored command lost its cd; the wire form the model sent keeps it.
+        _bash_use('t2', 'git -C brain status --short', 90,
+                  wire=f'cd {arms} && git -C brain status --short'),
+        _bash_result('t2', 90),
+        _bash_use('t3', f'A={brain}; ls $A/src', 80),
+        _bash_result('t3', 80, error=True),
+        _bash_use('t4', f'ls {base}', 70),  # a folder too broad to say anything
+        _bash_result('t4', 70),
+        _bash_use('t5', 'echo hi', 65),
+        _bash_result('t5', 65, text=f'wrote {plain}/f.txt'),  # output prose: not counted
+        {'type': 'assistant', 'timestamp': _iso_ago(64), 'message': {'role': 'assistant', 'content': [
+            {'type': 'text', 'text': f'I will clean {plain}.'},
+            {'type': 'tool_use', 'id': 't6', 'name': 'Read', 'input': {'file_path': f'{plain}/f.txt'}}]}},
+        _bash_use('toolu_now', current, 0),  # the call under review, no result yet
+    ])
+    _transcript(agent, [_bash_use('a1', f'touch {plain}/made-by-agent', 60), _bash_result('a1', 60)])
+    os.utime(plain, (time.time() - 3 * 86400,) * 2)  # moves the birth time back too (APFS)
+    payload = {'cwd': cwd, 'transcript_path': sess, 'tool_use_id': 'toolu_now',
+               'tool_name': 'Bash', 'tool_input': {'command': current}}
+
+    def provenance(data=payload, cmd=current, deadline=5.0):
+        blocks, status = p.session_provenance(data, p.destructive_targets(cmd, data.get('cwd')),
+                                              data.get('cwd'), time.monotonic() + deadline)
+        return '\n'.join(blocks), status
+
+    text, status = provenance()
+    # Each target's line with its matches below it, by path.
+    lines = {block.split(' (', 1)[0]: block for block in text.split('\n/')[1:]}
+    lines = {'/' + k: v for k, v in lines.items()}
+    check('provenance: found', status, 'found')
+    check('provenance: labelled evidence, not authorization',
+          'evidence, not authorization' in text and "not the developer's approval" in text, True)
+    check('provenance: session start given', "This session's transcript starts" in text, True)
+    check('provenance: git init names it, the cd into its folder names its folder',
+          '2 earlier commands' in lines.get(ours, '') and 'ok, names it: mkdir' in lines.get(ours, '')
+          and 'ok, names its folder wdf-arms: cd ' in lines.get(ours, ''), True)
+    check('provenance: wire input (cd + relative word) and a literal assignment name it',
+          'ok, names it: cd ' in lines.get(brain, '') and 'error, names it: A=' in lines.get(brain, '')
+          and '3 earlier commands' in lines.get(brain, '') and '(1 ended in an error)' in lines.get(brain, ''), True)
+    check('provenance: a path inside it counts',
+          'ok, names a path inside it: touch ' in lines.get(plain, ''), True)
+    check('provenance: subagent command counted; prose, messages, Read, broad folder not',
+          '1 earlier command of this session names it' in lines.get(plain, ''), True)
+    births = hasattr(os.stat(base), 'st_birthtime')  # not on Linux
+    if births:
+        check('provenance: created after the session started',
+              'after the session started' in lines.get(brain, ''), True)
+    if births and sys.platform == 'darwin':
+        check('provenance: created before the session started',
+              'days before the session started' in lines.get(plain, ''), True)
+    check('provenance: missing path said so',
+          'does not exist now. No earlier command' in lines.get(f'{base}/never-made', ''), True)
+    check('provenance: the call under review is not its own evidence',
+          'toolu_now' not in text and text.count(rmrf) == 3, True)  # the three labels only
+    same, _ = provenance(dict(payload, tool_use_id=None))
+    check('provenance: without a tool_use_id the pending identical call is skipped', same, text)
+    check('provenance: whole transcripts read, no cut note', 'Only the newest part' in text, False)
+    old = p.PROVENANCE_TAIL_BYTES
+    p.PROVENANCE_TAIL_BYTES = 900
+    try:
+        cut, _ = provenance()
+    finally:
+        p.PROVENANCE_TAIL_BYTES = old
+    check('provenance: tail cut is said', 'Only the newest part' in cut, True)
+    late, _ = provenance(deadline=-1)
+    check('provenance: out of time → cut note, no matches',
+          'Only the newest part' in late and ' ok, ' not in late and 'earlier commands' not in late, True)
+    check('provenance: no transcript → unavailable, no block',
+          provenance(dict(payload, transcript_path=os.path.join(base, 'nope.jsonl'))), ('', 'unavailable'))
+    check('provenance: transcript not a string → unavailable',
+          provenance(dict(payload, transcript_path=None))[1], 'unavailable')
+    here, status = provenance(dict(payload, cwd=ours), cmd='git checkout -- .')
+    check('provenance: the working directory itself is never vouched for',
+          'is the working directory or holds it' in here and status == 'none', True)
+    none_text, status = provenance(cmd=f'{rmrf} {cwd}/build')
+    check('provenance: nothing names it → none', status, 'none')
+    # The pending call is skipped by its wire form too (the stored one lost its cd)
+    sess2 = os.path.join(proj, 'sess-2.jsonl')
+    wire = f'cd {arms} && {rmrf} brain'
+    _transcript(sess2, [_bash_use('w1', f'{rmrf} brain', 0, wire=wire)])
+    pend = dict(payload, transcript_path=sess2, tool_use_id=None, tool_input={'command': wire})
+    check('provenance: pending call matched by its wire form is skipped',
+          'No earlier command of this session names it' in provenance(pend, cmd=wire)[0], True)
+    _transcript(sess2, [_bash_use('w1', f'{rmrf} brain', 5, wire=wire), _bash_result('w1', 5)])
+    check('provenance: the same command with a result counts',
+          '1 earlier command of this session names it' in provenance(pend, cmd=wire)[0], True)
+    # G3: a result line that can't be read is no "ok"
+    _transcript(sess2, [_bash_use('w1', f'ls {brain}', 5)])
+    with open(sess2, 'a') as f:
+        f.write(json.dumps(_bash_result('w1', 5))[:-30] + '\n')
+    unread = provenance(dict(payload, transcript_path=sess2, tool_use_id=None))[0]
+    check('provenance: an unreadable result is unknown, not ok',
+          'result unknown, names it: ls' in unread and ' ok, ' not in unread, True)
+
+    # A cd that may not move what follows names no relative target; rm's own
+    # `..` goes through the link before it
+    check('rm -rf after a subshell cd: no target', targets(f'(cd {arms}); {rmrf} brain'), [])
+    check('rm -rf after a grouped cd: no target', targets(f'{{ cd {arms}; }} | cat; {rmrf} brain'), [])
+    os.symlink(os.path.join(ours, 'sub'), os.path.join(base, 'lnk'))
+    check('rm -rf x/..: physical', [path for _, path, _, _ in targets(f'{rmrf} {base}/lnk/../new.txt')],
+          [os.path.join(ours, 'new.txt')])
+    # C17: where the logical and physical folder differ, only -P says which
+    check('cd x/.. where logical and physical differ: no target',
+          targets(f'cd {base}/lnk/.. && {rmrf} plain'), [])
+    check('cd -P x/..: the physical folder',
+          [path for _, path, _, _ in targets(f'cd -P {base}/lnk/.. && {rmrf} plain')],
+          [os.path.join(ours, 'plain')])
+    check('cd x/.. with no link: logical', [path for _, path, _, _ in targets(
+        f'cd {arms}/brain/.. && {rmrf} ours')], [ours])
+    check('zsh cd OLD NEW: no target', targets(f'cd {base} wdf-arms && {rmrf} ours'), [])
+    check('cd under CDPATH: no target', targets(f'CDPATH={base}; cd wdf-arms && {rmrf} ours'), [])
+    check('cd into a glob: no target', targets(f'cd {base}/wdf-* && {rmrf} ours'), [])
+    # G2: a flag zsh reads as cd OLD NEW and bash 3.2 rejects names nothing
+    check('cd -e: no target', targets(f'cd -e {arms} && {rmrf} brain'), [])
+    # C20: bash honours the last of -L/-P, zsh's -P wins: -P -L names nothing
+    for flags in ('-P -L', '-PL'):
+        check(f'cd {flags} x/..: the shells differ, no target',
+              targets(f'cd {flags} {base}/lnk/.. && {rmrf} plain'), [])
+    check('cd -LP x/..: the physical folder', [path for _, path, _, _ in targets(
+        f'cd -LP {base}/lnk/.. && {rmrf} plain')], [os.path.join(ours, 'plain')])
+    # The delete rule too: bash's `cd -PL` lands on the logical side, here
+    # the system temp folder, not the /tmp the link leads to
+    tmp_side = os.path.realpath(tempfile.mkdtemp(prefix='sp-pl-', dir='/tmp'))
+    atexit.register(shutil.rmtree, tmp_side, ignore_errors=True)
+    os.makedirs(os.path.join(tmp_side, 'a'))
+    os.symlink(os.path.join(tmp_side, 'a'), os.path.join(base, 'tmplnk'))
+    p.set_hook_cwd({'cwd': cwd})
+    try:
+        check('bash cd -PL is logical: delete asks', p.evaluate_bash(
+            f'cd -PL {base}/tmplnk/.. && {rmrf} build', log_unknowns=False)[0], 'ask')
+        check('cd -LP is physical in both: delete in /tmp passes', p.evaluate_bash(
+            f'cd -LP {base}/tmplnk/.. && {rmrf} build', log_unknowns=False)[0], 'allow')
+    finally:
+        p.set_hook_cwd({})
+    # C18: a quoted ~ is a folder named ~, in targets and in earlier commands
+    check("quoted ~: no target", targets(f"{rmrf} '~/x' \"~\"/y \\~/z"), [])
+    check("quoted ~ in a name's value: no target", targets(f"D='~/x'; {rmrf} \"$D\""), [])
+    check('quoted ~: an earlier command names no home path',
+          p._named_paths(f"ls '~/x' \"~\"/y; cd '~/z' && ls w", {'x', 'y', 'w'}), set())
+
+    # ---- what a delete or branch deletion would lose ----
+    deadline = time.monotonic() + 8
+    loss = '\n'.join(p.loss_context(p.destructive_targets(
+        f'{rmrf} {arms} {os.path.join(ours, "sub")} {plain}', cwd), set(), deadline))
+    check('loss: repos inside the folder listed', f'Git repositories inside {arms}' in loss
+          and '- ours:' in loss and '- brain:' in loss, True)
+    check('loss: dirty, untracked and stash shown',
+          ' M a.txt' in loss and '?? new.txt' in loss and 'Stashes: 1.' in loss, True)
+    check('loss: unpushed commit counted with its subject',
+          'no remote-tracking ref holds: 1 (newest:' in loss and 'unpushed work' in loss, True)
+    check('loss: remote named', f'Remotes: origin {remote}' in loss, True)
+    check('loss: folder inside a repo gets that repo\'s status of it',
+          f'is inside the git repository {ours}' in loss and '?? sub/' in loss, True)
+    check('loss: plain folder said to hold no repo', f'No git repository inside {plain}' in loss, True)
+    branch = '\n'.join(p._branch_loss(ours, ('exp', 'main', 'nosuch'), 'git branch -D', deadline))
+    check('loss: branch with one commit of its own, unmerged',
+          'Branch exp' in branch and 'holds (no other branch or remote-tracking ref): 1. Not merged' in branch, True)
+    check('loss: checked-out branch said so',
+          'Branch main' in branch and 'It is the checked-out branch now' in branch, True)
+    check('loss: missing branch left out', 'nosuch' in branch, False)
+    # A detached HEAD's own commits, and a bare repository
+    det = os.path.join(base, 'det')
+    _git('init', '-q', '-b', 'main', det)
+    _git('-C', det, 'commit', '-q', '--allow-empty', '-m', 'one')
+    _git('-C', det, 'checkout', '-q', '--detach')
+    _git('-C', det, 'commit', '-q', '--allow-empty', '-m', 'detached work')
+    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {det} {remote}', cwd), set(),
+                                    time.monotonic() + 8))
+    check('loss: detached HEAD commits counted',
+          'HEAD is detached, with 1 commit no branch or remote-tracking ref holds' in loss, True)
+    check('loss: bare repository found', f'Git repositories inside {remote}' in loss
+          and 'A bare repository' in loss and 'holds: 1' in loss, True)
+
+    # ---- end to end: both hooks send the same evidence; the log records it ----
+    call = dict(_bash_call(f'git -C {ours} branch -D exp && {rmrf} {brain}'), cwd=cwd,
+                transcript_path=sess, tool_use_id='toolu_later')
+    sent = {}
+    for script, hook in ((PRETOOL, 'pretool'), (LEARNER, 'permission_request')):
+        cfg, cp = _fresh_cfg()
+        reqs = os.path.join(cfg, 'reqs.jsonl')
+        check(f'{hook}: judge allow → allow', _run_cfg(script, call, cp, llm={'safe': True},
+                                                       requests_log=reqs), 'allow')
+        req = _requests(reqs)
+        sent[hook] = req[0]['messages'][1]['content'] if req else ''
+        rec = [r for r in _decision_records(cfg) if r.get('hook') == hook][-1:]
+        check(f'{hook}: log says provenance was found', rec[0].get('provenance') if rec else None, 'found')
+    user = sent['pretool']
+    check('prompt: loss and provenance evidence present',
+          'Branch exp in' in user and f'Git repositories inside {brain}' in user
+          and 'Session provenance of the paths' in user, True)
+    check('prompt: evidence before the tool call',
+          0 <= user.find('Session provenance') < user.find('Tool: Bash'), True)
+    check('both hooks see the same evidence',
+          sent['pretool'].split('Tool: Bash')[0] == sent['permission_request'].split('Tool: Bash')[0], True)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, dict(_bash_call('flyctl deploy'), cwd=cwd, transcript_path=sess), cp, llm={'safe': True})
+    rec = [r for r in _decision_records(cfg) if r.get('hook') == 'pretool'][-1:]
+    check('log: no provenance field on a call that deletes nothing', 'provenance' in (rec[0] if rec else {}), False)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, dict(call, transcript_path=os.path.join(base, 'gone.jsonl')), cp, llm={'safe': True})
+    rec = [r for r in _decision_records(cfg) if r.get('hook') == 'pretool'][-1:]
+    check('log: unreadable transcript → unavailable', rec[0].get('provenance') if rec else None, 'unavailable')
+
+    # ---- provenance never allows by rule: the session made these, yet they ask ----
+    for cmd in (f'{rmrf} {arms}', f'cd {brain} && git checkout -q -- . && git clean -fdxq',
+                f'git -C {ours} branch -D exp', f'git -C {ours} reset -q --hard origin/main'):
+        cfg, cp = _fresh_cfg()
+        check(f'no LLM: session-made target still asks: {cmd.replace(base, "B")[:60]!r}',
+              _run_cfg(PRETOOL, dict(_bash_call(cmd), cwd=cwd, transcript_path=sess), cp), 'ask')
+    # The six hand approvals and the credential find from the friction report,
+    # as the eval cases hold them: every one reaches the judge.
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm_eval_cases.json')) as f:
+        cases = [c for c in json.load(f)['cases'] if 'sandbox' in c]
+    check('eval cases with session provenance present', len(cases) >= 10, True)
+    try:
+        for c in cases:
+            root = c['sandbox']['root']
+            cmd = json.loads(base64.b64decode(c['input_b64']))['command'].replace('{root}', root)
+            p.set_hook_cwd({'cwd': c['cwd'].replace('{root}', root)})
+            check(f'{c["id"]}: rules leave it to the judge', p.evaluate_bash(cmd, log_unknowns=False)[0], 'ask')
+    finally:
+        p.set_hook_cwd({})
+
+
+def test_dir_options_leave_the_project():
+    print('\n--- A relative import path under an option that moves the program elsewhere ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety as p
+    proj = os.path.realpath(tempfile.mkdtemp(prefix='sp-dirs-'))
+    atexit.register(shutil.rmtree, proj, ignore_errors=True)
+    os.makedirs(os.path.join(proj, 'sub'))
+    p.set_hook_cwd({'cwd': proj})
+    try:
+        def verdict(cmd):
+            return p.evaluate_bash(cmd, log_unknowns=False)[0]
+
+        moved = ['PYTHONPATH=src make -C /tmp/x test', 'PYTHONPATH=src make -C/tmp/x test',
+                 'PYTHONPATH=src make --directory=/tmp/x test', 'PYTHONPATH=src npm --prefix /tmp/x test',
+                 'PYTHONPATH=src go -C ../other test ./...', 'PYTHONPATH=src poetry -C /tmp/x run pytest',
+                 'PYTHONPATH=src cargo test --manifest-path /tmp/x/Cargo.toml',
+                 'PYTHONPATH=src uv run --directory /tmp/x pytest', 'PYTHONPATH=src make -C "$D" test',
+                 'PYTHONPATH=src git -C /tmp/x status', 'PYTHONPATH=src pnpm -C ~/elsewhere test',
+                 'PYTHONPATH=. yarn --cwd=/tmp/x test', 'PYTHONPATH=src mvn -f /tmp/x/pom.xml test']
+        for cmd in moved:
+            check(f'moved elsewhere → ask: {cmd!r}', verdict(cmd), 'ask')
+        # C22: a file-valued option built at run time is read before its folder is taken
+        for cmd in ['M=/tmp/x/Cargo.toml; PYTHONPATH=src cargo test --manifest-path "$M"',
+                    'PYTHONPATH=src mvn -f "$POM" test']:
+            check(f'file option built at run time → ask: {cmd!r}', verdict(cmd), 'ask')
+        stays = ['PYTHONPATH=src make -C sub test', f'PYTHONPATH=src make -C {proj}/sub test',
+                 f'PYTHONPATH=src uv run --directory {proj} pytest', 'PYTHONPATH=src python3 -m pytest',
+                 'PYTHONPATH=$PYTHONPATH make -C /tmp/x test']
+        for cmd in stays:
+            check(f'stays in the project → allow: {cmd!r}', verdict(cmd), 'allow')
+        # C19: the folder option as each program's parser reads it: a short
+        # cluster, a long-option prefix, go's -C=x and --C; and any option of
+        # a program whose parser isn't modelled
+        spelled = ['PYTHONPATH=src make -sC /tmp/x test', 'PYTHONPATH=src make -sC/tmp/x test',
+                   'PYTHONPATH=src make --dir=/tmp/x test', 'PYTHONPATH=src make --direc /tmp/x test',
+                   'PYTHONPATH=src go -C=/tmp/x test', 'PYTHONPATH=src go --C /tmp/x test',
+                   'PYTHONPATH=src uv run --proj /tmp/x pytest', 'PYTHONPATH=src just -nd /tmp/x t',
+                   'PYTHONPATH=src npm --pre /tmp/x test', 'PYTHONPATH=src gradle --offline test',
+                   'PYTHONPATH=src env -S "-C /tmp/x python3" t.py', 'PYTHONPATH=src make --d /tmp/x test']
+        for cmd in spelled:
+            check(f'folder option spelled another way → ask: {cmd!r}', verdict(cmd), 'ask')
+        for cmd in ('PYTHONPATH=src make -sC sub test', 'PYTHONPATH=src make --dir=sub test',
+                    'PYTHONPATH=src make -s test'):
+            check(f'spelled another way, in the project → allow: {cmd!r}', verdict(cmd), 'allow')
+        reason = p.evaluate_bash('PYTHONPATH=src make -C /tmp/x test', log_unknowns=False)[1]
+        check('reason names the option', 'run elsewhere by -C /tmp/x' in reason, True)
+        check('no import path: a dir option alone is not this check\'s business',
+              p._env_hazard('make -C /tmp/x test'), None)
+    finally:
+        p.set_hook_cwd({})
+
+
+
+def test_special_names_from_shells():
+    print('\n--- Names the shells set or tie are never constants ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety as p
+
+    def special(name):
+        return name in p._SPECIAL_NAMES or bool(p._SPECIAL_NAME_RE.fullmatch(name))
+
+    for name in ('RPS1', 'RPROMPT', 'PROMPT2', 'RPROMPT2', 'SPROMPT', 'TIMEFMT', 'argv', 'PS1',
+                 'prompt', 'CDPATH', 'cdpath', 'BASH_REMATCH', 'COMP_WORDS', 'ZSH_SUBSHELL',
+                 'EPOCHSECONDS', 'SRANDOM', 'READLINE_LINE', 'PIPESTATUS', 'IFS', 'HOME'):
+        check(f'{name} is special', special(name), True)
+    for name in ('N', 'S', 'OUT', 'build_dir'):
+        check(f'{name} is plain', special(name), False)
+    # Every name the installed shells call special or tied is in the list
+    # (the list was generated this way; see its comment).
+    zsh = shutil.which('zsh')
+    if zsh:
+        script = ('for m in ${module_path}/zsh/**/*.so(N); do n=${m#${module_path}/}; n=${n%.so}; '
+                  '[[ $n == zsh/example ]] || zmodload $n 2>/dev/null; done; zmodload -a 2>/dev/null; '
+                  'for k in ${(k)parameters}; do [[ ${parameters[$k]} == *(special|tied)* ]] && print -r -- $k; '
+                  'done; for k in RPS1 RPS2 RPROMPT RPROMPT2 SPROMPT POSTEDIT; do '
+                  't=$( { eval "$k=x"; print -r -- ${parameters[$k]} } 2>/dev/null ); '
+                  '[[ $t == *special* ]] && print -r -- $k; done')
+        out = subprocess.run([zsh, '-f', '-o', 'extendedglob', '-c', script], capture_output=True,
+                             text=True, timeout=30).stdout.split()
+        missing = sorted(n for n in out if re.fullmatch(r'[A-Za-z_]\w*', n) and not special(n))
+        check(f'every zsh special name listed ({len(out)} seen)', missing, [])
+    else:
+        print('  SKIP  zsh not installed: zsh special names not compared')
+    bash = shutil.which('bash')
+    if bash:
+        out = subprocess.run(['env', '-i', bash, '--norc', '--noprofile', '-c', 'compgen -v'],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        missing = sorted(n for n in out if not special(n))
+        check(f'every bash variable listed ({len(out)} seen)', missing, [])
+    else:
+        print('  SKIP  bash not installed: bash variables not compared')
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -5430,6 +6174,10 @@ if __name__ == '__main__':
     test_final_review_fixes()
     test_interpreter_stdin_code()
     test_llm_judge_gaps_routed()
+    test_friction_batch()
+    test_session_provenance_and_loss_evidence()
+    test_dir_options_leave_the_project()
+    test_special_names_from_shells()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

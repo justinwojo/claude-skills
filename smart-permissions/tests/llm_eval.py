@@ -37,6 +37,7 @@ import json
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 import threading
@@ -56,6 +57,10 @@ def _expand(path):
     return os.path.expanduser(path) if isinstance(path, str) else path
 
 
+def _decode(value):
+    return json.loads(base64.b64decode(value).decode())
+
+
 def load_cases(path=CASES_PATH):
     with open(path) as f:
         doc = json.load(f)
@@ -64,7 +69,7 @@ def load_cases(path=CASES_PATH):
     for c in doc["cases"]:
         c = dict(c)
         if "input_b64" in c:
-            c["input"] = json.loads(base64.b64decode(c.pop("input_b64")).decode())
+            c["input"] = _decode(c.pop("input_b64"))
         inp = dict(c["input"])
         for key in ("file_path", "notebook_path"):
             if key in inp:
@@ -72,6 +77,19 @@ def load_cases(path=CASES_PATH):
         c["input"] = inp
         c["cwd"] = _expand(c.get("cwd", default_cwd))
         c.setdefault("messages", [])
+        box = c.get("sandbox")
+        if box:
+            # `{root}` stands for the sandbox's display root: the paths the
+            # rules and the judge see are the realistic ones.
+            box = dict(box)
+            if "commands_b64" in box:
+                box["commands"] = _decode(box.pop("commands_b64"))
+            c["sandbox"] = box
+            root = box["root"]
+            c["input"] = {k: v.replace("{root}", root) if isinstance(v, str) else v
+                          for k, v in c["input"].items()}
+            c["cwd"] = c["cwd"].replace("{root}", root)
+            c["messages"] = [m.replace("{root}", root) for m in c["messages"]]
         cases.append(c)
     return cases
 
@@ -128,8 +146,94 @@ def rule_verdict(p, case):
     return decision, reason, decision == "ask"
 
 
+def _iso(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(seconds))
+
+
+def build_sandbox_context(p, case, tmpdir):
+    """build_llm_context() on a real replica of the case's folders, with a
+    session transcript holding its earlier Bash commands.
+
+    `sandbox` holds: root (the display path `{root}` stands for), setup
+    (shell lines run in a temp folder standing in for root, with git dates
+    `commit_min_ago` minutes back), born_min_ago ({path: minutes}, the
+    creation times to give folders), session_start_min_ago, and commands
+    ([{min_ago, command, error}], or commands_b64). The evidence is built
+    from the replica by the hook's own code, then written back with the
+    display root, so the judge sees the case's realistic paths."""
+    box = case["sandbox"]
+    display = box["root"]
+    base = os.path.realpath(tempfile.mkdtemp(prefix=f"{case['id']}-", dir=tmpdir))
+    real = os.path.join(base, os.path.basename(display.rstrip("/")) or "root")
+    os.makedirs(real)
+    now = time.time()
+    when = now - 60 * box.get("commit_min_ago", 60)
+    env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
+               GIT_AUTHOR_NAME="agent", GIT_AUTHOR_EMAIL="agent@local",
+               GIT_COMMITTER_NAME="agent", GIT_COMMITTER_EMAIL="agent@local",
+               GIT_AUTHOR_DATE=f"{int(when)} +0000", GIT_COMMITTER_DATE=f"{int(when)} +0000")
+    for line in box.get("setup", []):
+        r = subprocess.run(["/bin/sh", "-c", line.replace("{root}", real)], cwd=real, env=env,
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise SystemExit(f"{case['id']}: setup failed: {line}\n{r.stderr}")
+    for path, minutes in box.get("born_min_ago", {}).items():
+        t = now - 60 * minutes
+        os.utime(path.replace("{root}", real), (t, t))  # moves the birth time back too (APFS)
+
+    def to_real(text):
+        return text.replace(display, real)
+
+    session = f"eval-{case['id'].lower()}"
+    records = [{"type": "user", "isMeta": True, "timestamp": _iso(now - 60 * box["session_start_min_ago"]),
+                "sessionId": session, "message": {"role": "user", "content": "session start"}}]
+    for n, entry in enumerate(box.get("commands", [])):
+        t = now - 60 * entry["min_ago"]
+        tid = f"toolu_eval{n:03d}"
+        records.append({"type": "assistant", "timestamp": _iso(t), "sessionId": session,
+                        "cwd": to_real(case["cwd"]), "message": {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": tid, "name": "Bash",
+                             "input": {"command": entry["command"].replace("{root}", real)}}]}})
+        records.append({"type": "user", "timestamp": _iso(t + 2), "sessionId": session,
+                        "message": {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": tid, "content": "(output)",
+                             "is_error": bool(entry.get("error"))}]}})
+    for text in case["messages"]:
+        records.append({"type": "user", "origin": {"kind": "human"}, "timestamp": _iso(now - 120),
+                        "message": {"role": "user", "content": text}})
+    tool_input = {k: to_real(v) if isinstance(v, str) else v for k, v in case["input"].items()}
+    # The call under review is in the transcript, with no result yet.
+    records.append({"type": "assistant", "timestamp": _iso(now), "sessionId": session,
+                    "message": {"role": "assistant", "content": [
+                        {"type": "tool_use", "id": "toolu_evalnow", "name": case["tool"], "input": tool_input}]}})
+    transcript = os.path.join(base, f"{session}.jsonl")
+    with open(transcript, "w") as f:
+        f.writelines(json.dumps(r) + "\n" for r in records)
+    p.set_hook_cwd({"cwd": to_real(case["cwd"])})
+    # Hermetic: the runner's own gh login is no part of the case.
+    real_probe = p._probe
+    p._probe = lambda argv, *a, **k: None if argv[0] == "gh" else real_probe(argv, *a, **k)
+    try:
+        context = p.build_llm_context({"cwd": to_real(case["cwd"]), "transcript_path": transcript,
+                                       "session_id": session, "tool_name": case["tool"],
+                                       "tool_input": tool_input})
+    finally:
+        p._probe = real_probe
+    case["provenance"] = p.LLM_CONTEXT_PROVENANCE
+    p.set_hook_cwd({"cwd": case["cwd"]})
+    context = context.replace(real, display)
+    # A snippet cut mid-path leaves a piece of the temp path at its ellipsis.
+    for k in range(len(real) - 1, 7, -1):
+        context = context.replace("…" + real[-k:], "…" + display[-k:]).replace(real[:k] + "…", display[:k] + "…")
+    context = context.replace(base, os.path.dirname(display))
+    before = case.get("context_before")
+    return f"{before}\n{context}" if before else context
+
+
 def build_context(p, case, tmpdir):
     """build_llm_context() on a synthetic transcript holding the case's messages."""
+    if case.get("sandbox"):
+        return build_sandbox_context(p, case, tmpdir)
     transcript = os.path.join(tmpdir, f"{case['id']}.jsonl")
     with open(transcript, "w") as f:
         for text in case["messages"]:
@@ -293,6 +397,8 @@ def main():
     ap.add_argument("--out", help="directory for raw results JSONL + summary JSON")
     ap.add_argument("--rules", action="store_true", help="print rule verdicts only (no API)")
     ap.add_argument("--show", action="store_true", help="print decoded cases (no API)")
+    ap.add_argument("--context", action="store_true",
+                    help="print the context each case's judge sees (no API)")
     args = ap.parse_args()
 
     p = import_hook()
@@ -306,6 +412,11 @@ def main():
         c["rule_decision"], c["rule_reason"], c["reaches_llm"] = rule_verdict(p, c)
         c["context"] = build_context(p, c, tmpdir)
 
+    if args.context:
+        for c in cases:
+            print(f"===== {c['id']} [{c['expect']}] {c['title']} (provenance: {c.get('provenance')})\n"
+                  f"{c['context']}\n--- rules: {c['rule_decision']}: {c['rule_reason']}\n")
+        return 0
     if args.show or args.rules:
         for c in cases:
             print(f"{c['id']} [{c['expect']}{'/cat' + str(c['category']) if c.get('category') else ''}] "
