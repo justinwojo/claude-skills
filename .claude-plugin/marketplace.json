@@ -6,18 +6,9 @@
   },
   "metadata": {
     "description": "Personal collection of Claude skills",
-    "version": "1.3.0"
+    "version": "1.4.0"
   },
   "plugins": [
-    {
-      "name": "ai-pair-programming",
-      "description": "Query external LLMs (OpenAI/ChatGPT, Google Gemini, xAI Grok) for code review, improvement suggestions, and collaborative problem-solving",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./ai-pair-programming"
-      ]
-    },
     {
       "name": "swift-binding-assistant",
       "description": "Guide users through creating .NET C# bindings for Swift iOS libraries, from SPM package or xcframework to validated NuGet package",
@@ -61,15 +52,6 @@
           }
         ]
       }
-    },
-    {
-      "name": "session-orchestrator",
-      "description": "Orchestrate multi-session design doc execution using agent teams, spawning one worker per session sequentially with fresh context and optional AI pair review",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./session-orchestrator"
-      ]
     }
   ]
 }
