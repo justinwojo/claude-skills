@@ -5406,10 +5406,12 @@ def test_friction_batch():
             f'cd {pad} && {rmrf} t5', f"find {pad}/t5 -name '*.o' -delete"], 'allow')
         expect('constant, not scratch', [f'S=/opt/sp-x; {rmrf} $S/build', f'k=x; {rmrf} /tmp/$k',
                                          f'X=x; {rmrf} ~/cache/$X'], 'ask')
+        # a loop name over literal words is never empty inside its body (1.5.0)
+        expect('loop name, not steered', [f'for S in {pad}; do {rmrf} $S/t5; done'], 'ask')
         expect('still steered', [
             f'if true; then S={pad}; fi; {rmrf} $S/t5', f'S=$(pwd); {rmrf} $S/t5',
             f'S={pad}; S=$(pwd); {rmrf} $S/t5', f'S={pad}; read S; {rmrf} $S/t5',
-            f'for S in {pad}; do {rmrf} $S/t5; done', f'false || S={pad}; {rmrf} $S/t5',
+            f'false || S={pad}; {rmrf} $S/t5',
             f'S={pad} | cat; {rmrf} $S/t5', f'S={pad}; unset S; {rmrf} $S/t5',
             f'(S={pad}); {rmrf} $S/t5', f'f() {{ S={pad}; }}; f; {rmrf} $S/t5',
             f'S={pad}; $E "$Y"; {rmrf} $S/t5', f'{rmrf} $S/t5; S={pad}', f'S=; {rmrf} $S/t5',
@@ -6053,6 +6055,411 @@ def test_special_names_from_shells():
         print('  SKIP  bash not installed: bash variables not compared')
 
 
+
+def test_phase1_evidence_and_rule_fixes():
+    print('\n--- 1.5.0: judge key file, clones, brief, scripts, stashes, /tmp, MCP notes, rule fixes ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety as p
+    rmrf = d('cm0gLXJm')
+    base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p15-'))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+
+    # ---- 1. the judge's settings from a 0600 env file beside the config ----
+    keyfile = os.path.join(base, 'judge.env')
+    with open(keyfile, 'w') as f:
+        f.write('# judge\nexport SAFETY_HOOK_MODEL="mock-model"\nSAFETY_HOOK_API_KEY=k-123  # note\n'
+                "SAFETY_HOOK_API_URL='https://mock.invalid/v1'\nOTHER=ignored\n")
+    os.chmod(keyfile, 0o600)
+    values, note = p._load_llm_env_file(keyfile)
+    check('key file: 0600 file read', (values, note), (
+        {'SAFETY_HOOK_MODEL': 'mock-model', 'SAFETY_HOOK_API_KEY': 'k-123',
+         'SAFETY_HOOK_API_URL': 'https://mock.invalid/v1'}, ''))
+    os.chmod(keyfile, 0o644)
+    values, note = p._load_llm_env_file(keyfile)
+    check('key file: group/world-readable refused', (values, 'chmod 600' in note), ({}, True))
+    os.chmod(keyfile, 0o600)
+    link = os.path.join(base, 'judge-link.env')
+    os.symlink(keyfile, link)
+    check('key file: a link is not followed', p._load_llm_env_file(link)[0], {})
+    check('key file: missing file is no note', p._load_llm_env_file(os.path.join(base, 'none.env')), ({}, ''))
+    cfg, cp = _fresh_cfg()
+    shutil.copy(keyfile, os.path.join(cfg, 'smart-permissions-llm.env'))
+    os.chmod(os.path.join(cfg, 'smart-permissions-llm.env'), 0o600)
+    env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
+    probe = ('import sys; sys.path.insert(0, %r); import pretool_safety as p; '
+             'print(p.llm_is_configured(), p.LLM_MODEL, p.LLM_API_URL)' % SCRIPT_DIR)
+    out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
+                         env=dict(env, SMART_PERMISSIONS_CONFIG=cp)).stdout.split()
+    check('key file: a hook with no env is configured from it', out, ['True', 'mock-model', 'https://mock.invalid/v1'])
+    out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
+                         env=dict(env, SMART_PERMISSIONS_CONFIG=cp, SAFETY_HOOK_MODEL='env-model')).stdout.split()
+    check('key file: the environment wins per key', out[:2], ['True', 'env-model'])
+    home_key = os.path.join(os.path.dirname(p.USER_CONFIG_PATH), 'smart-permissions-llm.env')
+    check('key file: writing it is never allowed',
+          p.evaluate('Write', {'file_path': home_key, 'content': 'x'})[0] in ('ask', 'deny'), True)
+    check('key file: reading it asks', p.evaluate_bash(f'cat {home_key}', log_unknowns=False)[0] != 'allow', True)
+
+    # ---- 2. clones with no remote-tracking refs: observations, said literally ----
+    src = os.path.join(base, 'src')
+    _git('init', '-q', '-b', 'main', src)
+    for n in range(3):
+        _git('-C', src, 'commit', '-q', '--allow-empty', '-m', f'c{n}')
+    clones = os.path.join(base, 'clones')
+    bare, mirror = os.path.join(clones, 'a.git'), os.path.join(clones, 'm.git')
+    _git('clone', '-q', '--bare', src, bare)
+    _git('clone', '-q', '--mirror', src, mirror)
+    later = time.monotonic() + 8
+    loss = p._repo_loss(bare, later, bare=True)
+    check('clone: commits counted without claiming they are unique',
+          'Commits on local branches: 3. There are no remote-tracking refs' in loss
+          and 'no remote-tracking ref holds' not in loss, True)
+    check('clone: packed-refs only, nothing newer', 'Local branches: 1; 0 loose refs' in loss
+          and 'no loose ref or reflog is newer than packed-refs' in loss, True)
+    check('clone: never says recoverable', 'recoverable' in loss.lower(), False)
+    check('clone: mirror setting named', 'set up as a mirror' in p._repo_loss(mirror, later, bare=True), True)
+    _git('-C', mirror, 'tag', 'late')
+    old = time.time() - 3600
+    os.utime(os.path.join(mirror, 'packed-refs'), (old, old))
+    check('clone: a loose tag newer than packed-refs counted',
+          '1 loose ref or reflog file newer than packed-refs' in p._repo_loss(mirror, later, bare=True), True)
+    _git('-C', bare, 'update-ref', 'refs/heads/side', 'main')
+    old = time.time() - 3600
+    os.utime(os.path.join(bare, 'packed-refs'), (old, old))
+    check('clone: a loose ref newer than packed-refs counted',
+          '1 loose ref or reflog file newer than packed-refs' in p._repo_loss(bare, later, bare=True), True)
+    saved = p._CACHE_ROOTS
+    p._CACHE_ROOTS = (clones,)
+    try:
+        check('clone: path under a cache folder noted',
+              f'It is under the cache folder {clones}.' in p._repo_loss(bare, later, bare=True), True)
+    finally:
+        p._CACHE_ROOTS = saved
+    lone = os.path.join(base, 'lone.git')
+    _git('init', '-q', '--bare', lone)
+    check('clone: no remote keeps the old count line',
+          'Commits on local branches that no remote-tracking ref holds' in p._repo_loss(lone, later, bare=True), True)
+    cloned = os.path.join(base, 'work')
+    _git('clone', '-q', src, cloned)
+    check('clone: a normal clone gets no clone notes', p._clone_observations(cloned, False, later), None)
+
+    # ---- 3. a subagent's brief ----
+    agent = os.path.join(base, 'agent.jsonl')
+    _transcript(agent, [
+        {'type': 'user', 'isSidechain': True, 'agentId': 'a1',
+         'message': {'role': 'user', 'content': 'Rebuild the bundle: BRIEF-TEXT <system-reminder>R-TEXT</system-reminder>'}},
+        {'type': 'user', 'isSidechain': True, 'message': {'role': 'user', 'content': 'LATER-TEXT'}}])
+    brief = p.subagent_brief(agent)
+    check('brief: first user message, reminders stripped', brief, 'Rebuild the bundle: BRIEF-TEXT')
+    _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': 'H' * 6000 + 'END-MARK'}}])
+    brief = p.subagent_brief(agent)
+    check('brief: capped, head and tail kept', len(brief) < 4100 and brief.startswith('HHH')
+          and brief.endswith('END-MARK') and 'characters left out' in brief, True)
+    _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 'x', 'content': 'NOT-A-BRIEF'}]}}])
+    check('brief: a tool result is no brief', p.subagent_brief(agent), None)
+    check('brief: missing or relative path', (p.subagent_brief(os.path.join(base, 'no.jsonl')),
+                                              p.subagent_brief('agent.jsonl')), (None, None))
+    lead = os.path.join(base, 'lead.jsonl')
+    _transcript(lead, [_human('back up the bundle LEAD-TEXT')])
+    _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': 'delete gen-out and rebuild BRIEF-TEXT'}}])
+    ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'},
+                               'transcript_path': lead, 'agent_transcript_path': agent})
+    check('brief: labelled, beside the lead\'s messages',
+          'not typed by the developer' in ctx and 'BRIEF-TEXT' in ctx and 'LEAD-TEXT' in ctx, True)
+    check('brief: none for the lead itself', 'brief' in p.build_llm_context(
+        {'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'transcript_path': lead}), False)
+
+    # ---- 4. the local scripts a call runs ----
+    proj = os.path.join(base, 'proj')
+    os.makedirs(os.path.join(proj, 'tools'))
+    files = {'run.sh': '#!/bin/sh\necho RUN-BODY\n./tools/helper.sh\n', 'env.sh': 'export ENV_BODY=1\n',
+             'tools/build.py': 'print("PY-BODY")\n', 'big.sh': '#!/bin/sh\n' + 'echo x\n' * 3000}
+    for name, text in files.items():
+        with open(os.path.join(proj, name), 'w') as f:
+            f.write(text)
+    with open(os.path.join(proj, 'blob.sh'), 'wb') as f:
+        f.write(b'\x00\x01binary')
+
+    def shown(cmd, cwd=proj):
+        return p.script_context(cmd, cwd)
+    check('scripts: bash file shown', 'RUN-BODY' in shown('bash run.sh'), True)
+    check('scripts: helper it names is flagged unseen', 'names other local scripts not shown here: ./tools/helper.sh' in shown('bash run.sh'), True)
+    check('scripts: sourced file shown', 'ENV_BODY' in shown('. ./env.sh && make'), True)
+    check('scripts: stdin file shown', 'RUN-BODY' in shown('ssh host sh < run.sh'), True)
+    check('scripts: piped by cat shown', 'RUN-BODY' in shown('cat run.sh | ssh host sh'), True)
+    check('scripts: python file after cd shown', 'PY-BODY' in shown(f'cd {proj}/tools && python3 -u build.py', base), True)
+    check('scripts: variable spelled out', 'RUN-BODY' in shown(f'D={proj}; bash $D/run.sh', base), True)
+    check('scripts: inline code is not a file', shown('python3 -c "print(1)" data.txt'), '')
+    check('scripts: named inside python -c', 'RUN-BODY' in shown(
+        "python3 -c \"import base64;print(base64.b64encode(open('run.sh','rb').read()))\" | ssh host"), True)
+    big = shown('bash big.sh')
+    check('scripts: truncation stated', 'TRUNCATED: only the first 8192 bytes' in big and len(big) < 9000, True)
+    check('scripts: binary not shown', 'a binary file, not shown' in shown('bash blob.sh'), True)
+    check('scripts: missing file stated', 'does not exist now' in shown('bash gone.sh'), True)
+    check('scripts: system tools are not scripts', shown('/usr/bin/env ls'), '')
+    check('scripts: at most three files', shown('bash run.sh; . ./env.sh; python3 tools/build.py; bash big.sh').count('--- end of'), 3)
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    call = {'tool_name': 'Bash', 'tool_input': {'command': 'ssh host sh < run.sh'}, 'cwd': proj}
+    _run_cfg(PRETOOL, call, cp, llm={'safe': True, 'reason': 'ok'}, requests_log=reqs)
+    sent = _requests(reqs)
+    check('scripts: the judge sees the contents', bool(sent) and 'RUN-BODY' in sent[0]['messages'][1]['content'], True)
+    check('scripts: never in the decision log', any('RUN-BODY' in json.dumps(r) for r in _decision_records(cfg)), False)
+
+    # ---- 5. git stash drop / clear / pop ----
+    repo = os.path.join(base, 'stashy')
+    _git('init', '-q', '-b', 'main', repo)
+    with open(os.path.join(repo, 'a.txt'), 'w') as f:
+        f.write('1\n')
+    _git('-C', repo, 'add', 'a.txt')
+    _git('-C', repo, 'commit', '-q', '-m', 'one')
+    with open(os.path.join(repo, 'a.txt'), 'w') as f:
+        f.write('2\n')
+    _git('-C', repo, 'stash', 'push', '-q', '-m', 'try-alt-parser')
+    sess = os.path.join(base, 'sess.jsonl')
+    made = dict(_bash_use('toolu_s1', f'cd {repo} && git stash push -m try-alt-parser', 5), cwd=base)
+    _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60)), made, _bash_result('toolu_s1', 5)])
+    stash = '\n'.join(p.stash_context('git stash drop stash@{0}', repo,
+                                      {'transcript_path': sess}, time.monotonic() + 8))
+    check('stash: listed with its message', 'stash@{0}' in stash and 'try-alt-parser' in stash, True)
+    check('stash: made after the session started', '(after this session started)' in stash, True)
+    check('stash: this session made one there',
+          "ran a stash-making `git stash` there 1 time(s); the latest" in stash and '(ok)' in stash, True)
+    nested = os.path.join(repo, 'vendor', 'lib')
+    _git('init', '-q', nested)
+    _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60)),
+                       dict(_bash_use('toolu_e', f'cd {repo} && echo git stash push', 9), cwd=base),
+                       dict(_bash_use('toolu_m', f'cd {repo} && git commit -m stash', 8), cwd=base),
+                       dict(_bash_use('toolu_n', f'cd {nested} && git stash', 7), cwd=base),
+                       dict(_bash_use('toolu_f', f'cd {repo} && git stash', 6), cwd=base),
+                       _bash_result('toolu_f', 6, error=True)])
+    stash = '\n'.join(p.stash_context(f'git -C {repo} stash --quiet drop', base, {'transcript_path': sess},
+                                      time.monotonic() + 8))
+    check('stash: only real stash calls in that repo, failures said',
+          '1 time(s), 1 of them failed' in stash and '(failed)' in stash, True)
+    _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60))])
+    stash = '\n'.join(p.stash_context(f'git -C {repo} stash clear', base, {'transcript_path': sess},
+                                      time.monotonic() + 8))
+    check('stash: none made by this session said so', 'show no Bash call that ran a stash-making' in stash, True)
+    check('stash: list and show are not discards', p.stash_context('git stash list', repo, {}, time.monotonic() + 8), [])
+
+    # ---- 6. a private folder under /tmp, and a clone rooted there ----
+    tmpdir = os.path.realpath(tempfile.mkdtemp(prefix='sp-p15-', dir='/tmp'))
+    atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
+    tmpname = os.path.basename(tmpdir)
+    reason = p.evaluate_bash(f'PYTHONPATH=/tmp/{tmpname}/old/src python3 -m pytest -q', log_unknowns=False)
+    check('tmp: private folder said not world-writable', reason[0] == 'ask' and 'not world-writable' in reason[1], True)
+    check('tmp: context names the owner and mode', 'mode 700 (private' in p.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
+    os.chmod(tmpdir, 0o777)
+    check('tmp: a world-writable folder gets no such note',
+          'not world-writable' in p.evaluate_bash(f'PYTHONPATH=/tmp/{tmpname}/src python3 x.py', log_unknowns=False)[1], False)
+    check('tmp: world-writable said so', 'world-writable)' in p.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
+    os.chmod(tmpdir, 0o700)
+    check('tmp: mixed entries get no note', 'not world-writable' in p.evaluate_bash(
+        f'PYTHONPATH=/tmp/{tmpname}/src:/opt/x python3 x.py', log_unknowns=False)[1], False)
+    tclone = os.path.join(tmpdir, 'repo')
+    _git('clone', '-q', src, tclone)
+    os.makedirs(os.path.join(tclone, 'docs', 'evidence'))
+    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {tclone}/docs/evidence', tmpdir),
+                                    set(), time.monotonic() + 8))
+    check('tmp: a target in a clone rooted under /tmp names its remotes',
+          "The repository's root is under /tmp; its remotes: origin" in loss, True)
+    with open(os.path.join(tclone, 'docs', 'evidence', 'run.json'), 'w') as f:
+        f.write('{}\n')
+    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {tclone}/docs/evidence/*', tmpdir),
+                                    set(), time.monotonic() + 8))
+    check('tmp: a file a glob names gets git\'s view too', 'run.json' in loss and '?? docs/evidence/run.json' in loss, True)
+
+    # ---- 7. mcp_context notes ----
+    cfg, cp = _fresh_cfg({'mcp_context': {'mcp__bench__*': 'BENCH-NOTE: the bench account is the developer\'s own.',
+                                          'mcp__other__*': 'OTHER-NOTE'}})
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    _run_cfg(PRETOOL, {'tool_name': 'mcp__bench__run', 'tool_input': {'command': 'dir'}, 'cwd': base},
+             cp, llm={'safe': True}, requests_log=reqs)
+    sent = _requests(reqs)
+    user = sent[0]['messages'][1]['content'] if sent else ''
+    check('mcp: matching note given', 'BENCH-NOTE' in user and 'OTHER-NOTE' not in user, True)
+    cfg, cp = _fresh_cfg({'mcp_context': ['not', 'a', 'dict']})
+    probe = 'import sys; sys.path.insert(0, %r); import pretool_safety as p; print(p.MCP_CONTEXT)' % SCRIPT_DIR
+    check('mcp: wrong type ignored', subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
+                                                    env=dict(os.environ, SMART_PERMISSIONS_CONFIG=cp)).stdout.strip(), '{}')
+    with open(os.path.join(SCRIPT_DIR, '..', 'config', 'defaults.json')) as f:
+        check('mcp: no shipped mcp_context values', json.load(f).get('mcp_context', {}), {})
+
+    # ---- 8. rule false positives ----
+    def verdict(cmd):
+        return p.evaluate_bash(cmd, log_unknowns=False)
+
+    for cmd in ['for v in a b; do ' + rmrf + ' "/tmp/q/$v"; done',
+                'for x in /tmp/q/x*; do for v in a b; do [ -d "${x:?}/$v" ] && ' + rmrf + ' "${x:?}/$v"; done; done',
+                'E=~/Dev/x; F=$E/v9/fit; mkdir -p $F; ' + rmrf + ' $F/code/__pycache__',
+                'P=/tmp/q/w; cat > $P/x.sh <<EOF\nif true; then echo "$P"; fi\nEOF\nchmod +x $P/x.sh; ' + rmrf + ' $P/bench-v6',
+                'cd /tmp/q && git commit -q -m "fix: a\n\nbody; (x)"; git log -1\nB=~/corpus/b2; ' + rmrf + ' $B/build',
+                'set -e; S=/tmp/q/pad; ' + rmrf + ' $S/venv; python3 -m venv $S/venv; P=$S/venv/bin; $P/pip --version',
+                'cd /tmp/q && export K="$(echo k)"; S=/tmp/q/pad; ' + rmrf + ' $S/smoke']:
+        v = verdict(cmd)
+        check(f'steer: no rewrite demanded: {cmd[:50]!r}', v[0] == 'deny' and 'Rewrite' in v[1], False)
+    for cmd in ['cd /tmp/x && S=/tmp/q; ' + rmrf + ' $S/y', 'S=/tmp/q; S=; ' + rmrf + ' $S/y',
+                'if true; then S=/tmp/q; fi; ' + rmrf + ' $S/y', 'S=/tmp/q | cat; ' + rmrf + ' $S/y',
+                'S=/tmp/q; read S; ' + rmrf + ' $S/y', 'S=/tmp/q; eval "$X"; ' + rmrf + ' $S/y',
+                'S=/tmp/q; $CMD x; ' + rmrf + ' $S/y', 'S=/tmp/q; unset S; ' + rmrf + ' $S/y',
+                'S=/tmp/q; : ${S:=}; ' + rmrf + ' $S/y', 'for v in "$X" a; do ' + rmrf + ' "/tmp/q/$v"; done',
+                'for v in a b; do v=; ' + rmrf + ' "/tmp/q/$v"; done', '(S=/tmp/q); ' + rmrf + ' $S/y',
+                'S=/tmp/q &\n' + rmrf + ' $S/y', 'IFS=/; S=/tmp/q; ' + rmrf + ' $S/y',
+                'S=/tmp/q; f() { S=; }; f; ' + rmrf + ' $S/y']:
+        check(f'steer: still demanded: {cmd[:50]!r}', p.unguarded_delete_check(cmd) is not None, True)
+    check('protected: nested loop over a loop value is no protected-folder deny',
+          verdict('for x in /tmp/q/x*; do for a in "$x"/*/; do ' + rmrf + ' "$a"; done; done')[0], 'ask')
+    check('protected: an empty loop word still denied',
+          verdict('for x in "" a; do ' + rmrf + ' ~/"$x"; done')[0], 'deny')
+    check('wrapper: sandbox-exec judges its command',
+          verdict('sandbox-exec -f /tmp/prof.sb ls -la')[0], 'allow')
+    check('wrapper: sandbox-exec inner delete denied',
+          verdict('sandbox-exec -p "(version 1)" ' + rmrf + ' ~')[0], 'deny')
+    check('wrapper: script judges its command', verdict('script -q /dev/null ls -la')[0], 'allow')
+    check('wrapper: script -c inner delete denied', verdict("script -q -c '" + rmrf + " ~' /dev/null")[0], 'deny')
+    check('wrapper: script FILE is a write (C9)',
+          p.human_required_reason('Bash', {'command': 'script -q ~/.claude/settings.json ls'}) is not None, True)
+    check('wrapper: unknown script option is risky', verdict('script -Z out ls')[0], 'ask')
+
+    # ---- review fixes ----
+    check('wrapper: script -c code is read as shell code',
+          verdict("script -q -c 'printf ok; " + rmrf + " ~' /dev/null")[0], 'deny')
+    check('wrapper: script -c code writing a config path asks the human',
+          p.human_required_reason('Bash', {'command': "script -q -c 'printf x > "
+                                           + os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+                                           + "' /dev/null"}) is not None, True)
+    check('protected: two loop names stay possibly empty (zsh `for X Y in a b c`)',
+          verdict('for X Y in a b c; do ' + rmrf + ' ~/"$Y"; done')[0], 'deny')
+    check('steer: a continued line can clear the name',
+          p.unguarded_delete_check('S=/tmp/q/lit\nS\\\n=; ' + rmrf + ' "/tmp/q/$S"') is not None, True)
+    check('steer: ANSI-C quoting is no literal text',
+          p.unguarded_delete_check("S=$'\\0'; " + rmrf + ' "/tmp/q/$S"') is not None, True)
+    fifo = os.path.join(base, 'fifo.env')
+    os.mkfifo(fifo, 0o600)
+    t0 = time.monotonic()
+    check('key file: a FIFO is refused without blocking',
+          p._load_llm_env_file(fifo)[0] == {} and time.monotonic() - t0 < 2, True)
+    check('brief: a FIFO or a NUL in the path is no brief',
+          (p.subagent_brief(fifo), p.subagent_brief(base + '/a\0b')), (None, None))
+    _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 7}]}}])
+    check('brief: a malformed text block is no brief', p.subagent_brief(agent), None)
+    with open(os.path.join(proj, '.env'), 'w') as f:
+        f.write('#!/bin/sh\nexport TOKEN=SECRET-BODY\n')
+    check('scripts: a sensitive file is never shown', 'SECRET-BODY' in shown('ssh host sh < .env') + shown('bash .env'), False)
+    check('scripts: a stdin file must look like a script', shown('ssh host cat < data.txt'), '')
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, call, cp, llm=[{'safe': False, 'category': 1, 'reason': 'it runs `echo RUN-BODY` remotely'}])
+    recs = _decision_records(cfg)
+    check('scripts: a judge quoting the script is kept out of the log',
+          bool(recs) and not any('RUN-BODY' in json.dumps(r) for r in recs)
+          and any('its words are not logged' in r.get('reason', '') for r in recs), True)
+    cfg, cp = _fresh_cfg()
+    _run_cfg(PRETOOL, call, cp, llm=[{'safe': False, 'category': 1, 'reason': 'echoes RUN-BODY bare'}])
+    check('scripts: an unquoted echo of script text stays out of the log',
+          any('RUN-BODY' in json.dumps(r) for r in _decision_records(cfg)), False)
+    p.SCRIPT_CONTEXT_TEXTS[:] = ['#!/bin/sh\necho RUN-BODY\n']
+    try:
+        check('scripts: the reason shown is scrubbed of quoted script text',
+              p.scrub_script_text('it runs `echo RUN-BODY` remotely'), 'it runs `[script text]` remotely')
+    finally:
+        p.SCRIPT_CONTEXT_TEXTS.clear()
+    os.makedirs(os.path.join(base, 'fake-home', '.ssh'))
+    with open(os.path.join(base, 'fake-home', '.ssh', 'id_x'), 'w') as f:
+        f.write('#!/bin/sh\nKEY-BODY\n')
+    os.symlink(os.path.join(base, 'fake-home', '.ssh', 'id_x'), os.path.join(proj, 'boot.sh'))
+    check('scripts: a link to a sensitive file is never shown', 'KEY-BODY' in shown('ssh host sh < boot.sh'), False)
+    check('tmp: `..` out of the private folder gets no note', 'not world-writable' in p.evaluate_bash(
+        f'PYTHONPATH=/tmp/{tmpname}/../shared python3 x.py', log_unknowns=False)[1], False)
+
+    # ---- review round 2 ----
+    check('protected: a loop over "$@"b may still be empty', verdict(
+        'for S in "$@"b; do ' + rmrf + ' ~/"$S"; done')[0], 'deny')
+    check('steer: a blank value splits away where $S is unquoted',
+          p.unguarded_delete_check("S=' a'; " + rmrf + ' /tmp/q/$S') is not None, True)
+    check('steer: an assignment with a redirection may not happen',
+          p.unguarded_delete_check('S=foo>/no/dir/out; ' + rmrf + ' "/tmp/q/$S"') is not None, True)
+    settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+    check('wrapper: script log options are writes',
+          [p.human_required_reason('Bash', {'command': c}) is not None for c in (
+              f"script -c 'printf x' --log-out={settings}", f"script -c 'printf x' -O{settings}",
+              f"script -O {settings} -c 'printf x'", f"script -qc 'printf x' -t{settings}")],
+          [True] * 4)
+    check('wrapper: script FILE then -c (util-linux order) is read as code',
+          verdict("script out.log -c '" + rmrf + " ~'")[0], 'deny')
+    check('wrapper: BSD script FILE cmd still runs cmd',
+          p._resolve_through_wrappers("script -q out.log python3 -c 'print(1)'"), "python3 -c 'print(1)'")
+    check('wrapper: a sensitive sandbox profile is no allow',
+          p.evaluate_bash(f'sandbox-exec -f {p.LLM_ENV_FILE} ls', log_unknowns=False)[0], 'ask')
+    _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60)),
+                       dict(_bash_use('toolu_o', f'git -C {src} stash', 5), cwd=repo),
+                       {'type': 'user', 'message': {'role': 'user', 'content': [
+                           {'type': 'tool_result', 'tool_use_id': ['x'], 'content': 'x'}]}}])
+    stash = '\n'.join(p.stash_context(f'git -C {repo} stash drop', base, {'transcript_path': sess},
+                                      time.monotonic() + 8))
+    check('stash: a call in another repo is not credited, a malformed result is skipped',
+          'stash@{0}' in stash and 'show no Bash call that ran a stash-making' in stash, True)
+
+    # ---- review round 3 ----
+    check('steer: a brace alternative may make an empty word',
+          p.unguarded_delete_check('for S in {,abc}; do ' + rmrf + ' "/tmp/q/$S"; done') is not None, True)
+    check('wrapper: util-linux bare -t takes no value',
+          p.human_required_reason('Bash', {'command': f"script -t -c 'printf x' {settings}"}) is not None, True)
+    check('wrapper: BSD -t SECONDS still takes its value (and counts as a possible file)',
+          (p._script_args(['script', '-t', '5', 'out', 'ls'])['files'],
+           p._resolve_through_wrappers('script -t 5 out ls')), (['5', 'out'], 'ls'))
+    check('wrapper: script FILE -- CMD runs CMD', verdict('script out.log -- ' + rmrf + ' ~')[0], 'deny')
+    check('stash: credited where the stash ran, not where the call ended',
+          (p._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(src)),
+           p._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(repo))),
+          (False, True))
+    check('stash: a malformed Bash id is skipped, not fatal', list(p._bash_inputs(
+        {'type': 'assistant', 'wireToolInputs': {'a': {}}, 'message': {'content': [
+            {'type': 'tool_use', 'name': 'Bash', 'id': ['x'], 'input': {'command': 'ls'}}]}})), [(['x'], ['ls'])])
+    # ---- review round 4 ----
+    check('wrapper: util-linux joins the words after FILE -- into shell code',
+          verdict("script out.log -- printf ok '; " + rmrf + " ~'")[0], 'deny')
+    check('wrapper: an abbreviated script log option is a write',
+          p.human_required_reason('Bash', {'command': f"script -c 'printf x' --log-ou={settings}"}) is not None, True)
+    check('wrapper: an ambiguous abbreviation is a doubt', p._script_args(['script', '--log=x', '-c', 'ls'])['unknown'],
+          '--log=x')
+    check('wrapper: a number after bare -t may be the output file',
+          p._script_args(['script', '-t', '123', '-c', 'ls'])['files'], ['123'])
+    check('steer: a brace holding an expansion may still make an empty word',
+          p.unguarded_delete_check('for S in {${X},abc}; do ' + rmrf + ' "/tmp/q/$S"; done') is not None, True)
+    check('stash: an earlier git -C elsewhere leaves the stash uncredited',
+          p._stash_made_in(f'git -C {src} status; git stash push', repo, os.path.realpath(src)), False)
+    probes = []
+    real_evidence = p._evidence_path
+    p._evidence_path = lambda *a: probes.append(a) or real_evidence(*a)
+    try:
+        p.script_files(f'cd {proj}; bash run.sh; cat a.sh', base, time.monotonic() - 1)
+    finally:
+        p._evidence_path = real_evidence
+    check('scripts: nothing is probed past the deadline', probes, [])
+    # ---- review round 5 ----
+    check('wrapper: a script FILE or option built at run time is a doubt',
+          [p.evaluate_bash(c, log_unknowns=False)[0] for c in (
+              'script -q "$OUT" printf fixture', 'script -q "$@" printf fixture', 'script -q -O "$L" -c ls')],
+          ['ask'] * 3)
+    check('wrapper: an attached numeric -t may be the output file',
+          p._script_args(['script', '-t123', '-c', 'ls'])['files'], ['123'])
+    check('stash: git stash inside quoted text is no stash call',
+          p._stash_made_in("printf 'note; git stash push; end'", repo, os.path.realpath(repo)), False)
+    saved_flag = p.LLM_FLAG_PATH
+    p.LLM_FLAG_PATH = os.path.join(base, 'flags.json')
+    p.SCRIPT_CONTEXT_TEXTS[:] = ['echo RUN-BODY\n']
+    try:
+        p._flag_put('Bash', {'command': 'x'}, 'LLM: category 2: runs RUN-BODY, category 4242')
+        with open(p.LLM_FLAG_PATH) as f:
+            stored = f.read()
+        check('scripts: the flag state the learner logs holds no judge words',
+              'RUN-BODY' not in stored and '4242' not in stored and 'category 2' in stored, True)
+    finally:
+        p.SCRIPT_CONTEXT_TEXTS.clear()
+        p.LLM_FLAG_PATH = saved_flag
+
+
 if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
@@ -6178,6 +6585,7 @@ if __name__ == '__main__':
     test_session_provenance_and_loss_evidence()
     test_dir_options_leave_the_project()
     test_special_names_from_shells()
+    test_phase1_evidence_and_rule_fixes()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

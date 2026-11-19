@@ -35,6 +35,7 @@ import atexit
 import base64
 import json
 import os
+import re
 import shutil
 import statistics
 import subprocess
@@ -158,14 +159,22 @@ def build_sandbox_context(p, case, tmpdir):
     (shell lines run in a temp folder standing in for root, with git dates
     `commit_min_ago` minutes back), born_min_ago ({path: minutes}, the
     creation times to give folders), session_start_min_ago, and commands
-    ([{min_ago, command, error}], or commands_b64). The evidence is built
+    ([{min_ago, command, error}], or commands_b64), and brief (the call
+    then comes from a subagent whose first message this is). The evidence is built
     from the replica by the hook's own code, then written back with the
     display root, so the judge sees the case's realistic paths."""
     box = case["sandbox"]
     display = box["root"]
-    base = os.path.realpath(tempfile.mkdtemp(prefix=f"{case['id']}-", dir=tmpdir))
-    real = os.path.join(base, os.path.basename(display.rstrip("/")) or "root")
-    os.makedirs(real)
+    if re.fullmatch(r"/tmp/[^/]+", display):
+        # a folder right under /tmp: replicate it there, so the hook's /tmp
+        # evidence (who owns the folder, its mode) is about a real one
+        base = real = os.path.realpath(tempfile.mkdtemp(prefix=f"{case['id']}-", dir="/tmp"))
+        os.chmod(real, 0o755)
+        atexit.register(shutil.rmtree, real, ignore_errors=True)
+    else:
+        base = os.path.realpath(tempfile.mkdtemp(prefix=f"{case['id']}-", dir=tmpdir))
+        real = os.path.join(base, os.path.basename(display.rstrip("/")) or "root")
+        os.makedirs(real)
     now = time.time()
     when = now - 60 * box.get("commit_min_ago", 60)
     env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1",
@@ -209,14 +218,22 @@ def build_sandbox_context(p, case, tmpdir):
     transcript = os.path.join(base, f"{session}.jsonl")
     with open(transcript, "w") as f:
         f.writelines(json.dumps(r) + "\n" for r in records)
+    payload = {"cwd": to_real(case["cwd"]), "transcript_path": transcript,
+               "session_id": session, "tool_name": case["tool"], "tool_input": tool_input}
+    if box.get("brief"):
+        agent = os.path.join(base, session, "subagents", "agent-eval.jsonl")
+        os.makedirs(os.path.dirname(agent))
+        with open(agent, "w") as f:
+            f.write(json.dumps({"type": "user", "isSidechain": True, "agentId": "eval",
+                                "timestamp": _iso(now - 600), "sessionId": session,
+                                "message": {"role": "user", "content": box["brief"].replace("{root}", real)}}) + "\n")
+        payload["agent_transcript_path"] = agent
     p.set_hook_cwd({"cwd": to_real(case["cwd"])})
     # Hermetic: the runner's own gh login is no part of the case.
     real_probe = p._probe
     p._probe = lambda argv, *a, **k: None if argv[0] == "gh" else real_probe(argv, *a, **k)
     try:
-        context = p.build_llm_context({"cwd": to_real(case["cwd"]), "transcript_path": transcript,
-                                       "session_id": session, "tool_name": case["tool"],
-                                       "tool_input": tool_input})
+        context = p.build_llm_context(payload)
     finally:
         p._probe = real_probe
     case["provenance"] = p.LLM_CONTEXT_PROVENANCE
@@ -225,13 +242,24 @@ def build_sandbox_context(p, case, tmpdir):
     # A snippet cut mid-path leaves a piece of the temp path at its ellipsis.
     for k in range(len(real) - 1, 7, -1):
         context = context.replace("…" + real[-k:], "…" + display[-k:]).replace(real[:k] + "…", display[:k] + "…")
+    context = context.replace(re.sub(r"^/private/", "/", real), display)  # /tmp/x for /private/tmp/x
     context = context.replace(base, os.path.dirname(display))
     before = case.get("context_before")
     return f"{before}\n{context}" if before else context
 
 
 def build_context(p, case, tmpdir):
-    """build_llm_context() on a synthetic transcript holding the case's messages."""
+    """build_llm_context() on a synthetic transcript holding the case's
+    messages, with the case's mcp_context ({glob: sentence}) as the config's."""
+    saved = p.MCP_CONTEXT
+    p.MCP_CONTEXT = case.get("mcp_context", {})
+    try:
+        return _build_context(p, case, tmpdir)
+    finally:
+        p.MCP_CONTEXT = saved
+
+
+def _build_context(p, case, tmpdir):
     if case.get("sandbox"):
         return build_sandbox_context(p, case, tmpdir)
     transcript = os.path.join(tmpdir, f"{case['id']}.jsonl")
@@ -239,7 +267,10 @@ def build_context(p, case, tmpdir):
         for text in case["messages"]:
             f.write(json.dumps({"type": "user", "origin": {"kind": "human"},
                                 "message": {"role": "user", "content": text}}) + "\n")
-    context = p.build_llm_context({"cwd": case["cwd"], "transcript_path": transcript})
+    payload = {"cwd": case["cwd"], "transcript_path": transcript}
+    if case.get("mcp_context"):  # the tool's name picks the notes; no probes run for MCP calls
+        payload.update(tool_name=case["tool"], tool_input=case["input"])
+    context = p.build_llm_context(payload)
     # What the hook would compute from a real repository (worktree note, git status).
     before = case.get("context_before")
     return f"{before}\n{context}" if before else context

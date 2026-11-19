@@ -284,6 +284,7 @@
     "/.aws/",
     "/.config/gh/",
     "/.env",
+    "/smart-permissions-llm.env",
     "__ browser profiles (saved logins, cookies, the key that decrypts them) and keychains __",
     "/Google/Chrome/",
     "/google-chrome/",
@@ -309,6 +310,7 @@
   "always_ask_write_paths": [
     "smart-permissions-config.json",
     "smart-permissions-decisions",
+    "smart-permissions-llm.env",
     "/.claude/settings",
     "/.claude/hooks/",
     "/.claude/keybindings.json"

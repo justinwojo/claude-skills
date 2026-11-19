@@ -113,6 +113,44 @@ upload needs explicit authorization.
   Provenance never allows anything by rule. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
   a hint about what to check.
+- **More evidence.** None of this allows anything by rule, and none of it is
+  written to the decision log.
+  - *A subagent's brief.* A call from a subagent comes with the task the agent
+    that started it handed over (the first message of its transcript, 4000
+    characters at most, head and tail kept), labelled as an agent's brief, not
+    your words, next to your own recent messages.
+  - *Scripts it runs.* For `bash x.sh`, `python3 tools/x.py`, `. env.sh`,
+    `cmd < x.sh`, `cat x.sh | …`, `base64 x.sh` and a shell script named
+    anywhere in the command (inside `python3 -c "…"`, say), the judge reads the
+    file: up to 3 files, 8 KB each, regular files you own only (not on
+    Windows, where ownership can't be checked), never a
+    `sensitive_paths` entry or the judge's key file (nor a link to one). It is
+    told when a file was truncated, unreadable, missing or not shown, and which
+    other local scripts a shown one names that it has not seen. Script contents
+    stay out of the decision log: when the judge was shown a script, the log
+    keeps only its category, not its words. The reason you see has quoted
+    script text replaced by `[script text]`.
+  - *Stashes.* For `git stash drop`, `clear` or `pop` (when it reaches the
+    judge): `git stash list` with each stash's date and message, whether it
+    was made before or after this session started, and this session's own
+    Bash calls that ran a stash-making `git stash` in that repository, with
+    whether each failed.
+  - *Clones without remote-tracking refs.* A `git clone --bare` or `--mirror`
+    keeps no `refs/remotes`, so every commit would count as one "no
+    remote-tracking ref holds". For a repository with a remote and no such
+    refs, the judge is told that plainly instead, with what git shows: a
+    mirror setting, how many branch refs are loose or only in `packed-refs`
+    and when that was written, any loose ref or reflog newer than it, and a
+    path under `~/.cache` or `~/Library/Caches`. It is never told the commits
+    are safe elsewhere; it weighs that.
+  - *`/tmp`.* For a path under `/tmp`, who owns the folder right under it and
+    its mode: Claude Code's own `/private/tmp/claude-<uid>` (yours, mode 700) is
+    private, not world-writable, and an import path (`PYTHONPATH=…`) into it
+    says so in the rule reason. A delete inside a git clone whose root is under
+    `/tmp` names that clone's remotes; a file a glob names inside a repository
+    gets git's view of it, as a folder does.
+  - *Your notes on an MCP tool.* See `mcp_context` under
+    [MCP tool permissions](#mcp-tool-permissions).
 - **Messages are a partial view.** An agent often works from earlier
   instructions, a plan or a brief the judge never sees, so a call the latest
   message doesn't mention (cleanup after "where are we at?") is no reason to
@@ -276,6 +314,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `safe_script_paths` | string array | Directories where absolute-path scripts are auto-allowed |
 | `allowed_web_domains` | string array | Domains auto-allowed for WebFetch (subdomains included) |
 | `safe_mcp_tools` | string array | MCP tool name patterns auto-allowed (supports glob wildcards) |
+| `mcp_context` | object | `{"MCP tool glob": "sentence"}`: a note the LLM judge reads with each call to a matching MCP tool (see [MCP tool permissions](#mcp-tool-permissions)). Context only, never an allow. Empty by default. |
 | `safe_internal_tools` | string array | Claude Code / harness internal tools auto-allowed (no side effects outside the harness) |
 | `sensitive_paths` | string array | Write/Edit to a path containing one is denied (substring match); Read/Glob/Grep of one, and Bash commands naming one, go to the LLM (matched where a path component ends, case-insensitive: `/.env` matches `.env.local`, not `.envrc`) |
 | `always_ask_write_paths` | string array | Path substrings that always prompt on Write/Edit (permission-config self-escalation guard, C9). **Not subtractable.** |
@@ -327,6 +366,18 @@ With this config, `mcp__sentry__get_issue` is auto-allowed, but `mcp__sentry__re
 Patterns use Python's `fnmatch` — `*` matches any characters, `?` matches a single character. For example, `mcp__*__get_*` matches all get operations from any MCP server.
 
 An MCP tool that matches no pattern goes to the LLM (if configured) on each call, and to the standard prompt otherwise. An LLM approval is never saved as a pattern.
+
+The judge knows nothing about the machine an MCP server reaches. `mcp_context` tells it, one sentence per tool glob (up to 500 characters; every matching sentence is sent, five at most):
+
+```json
+{
+  "mcp_context": {
+    "mcp__bench__*": "The developer's Windows test bench. Commands run as the bench's own account; C:\\Users\\bench is that account's home, not another person's."
+  }
+}
+```
+
+A note is evidence for the judge, not an allow: it still flags what the call does if that is harmful. A value that isn't an object of strings is ignored.
 
 ## How Bash commands are parsed
 
@@ -478,6 +529,15 @@ Covers all decision paths: safe commands, dangerous patterns, risky patterns, fi
 | `SAFETY_HOOK_RECHECK_REASONING_EFFORT` | `reasoning_effort` for the second pass on a flagged call (default `high`; empty string = provider default) |
 | `SAFETY_HOOK_AUTO_LEARN` | **Retired** — ignored. Approvals are no longer written to the config; remove it from your shell config. |
 
+**A key file for processes without your shell's environment.** A Claude Code started from an app, a launcher or a non-interactive shell may not have the variables from `~/.zshrc`, and then has no judge: everything the rules can't settle prompts. When `SAFETY_HOOK_MODEL` or `SAFETY_HOOK_API_KEY` is missing from the environment, the hooks read the same variables from `smart-permissions-llm.env` beside your config (`~/.claude/smart-permissions-llm.env`, or beside `SMART_PERMISSIONS_CONFIG`). Lines are `NAME=value`, with an optional `export` and quotes; `#` starts a comment; only the `SAFETY_HOOK_*` names above are read. A variable that is set in the environment wins over the file. Create the file yourself and make it private:
+
+```bash
+touch ~/.claude/smart-permissions-llm.env && chmod 600 ~/.claude/smart-permissions-llm.env
+# then add, in an editor:  SAFETY_HOOK_MODEL=claude-haiku-5-5  and  SAFETY_HOOK_API_KEY=...
+```
+
+The hooks ignore it, and say why when the judge is reported unavailable, if it is readable or writable by anyone but you, owned by someone else, a symbolic link, not a regular file or over 64 KB. The check reads the file's mode bits, not access-control lists: don't add an ACL entry that grants it to others (`ls -le` shows them on macOS). On Windows, where the hooks can't check that, it is always ignored: use the environment there. It is a sensitive path: Claude's writes to it are denied, its reads go to the judge, and its text is never shown to the judge as a script.
+
 ## Audit log
 
 All unknown commands and tools are logged to `~/.claude/hooks/unknown-permissions.log` for review.
@@ -494,6 +554,15 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 ## Changelog
 
+- **1.5.0 (2026-11-19) — more evidence for the judge, fewer false denies.**
+  - A judge key file: when `SAFETY_HOOK_MODEL` or `SAFETY_HOOK_API_KEY` is missing from the environment, the hooks read the `SAFETY_HOOK_*` settings from `smart-permissions-llm.env` beside the config, if only you can read it (`chmod 600`; not on Windows). A Claude Code started outside your interactive shell no longer loses its judge. See [LLM environment variables](#llm-environment-variables).
+  - The judge sees a subagent's brief, the contents of the local scripts a call runs or feeds (3 files, 8 KB each, your own regular files; never logged), the stash list and its provenance for `git stash drop/clear/pop`, who owns a `/tmp` folder and its mode, and your `mcp_context` notes for MCP tools. See [How the LLM judges a call](#how-the-llm-judges-a-call).
+  - A bare or mirror clone is no longer reported as holding thousands of commits no remote has: with a remote and no remote-tracking refs, the judge is told git cannot compare them, with the clone's packed-refs and reflog observations and any cache-folder path.
+  - `PYTHONPATH` into Claude Code's private `/private/tmp/claude-<uid>` still goes to the judge, now with a rule reason saying the folder is yours and not world-writable.
+  - Fewer "Rewrite needed … `${S:?}`" denies: a loop variable over literal words, and a name assigned once at the top level to text with a literal part (`F=$E/v9`, also after a heredoc, a multi-line commit message, `set -e` or `export K=$(…)`), count as non-empty. `cd X && S=/lit; rm -rf $S/y`, a conditional or piped assignment, `read`, `eval`, `unset`, `${S:=}`, a function or a subshell still get the rewrite.
+  - A nested loop over a loop variable's folders (`for x in …; do for a in "$x"/*/; do rm -rf "$a"`) is no longer denied as a delete of `~`; it goes to the judge. A loop word that is empty (`""`) still counts as empty.
+  - `sandbox-exec` and `script` are wrappers: the command they run is judged instead of "Unknown command", and util-linux `script -c CODE` is read as shell code. `script`'s output and log files (`FILE`, `-O`, `--log-out=`, `-T`, `-tFILE`, …) count as writes (a permission-config or startup file there prompts), and a sensitive file a wrapper reads (`sandbox-exec -f`) goes to the judge.
+  - Loop and assignment leniency stays off where a value may still be empty: a loop word with `"$@"`, `$*` or `${a[@]}`, a value with a blank in it (`S=' a'` splits where `$S` is unquoted), or an assignment with a redirection.
 - **Unreleased — hardening.**
   - The 7-day LLM allow cache is gone: every call the rules can't settle is judged afresh. Old cache files and the `llm_cache`/`llm_cache_ttl_days` keys are ignored; delete them if you like. The LLM now also sees why the local rules sent it the call, and a timeout reports the total time spent.
   - A deny anywhere in a command wins over an ask earlier in it (`unknowncmd; sudo ls` is denied, not prompted).

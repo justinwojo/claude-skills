@@ -282,6 +282,12 @@ SAFE_WRITE_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_write_pa
 SAFE_SCRIPT_PATHS = [_expand_path(p) for p in _as_list(_CONFIG.get("safe_script_paths"))]
 ALLOWED_WEB_DOMAINS = _as_list(_CONFIG.get("allowed_web_domains"))
 SAFE_MCP_TOOLS = _as_list(_CONFIG.get("safe_mcp_tools"))
+# {MCP tool glob: a sentence the judge reads with a call to a matching tool}
+# ("the developer's Windows bench; C:\\Users\\bench is its own account").
+# Context only: it never allows anything by itself. A wrong type is ignored.
+MCP_CONTEXT = {k: v.strip()[:500] for k, v in _CONFIG.get("mcp_context", {}).items()
+               if isinstance(k, str) and isinstance(v, str) and v.strip()} \
+    if isinstance(_CONFIG.get("mcp_context"), dict) else {}
 SENSITIVE_PATHS = _as_list(_CONFIG.get("sensitive_paths"))
 
 # Real tool names can NEVER be marked "internal-safe" via config — an entry of
@@ -356,10 +362,15 @@ LLM_FLAG_TTL_S = 300
 # paths aren't substrings of the shipped always_ask_write_paths, so writes to
 # them would sneak past C9. Append the resolved absolute paths (deduped) so both
 # the Write/Edit guard and the H1 Bash-write guard cover them too.
+# The judge's key file (see _load_llm_env_file) is state too, and a secret:
+# reading it asks like any sensitive path.
+LLM_ENV_FILE = os.path.join(os.path.dirname(USER_CONFIG_PATH) or ".", "smart-permissions-llm.env")
 for _state_path in (USER_CONFIG_PATH, DECISION_LOG_PATH,
-                    DECISION_LOG_PATH + ".1", LLM_FLAG_PATH):
+                    DECISION_LOG_PATH + ".1", LLM_FLAG_PATH, LLM_ENV_FILE):
     if _state_path and _state_path not in ALWAYS_ASK_WRITE_PATHS:
         ALWAYS_ASK_WRITE_PATHS.append(_state_path)
+if LLM_ENV_FILE not in SENSITIVE_PATHS:
+    SENSITIVE_PATHS.append(LLM_ENV_FILE)
 
 
 # ============================================================
@@ -377,12 +388,88 @@ for _state_path in (USER_CONFIG_PATH, DECISION_LOG_PATH,
 #   SAFETY_HOOK_PROVIDER  - "anthropic" | "openai" (optional; auto-detected:
 #                           anthropic when the URL is on anthropic.com, or no
 #                           URL is set and the model starts with "claude-")
+#
+# A Claude Code process not started from the developer's interactive shell
+# (an IDE, a launcher, a service) doesn't get variables set in ~/.zshrc. So
+# a variable the environment doesn't set is read from LLM_ENV_FILE
+# (~/.claude/smart-permissions-llm.env): `SAFETY_HOOK_MODEL=…` lines, as a
+# shell would source them. The file holds the key, so it is used only when
+# it is a regular file the developer owns that no one else can read
+# (chmod 600); LLM_ENV_FILE_NOTE says why it was ignored otherwise.
+_LLM_ENV_KEYS = frozenset({
+    "SAFETY_HOOK_MODEL", "SAFETY_HOOK_API_KEY", "SAFETY_HOOK_API_URL", "SAFETY_HOOK_PROVIDER",
+    "SAFETY_HOOK_REASONING_EFFORT", "SAFETY_HOOK_RECHECK_REASONING_EFFORT", "SAFETY_HOOK_DEBUG"})
+_LLM_ENV_FILE_MAX_BYTES = 64 * 1024
+
+
+def _load_llm_env_file(path):
+    """({KEY: value} from the judge's env file, note): the note says why the
+    file was ignored ("" when read, or when there is none). Never raises."""
+    try:
+        if not (hasattr(os, "getuid") and hasattr(os, "O_NOFOLLOW")):
+            # Windows: who can read it, and whether it is a link, can't be checked here
+            return {}, f"{path} ignored: its permissions can't be checked on this platform"
+        # non-blocking: a FIFO there must not hang the hook
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return {}, ""
+        except OSError as e:
+            return {}, f"{path} could not be opened ({type(e).__name__}; a link is not followed)"
+        try:
+            st = os.fstat(fd)
+            import stat as _stat
+            if not _stat.S_ISREG(st.st_mode):
+                return {}, f"{path} ignored: not a regular file"
+            if st.st_uid != os.getuid():
+                return {}, f"{path} ignored: owned by another user"
+            if st.st_mode & 0o077:
+                return {}, (f"{path} ignored: readable or writable by others "
+                            f"(mode {st.st_mode & 0o777:o}; run chmod 600 on it)")
+            data = os.read(fd, _LLM_ENV_FILE_MAX_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(data) > _LLM_ENV_FILE_MAX_BYTES:
+            return {}, f"{path} ignored: larger than {_LLM_ENV_FILE_MAX_BYTES} bytes"
+        values = {}
+        for line in data.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            line = re.sub(r"^export\s+", "", line)
+            key, sep, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if not sep or key not in _LLM_ENV_KEYS:
+                continue
+            quoted = re.fullmatch(r"""(['"])(.*?)\1(?:\s+#.*)?""", value)
+            if quoted:  # `"v"`, or `"v"  # comment`
+                value = quoted.group(2)
+            else:
+                value = re.sub(r"\s+#.*$", "", value)  # a trailing comment
+            values[key] = value
+        return values, ""
+    except Exception as e:  # never break the hook over its key file
+        return {}, f"{path} could not be read ({type(e).__name__})"
+
+
+def _llm_setting(key, default=""):
+    """A judge setting: the environment's value, else the env file's. A
+    blank model or key in the environment counts as missing; any other
+    setting the environment sets, even to "", wins (an empty effort means
+    "send none")."""
+    value = os.environ.get(key)
+    if value is None or not value.strip() and key in ("SAFETY_HOOK_MODEL", "SAFETY_HOOK_API_KEY"):
+        value = _LLM_ENV_FILE_VALUES.get(key, default)
+    return value
+
+
+_LLM_ENV_FILE_VALUES, LLM_ENV_FILE_NOTE = ({}, "") if all(
+    os.environ.get(k, "").strip() for k in ("SAFETY_HOOK_MODEL", "SAFETY_HOOK_API_KEY")
+) else _load_llm_env_file(LLM_ENV_FILE)
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-LLM_API_URL = os.environ.get("SAFETY_HOOK_API_URL", "").strip()
-LLM_MODEL = os.environ.get(
-    "SAFETY_HOOK_MODEL",
-    ""
-).strip()
+LLM_API_URL = _llm_setting("SAFETY_HOOK_API_URL").strip()
+LLM_MODEL = _llm_setting("SAFETY_HOOK_MODEL").strip()
 
 
 def _detect_llm_provider(explicit, url, model):
@@ -399,10 +486,10 @@ def _detect_llm_provider(explicit, url, model):
 
 
 LLM_PROVIDER = _detect_llm_provider(
-    os.environ.get("SAFETY_HOOK_PROVIDER", ""), LLM_API_URL, LLM_MODEL)
+    _llm_setting("SAFETY_HOOK_PROVIDER"), LLM_API_URL, LLM_MODEL)
 if LLM_PROVIDER == "anthropic" and not LLM_API_URL:
     LLM_API_URL = ANTHROPIC_MESSAGES_URL
-LLM_API_KEY = os.environ.get("SAFETY_HOOK_API_KEY", "").strip()
+LLM_API_KEY = _llm_setting("SAFETY_HOOK_API_KEY").strip()
 if not LLM_API_KEY and LLM_PROVIDER == "anthropic":
     LLM_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
 # Anthropic: thinking tokens count toward max_tokens, so leave headroom for
@@ -411,11 +498,13 @@ ANTHROPIC_MAX_TOKENS = 4096
 ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # Optional reasoning_effort param (e.g. "none", "low", "medium", "high").
 # Only sent if set — otherwise the provider's default applies.
-LLM_REASONING_EFFORT = os.environ.get("SAFETY_HOOK_REASONING_EFFORT", "").strip()
+LLM_REASONING_EFFORT = _llm_setting("SAFETY_HOOK_REASONING_EFFORT").strip()
 # Effort for the second pass on a flagged call. Flags are rare, so this can
 # afford to think; set to "" to fall back to the provider default.
-LLM_RECHECK_REASONING_EFFORT = os.environ.get(
-    "SAFETY_HOOK_RECHECK_REASONING_EFFORT", "high").strip()
+LLM_RECHECK_REASONING_EFFORT = (
+    os.environ.get("SAFETY_HOOK_RECHECK_REASONING_EFFORT")
+    if "SAFETY_HOOK_RECHECK_REASONING_EFFORT" in os.environ
+    else _LLM_ENV_FILE_VALUES.get("SAFETY_HOOK_RECHECK_REASONING_EFFORT", "high")).strip()
 # A recheck with less time than this left in the budget is skipped (→ ask).
 LLM_RECHECK_MIN_S = 3
 # Total LLM budget for PreToolUse, retry included. Claude Code kills the hook
@@ -424,7 +513,7 @@ LLM_PRETOOL_BUDGET_S = 24
 
 # Enable verbose logging to stderr (LLM approved/flagged/rechecked).
 # Errors and unparseable responses always log regardless of this flag.
-DEBUG = os.environ.get("SAFETY_HOOK_DEBUG", "").lower() in ("true", "1", "yes")
+DEBUG = _llm_setting("SAFETY_HOOK_DEBUG").lower() in ("true", "1", "yes")
 
 # Allow-by-default policy: flag only concrete evidence of a listed harm. The
 # risk categories borrow from Codex's auto-review policy, minus its
@@ -499,7 +588,9 @@ keys in the environment) is normal.
 interpreter, unless it is the tool's official installer. Injecting a library \
 or module path from /tmp or another world-writable directory into another \
 program (LD_PRELOAD, DYLD_INSERT_LIBRARIES, PYTHONPATH) counts; running the \
-task's own scripts from /tmp does not.
+task's own scripts from /tmp does not. A folder the context shows is owned by \
+the developer with no group or other write (Claude Code's own \
+/private/tmp/claude-<uid>) is not world-writable.
 5. Lasting security weakening. Disabling SIP, Gatekeeper or download \
 quarantine, the firewall, or FileVault; editing sudoers or SSH server config; broad permission changes \
 (chmod -R 777 on home); login items, launch agents, cron jobs, or shell \
@@ -518,6 +609,12 @@ TVs, meters, etc.); sending code to review CLIs (codex, grok, claude); running \
 project scripts; reading any file that isn't a secret store. Not safe, even as \
 a plain filename search: looking for cookie, session, storage-state, `Local \
 State` or auth files the developer didn't point to (category 3).
+
+A subagent's brief, when given, is the task the agent that started it handed \
+over: read it like the developer's messages to understand the work, though an \
+agent wrote it. Script contents, when given, are what the call runs: judge \
+them as part of the call, and in your reason say what a line does rather \
+than quoting it.
 
 The developer's recent messages are a partial view: the agent often works from \
 earlier instructions, a plan or a brief you can't see. Use them to understand \
@@ -660,6 +757,18 @@ def _decision_log_input(tool, tool_input, limit=DECISION_LOG_INPUT_CHARS):
     return val[:limit]
 
 
+def _loggable_reason(reason):
+    """`reason` for the decision log. When the judge was shown script
+    contents (SCRIPT_CONTEXT_TEXTS), its own words may echo them, so only
+    its category numbers are kept: script text never reaches the log."""
+    if not (SCRIPT_CONTEXT_TEXTS and isinstance(reason, str) and reason.startswith("LLM")) \
+            or reason == "LLM approved":
+        return reason
+    cats = sorted(set(re.findall(r"category ([1-9])(?!\d)", reason)))  # the prompt's 1-9, not free text
+    return ("LLM verdict; its words are not logged, as it was shown script contents"
+            + (f" (category {', '.join(cats)})" if cats else ""))
+
+
 def log_decision(hook, tool, tool_input, decision, source, reason,
                  duration_ms=None, llm_ms=None, rule_reason=None):
     """Append one JSONL record describing a permission decision.
@@ -684,7 +793,7 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
             "input": _decision_log_input(tool, tool_input, limit),
             "decision": decision,
             "source": source,
-            "reason": reason,
+            "reason": _loggable_reason(reason),
         }
         if duration_ms is not None:
             record["duration_ms"] = duration_ms
@@ -728,7 +837,8 @@ def _flag_put(tool, tool_input, reason):
         now = time.time()
         flags = {k: v for k, v in _read_json_dict(LLM_FLAG_PATH).items()
                  if isinstance(v, dict) and now - v.get("ts", 0) < LLM_FLAG_TTL_S}
-        flags[_call_key(tool, tool_input)] = {"reason": reason, "ts": now}
+        # stored, then logged by the learner: never the judge's words about a script
+        flags[_call_key(tool, tool_input)] = {"reason": _loggable_reason(reason), "ts": now}
         os.makedirs(os.path.dirname(LLM_FLAG_PATH), exist_ok=True)
         tmp_path = LLM_FLAG_PATH + ".tmp"
         with open(tmp_path, "w") as f:
@@ -1536,7 +1646,7 @@ def _session_transcripts(input_data):
         return []
     files = [main]
     agent = input_data.get("agent_transcript_path")
-    if isinstance(agent, str) and os.path.isabs(agent) and agent != main:
+    if isinstance(agent, str) and os.path.isabs(agent) and agent != main and os.path.isfile(agent):
         files.append(agent)
     try:
         with os.scandir(os.path.join(os.path.splitext(main)[0], "subagents")) as it:
@@ -1551,7 +1661,7 @@ def _session_transcripts(input_data):
 def _session_start(path):
     """When the transcript at `path` starts: its first record's timestamp."""
     try:
-        with open(path, "rb") as f:
+        with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), "rb") as f:
             head = f.read(256 * 1024).decode("utf-8", "replace")
     except OSError:
         return None
@@ -1654,7 +1764,7 @@ def _bash_inputs(record):
             continue
         inp = block.get("input") if isinstance(block.get("input"), dict) else {}
         texts = [inp.get("command")]
-        sent = wire.get(block.get("id"))
+        sent = wire.get(block.get("id")) if isinstance(block.get("id"), str) else None
         if isinstance(sent, dict) and sent.get("command") != texts[0]:
             texts.append(sent.get("command"))
         texts = [t for t in texts if isinstance(t, str) and t]
@@ -1664,7 +1774,8 @@ def _bash_inputs(record):
 
 def _tail_lines(path, limit):
     """(lines of the last `limit` bytes of `path`, bytes read, whether it was cut)."""
-    with open(path, "rb") as f:
+    # non-blocking: a path swapped for a FIFO after a type check must not hang the hook
+    with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), "rb") as f:
         f.seek(0, os.SEEK_END)
         start = max(0, f.tell() - limit)
         f.seek(start)
@@ -1892,9 +2003,16 @@ def _repo_loss(repo, deadline, bare=False):
         if status is None:
             return "  git could not read it in time."
         text = "  `git status --short --branch --ignored`:\n" + _indent(status)
+    remotes = _git_remotes(repo, deadline)
+    # a clone of a configured remote that kept no remote-tracking refs
+    clone = _clone_observations(repo, bare, deadline) if remotes else None
     unique = (_git_probe(repo, ["rev-list", "--count", "--branches", "--not", "--remotes"],
                          deadline) or "").strip()
-    if unique.isdigit():
+    if unique.isdigit() and clone:
+        # with no remote-tracking ref to compare against, git counts every commit
+        text += (f"\n  Commits on local branches: {unique}. There are no remote-tracking refs, "
+                 "so git cannot say which of them its remote also holds.")
+    elif unique.isdigit():
         text += f"\n  Commits on local branches that no remote-tracking ref holds: {unique}"
         if unique != "0":
             latest = (_git_probe(repo, ["log", "-1", "--format=%h %cd %s", "--date=format-local:%Y-%m-%d %H:%M",
@@ -1907,22 +2025,97 @@ def _repo_loss(repo, deadline, bare=False):
         if detached.isdigit() and detached != "0":
             text += (f" HEAD is detached, with {detached} commit{'s' if detached != '1' else ''}"
                      " no branch or remote-tracking ref holds.")
-    remotes = _git_remotes(repo, deadline)
     if remotes is not None:
         named = [f"{n} {_clean_url(r.get('fetch', ''))[:100]}" for n, r in list(remotes.items())[:4]]
         text += f" Remotes: {', '.join(named) if named else 'none'}."
     stashes = _git_probe(repo, ["stash", "list", "--format=%gd"], deadline)
     if stashes is not None:
         text += f" Stashes: {len(stashes.splitlines())}."
+    if clone:
+        text += "\n  " + clone
     return text
+
+
+_CACHE_ROOTS = tuple(os.path.join(HOME_DIR, d) for d in (".cache", "Library/Caches"))
+
+
+def _clone_observations(repo, bare, deadline):
+    """What a repository with a remote but no remote-tracking refs shows about where its
+    branches came from, said literally (a `git clone --bare`/`--mirror` keeps
+    none): a mirror setting, its branch count, its loose refs and reflogs
+    and those newer than packed-refs (and when that was written),
+    and a path under a cache folder. None when it has remote-tracking refs or
+    git can't say. Whether its commits exist elsewhere is left to the judge."""
+    tracking = _git_probe(repo, ["for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes"],
+                          deadline)
+    if tracking is None or tracking.strip():
+        return None
+    out = []
+    mirror = _git_probe(repo, ["config", "--get-regexp", r"^remote\..*\.mirror$"], deadline) or ""
+    if re.search(r"\strue\s*$", mirror, re.M | re.I):
+        out.append("Its remote is set up as a mirror (remote.<name>.mirror true).")
+    heads = _git_probe(repo, ["for-each-ref", "--format=%(refname)", "refs/heads"], deadline)
+    gitdir = repo if bare else (_git_probe(repo, ["rev-parse", "--absolute-git-dir"], deadline)
+                                or "").strip()
+    if heads is not None:
+        line = f"Local branches: {len(heads.splitlines())}"
+        if gitdir and os.path.isdir(gitdir):
+            loose, logs, cut = [], [], False
+            head_log = os.path.join(gitdir, "logs", "HEAD")
+            logs += [head_log] if os.path.isfile(head_log) else []
+            # every local ref (branches, tags, notes…) and its log: any of them may be newer
+            for sub, into in (("refs", loose), ("logs/refs", logs)):
+                for root, _dirs, files in os.walk(os.path.join(gitdir, sub)):
+                    into.extend(os.path.join(root, f) for f in files)
+                    if len(into) > 1000 or time.monotonic() > deadline:
+                        cut = True
+                        break
+            packed = os.path.join(gitdir, "packed-refs")
+            try:
+                packed_at = os.stat(packed).st_mtime
+            except OSError:
+                packed_at = None
+            line += f"; {len(loose)} loose ref{'s' if len(loose) != 1 else ''} (branches, tags, …)"
+            line += f", {len(logs)} reflog{'s' if len(logs) != 1 else ''} (refs and HEAD)"
+            if packed_at is None:
+                line += "; no packed-refs file"
+            else:
+                newer = []
+                for f in loose + logs:
+                    if time.monotonic() > deadline:
+                        cut = True
+                        break
+                    try:
+                        mtime = os.stat(f).st_mtime
+                    except OSError:
+                        continue
+                    if mtime > packed_at:
+                        newer.append(mtime)
+                line += f"; packed-refs written {_local_time(packed_at, '%Y-%m-%d %H:%M')}"
+                line += (f"; {len(newer)} loose ref or reflog file{'s' if len(newer) != 1 else ''}"
+                         f" newer than packed-refs (newest {_local_time(max(newer), '%Y-%m-%d %H:%M')})"
+                         if newer else "" if cut else
+                         "; no loose ref or reflog is newer than packed-refs")
+            line += "; the scan stopped early, there may be more." if cut else "."
+        out.append(line if line.endswith(".") else line + ".")
+    real = os.path.realpath(repo)
+    cache = next((c for c in _CACHE_ROOTS if real == c or real.startswith(c + os.sep)
+                  or repo.startswith(c + os.sep)), None)
+    if cache:
+        out.append(f"It is under the cache folder {cache}.")
+    return " ".join(out) or None
 
 
 def _delete_loss(path, label, deadline):
     """A block on what deleting the folder `path` would lose: the git
-    checkouts inside it, or, inside a checkout, git's view of that path."""
-    if not os.path.isdir(path) or os.path.islink(path):
+    checkouts inside it, or, inside a checkout, git's view of that path (of
+    a file too, as a glob names them)."""
+    if os.path.islink(path) or not os.path.exists(path):
         return ""
-    repos, complete = _repos_inside(path, deadline)
+    folder = os.path.isdir(path)
+    if not folder and not os.path.isfile(path):
+        return ""
+    repos, complete = _repos_inside(path, deadline) if folder else ([], True)
     if repos:
         out = [f"Git repositories inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
                + ("" if complete else "; the search stopped early, there may be more") + ":"]
@@ -1930,15 +2123,26 @@ def _delete_loss(path, label, deadline):
             out.append(f"- {os.path.relpath(repo, path) if repo != path else path}:")
             out.append(_repo_loss(repo, deadline, bare))
         return "\n".join(out)
-    top = (_git_probe(path, ["rev-parse", "--show-toplevel"], deadline) or "").strip()
+    top = (_git_probe(path if folder else os.path.dirname(path), ["rev-parse", "--show-toplevel"],
+                      deadline) or "").strip()
     if top:
         status = _git_probe(top, ["status", "--porcelain=v1", "--untracked-files=normal",
                                   "--ignored=matching", "--", os.path.realpath(path)], deadline)
         if status is not None:
             body = _indent(status) if status.strip() else \
                 "    (nothing: every file there is committed and unchanged)"
-            return (f"{path} ({label}) is inside the git repository {top}. Uncommitted, untracked "
-                    f"and ignored files there (`git status --short --ignored`):\n{body}")
+            where = ""
+            if re.match(r"(?:/private)?/tmp/", top):
+                remotes = _git_remotes(top, deadline)
+                named = [f"{n} {_clean_url(r.get('fetch', ''))[:100]}"
+                         for n, r in list((remotes or {}).items())[:3]]
+                where = (f" The repository's root is under /tmp" + (
+                    f"; its remotes: {', '.join(named)}." if named else
+                    "; it has no remotes." if remotes is not None else "."))
+            return (f"{path} ({label}) is inside the git repository {top}.{where} Uncommitted, "
+                    f"untracked and ignored files there (`git status --short --ignored`):\n{body}")
+    if not folder:
+        return ""
     return (f"No git repository inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
             + ("" if complete else " (the search stopped early)") + ", and it is not inside one.")
 
@@ -1991,10 +2195,533 @@ def loss_context(targets, covered, deadline):
     return parts
 
 
+# ── Judge context: a subagent's brief, local scripts, stashes, /tmp, MCP ──
+# Evidence only: none of it changes a rule's verdict, and none of it is
+# written to the decision log (log_decision records the tool input alone).
+
+# A subagent's brief: its first message, head and tail kept when long.
+CONTEXT_BRIEF_CHARS = 4000
+CONTEXT_BRIEF_TAIL_CHARS = 1000
+CONTEXT_BRIEF_HEAD_BYTES = 1024 * 1024
+
+
+def subagent_brief(path, limit=CONTEXT_BRIEF_CHARS):
+    """The task prompt a subagent works from (the first user message of its
+    transcript at `path`), capped at `limit` characters, or None. Its first
+    message is written by the agent that started it, never a tool result.
+    Never raises."""
+    try:
+        return _subagent_brief(path, limit)
+    except Exception:  # a malformed transcript is no brief; never break the hook
+        return None
+
+
+def _subagent_brief(path, limit):
+    if not (isinstance(path, str) and os.path.isabs(path) and os.path.isfile(path)):
+        return None
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        head = os.read(fd, CONTEXT_BRIEF_HEAD_BYTES)
+    finally:
+        os.close(fd)
+    for line in head.decode("utf-8", "replace").splitlines()[:200]:
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("type") != "user" \
+                or record.get("isMeta") or record.get("isCompactSummary"):
+            continue
+        message = record.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+                return None
+            content = "\n".join(b["text"] for b in content if isinstance(b, dict)
+                                and b.get("type") == "text" and isinstance(b.get("text"), str))
+        if not isinstance(content, str):
+            return None
+        text = _SYSTEM_REMINDER_RE.sub("", content).strip()
+        if not text:
+            return None
+        if len(text) > limit:
+            tail = CONTEXT_BRIEF_TAIL_CHARS
+            text = (text[:limit - tail] + f"\n[… {len(text) - limit} characters left out …]\n"
+                    + text[-tail:])
+        return text
+    return None
+
+
+# Local scripts a call runs, sources or feeds (`bash x.sh`, `. env.sh`,
+# `cmd < x.sh`, `cat x.sh | …`, `base64 x.sh`): their text, so the judge sees
+# what runs. Only regular files the developer owns, capped.
+SCRIPT_CONTEXT_MAX_FILES = 3
+SCRIPT_CONTEXT_MAX_BYTES = 8 * 1024
+SCRIPT_CONTEXT_TOTAL_BYTES = 16 * 1024
+# The script text this hook call showed the judge, so a reason quoting it is
+# scrubbed before it is logged or stored (see scrub_script_text).
+SCRIPT_CONTEXT_TEXTS = []
+_SCRIPT_RUNNERS = frozenset({
+    "bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "python", "python2", "python3", "pypy", "pypy3", "node", "ruby", "perl", "php", "pwsh",
+    "Rscript", "osascript", "deno", "tsx", "ts-node"})
+# Options of a runner that take the next word, or end the options without a file.
+_SCRIPT_VALUE_OPTS = frozenset({"-o", "+o", "-O", "+O", "-X", "-W", "-r", "--require", "-I"})
+_SCRIPT_INLINE_OPTS = frozenset({"-c", "-m", "-e", "-p", "--eval", "--print", "-Command", "-command"})
+_SCRIPT_READERS = frozenset({"cat", "base64", "gzip", "xxd", "head", "tail", "tee"})
+_SCRIPT_EXT = r"(?:sh|bash|zsh|ksh|py|rb|pl|js|mjs|cjs|ts|ps1|psm1|sql|bat|cmd)"
+_SCRIPT_NAME_RE = re.compile(r"(?<![\w$%s])(?:~/|\.{1,2}/|/)?[\w@%%+,.:/-]*?[\w-]\.%s(?![\w.])"
+                             % (re.escape("{"), _SCRIPT_EXT))
+_SHELL_SCRIPT_NAME_RE = re.compile(r"(?<![\w$%s])(?:~/|\.{1,2}/|/)?[\w@%%+,.:/-]*?[\w-]\.(?:sh|bash|zsh|ksh|ps1)(?![\w.])"
+                                   % re.escape("{"))
+
+
+def _script_operand(name, args):
+    """The script file a runner (`bash`, `python3 -u`, `node`) runs, or None
+    when it runs inline code (`-c`, `-m`, `-e`) or reads stdin."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        if a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
+            return None
+        if not a.startswith(("-", "+")) or a == "-":
+            break
+        i += 2 if a in _SCRIPT_VALUE_OPTS else 1
+    if i < len(args) and args[i] != "-":
+        return args[i]
+    return None
+
+
+def _looks_like_script(path):
+    """True for a file with a script extension, a `#!` line, or an exec bit."""
+    if re.search(r"\.%s$" % _SCRIPT_EXT, path, re.I):
+        return True
+    import stat as _stat
+    try:
+        st = os.stat(path)
+        if not _stat.S_ISREG(st.st_mode) or hasattr(os, "getuid") and st.st_uid != os.getuid():
+            return False  # never open a FIFO or a device (it may block), or another's file
+        if st.st_mode & 0o111:
+            return True
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            return os.read(fd, 2) == b"#!"
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def script_files(command, cwd, deadline=None):
+    """[(absolute path, how the call uses it)] for the local script files
+    `command` runs, sources, feeds on stdin or reads into a pipe or an
+    encoder, in order, at most SCRIPT_CONTEXT_MAX_FILES. Follows `cd` and
+    names set to one literal path (`D=~/x; bash $D/run.sh`); a shell script
+    named anywhere else in the command (inside `python3 -c "…"`) counts too."""
+    if not isinstance(command, str) or not command.strip() or not hasattr(os, "getuid"):
+        return []  # Windows: no owner to check, and sensitive_paths are written with `/`
+    names = _literal_paths(command)
+    spelled = _spell_names(command, names)
+    segments, uncertain = split_compound_command(spelled)
+    if uncertain or not segments:
+        segments = [spelled]
+    base = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
+    scoped = None
+    found = []
+
+    deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
+
+    def add(word, how, where, check=False):
+        if len(found) >= SCRIPT_CONTEXT_MAX_FILES or time.monotonic() > deadline:
+            return
+        path = _evidence_path(word, where) if word else None
+        # never a credential file: its text would go to the judge's provider
+        if path and not _private_file(path) and (not check or _looks_like_script(path)) \
+                and path not in [p for p, _ in found]:
+            found.append((path, how))
+
+    for segment in segments:
+        raw, stdin, _hazard = _parse_simple_command(segment)
+        tokens = [_unquote_word(w) for w in raw]
+        if time.monotonic() > deadline or len(found) >= SCRIPT_CONTEXT_MAX_FILES:
+            break  # no probe past the deadline
+        if not tokens:
+            continue
+        if tokens[0] in ("cd", "pushd", "popd"):
+            if scoped is None:
+                scoped = _cd_in_scope(spelled)  # in a subshell, loop, condition…: not sure
+            base = None if scoped else base and _evidence_cd(tokens[0], tokens, base, spelled)
+            continue
+        peeled = _peel_words(raw)
+        k = peeled[0] if peeled else 0
+        name, args = os.path.basename(tokens[k]), tokens[k + 1:]
+        if stdin and stdin[0] == "file":
+            add(_unquote_word(stdin[1]), f"fed on stdin to {name}", base, check=True)
+        if name in _SCRIPT_RUNNERS or re.fullmatch(r"python\d+(?:\.\d+)?", name):
+            op = _script_operand(name, args)
+            if op:
+                add(op, f"run by {name}", base)
+        elif name in ("source", "."):
+            add(args[0] if args else "", "sourced", base)
+        elif name in _SCRIPT_READERS:
+            ops = [a for a in args if not a.startswith("-")]
+            ops += [args[i + 1] for i, a in enumerate(args[:-1]) if a in ("-i", "--input")]
+            for op in ops:
+                add(op, f"read by {name}", base, check=True)
+        elif "/" in tokens[k] and os.path.dirname(tokens[k]) not in _SYSTEM_BIN_DIRS:
+            add(tokens[k], "run", base, check=True)
+    for m in itertools.islice(_SHELL_SCRIPT_NAME_RE.finditer(spelled), 20):
+        if time.monotonic() > deadline or len(found) >= SCRIPT_CONTEXT_MAX_FILES:
+            break
+        path = _evidence_path(m.group(0), base)
+        if path and os.path.isfile(path):
+            add(m.group(0), "named in the command", base)
+    return found[:SCRIPT_CONTEXT_MAX_FILES]
+
+
+def _private_file(path):
+    """True for a file whose text must not go to the judge: a sensitive_paths
+    entry, or the judge's own key file."""
+    real = os.path.realpath(path)
+    if real == os.path.realpath(LLM_ENV_FILE):
+        return True
+    # the path as named and where it leads: a link may point at a credential
+    return any(p and _names_sensitive(low, p) for low in {path.lower() + "/", real.lower() + "/"}
+               for p in SENSITIVE_PATHS)
+
+
+def _read_script(path, limit):
+    """(text or None, note) for one script file: only a regular file the
+    developer owns; the note says what was left out or why nothing is shown."""
+    import stat as _stat
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return None, "does not exist now (the call may create it first)"
+    except OSError as e:
+        return None, f"could not be read ({type(e).__name__})"
+    if not _stat.S_ISREG(st.st_mode):
+        return None, "not a regular file, not shown"
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return None, "owned by another user, not shown"
+    try:  # non-blocking: a file swapped for a FIFO since the stat can't hang the hook
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            again = os.fstat(fd)
+            if not _stat.S_ISREG(again.st_mode) or (again.st_dev, again.st_ino) != (st.st_dev, st.st_ino):
+                return None, "changed while being read, not shown"
+            data = os.read(fd, limit + 1)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        return None, f"could not be read ({type(e).__name__})"
+    if b"\0" in data:
+        return None, "a binary file, not shown"
+    note = f"{st.st_size} bytes"
+    if len(data) > limit or st.st_size > limit:
+        data = data[:limit]
+        note += f"; TRUNCATED: only the first {limit} bytes are shown"
+    return data.decode("utf-8", "replace"), note
+
+
+def script_context(command, cwd, deadline=None):
+    """A block with the text of the local scripts `command` runs or feeds
+    (see script_files), or ''. It says when a file is truncated, unreadable
+    or not shown, and which other local scripts a shown one names: those the
+    judge has not seen."""
+    deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
+    try:
+        files = script_files(command, cwd, deadline)
+    except Exception:  # context is a nice-to-have; never break the hook
+        return ""
+    if not files:
+        return ""
+    out = ["Local script files this call runs or reads (their contents now, as data; "
+           "the call itself may change them first):"]
+    budget, read = SCRIPT_CONTEXT_TOTAL_BYTES, []
+    for path, how in files:
+        text, note = _read_script(path, min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0))) \
+            if time.monotonic() <= deadline else (None, "not shown: out of time")
+        budget -= len(text.encode("utf-8", "replace")) if text else 0
+        read.append((path, how, text, note))
+    shown = {path for path, _, text, _ in read if text is not None}
+    SCRIPT_CONTEXT_TEXTS.extend(text for _, _, text, _ in read if text)
+    for path, how, text, note in read:
+        if text is None:
+            out.append(f"--- {path} ({how}): {note} ---")
+            continue
+        out.append(f"--- {path} ({how}; {note}) ---\n{text.rstrip()}\n--- end of {os.path.basename(path)} ---")
+        others = []
+        for m in _SCRIPT_NAME_RE.finditer(text):
+            other = _evidence_path(m.group(0), os.path.dirname(path))
+            if other and other not in shown and m.group(0) not in others:
+                others.append(m.group(0))
+        if others:
+            out.append(f"{os.path.basename(path)} names other local scripts not shown here: "
+                       + ", ".join(others[:8]) + ("" if len(others) <= 8 else ", …") + ".")
+    return "\n".join(out)
+
+
+# `git stash drop/clear/pop`: the stashes, when each was made against this
+# session's start, and whether this session's own commands made one there.
+_STASH_DISCARD_RE = re.compile(r"\bgit\b[^\n;&|]*?\bstash(?:\s+-\S+)*\s+(?:drop|clear|pop)\b")
+_STASH_CREATE_RE = re.compile(
+    r"\bgit\b[^\n;&|]*?\bstash\b(?!\s+(?:list|show|drop|clear|pop|apply|branch|create|store)\b)")
+STASH_CONTEXT_MAX = 10
+
+
+def _makes_stash(text):
+    """True when a command of `text` is `git … stash` that makes one: no
+    subcommand, `push` or `save` (not `echo git stash`, not `stash list`)."""
+    for words in _commands_words(text):
+        if os.path.basename(words[0]) != "git":
+            continue
+        i = 1
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else 1
+        if words[i:i + 1] != ["stash"]:
+            continue  # stash is git's subcommand, not a word after it (`git commit -m stash`)
+        rest = words[i + 1:]
+        sub = next((w for w in rest if not w.startswith("-")), None)
+        if sub in (None, "push", "save") or sub is not None and rest and rest[0].startswith("-") \
+                and sub not in _STASH_SUBCOMMANDS:
+            return True
+    return False
+
+
+_STASH_SUBCOMMANDS = frozenset({"list", "show", "drop", "clear", "pop", "apply", "branch",
+                                "create", "store", "push", "save"})
+
+
+def _stash_made_in(text, where, top):
+    """True when a stash-making `git stash` in Bash command `text` (run from
+    `where`) runs in repository `top`: where git runs is the last place the
+    command moved to by then (`cd X`, `git -C X`), named with certainty;
+    every directory named up to it must be in `top`."""
+    if not _makes_stash(text):  # parsed whole: not text inside quotes (`printf 'a; git stash'`)
+        return False
+    for m in _STASH_CREATE_RE.finditer(text):
+        end = re.compile(r"[^\n;&|]*").match(text, m.end()).end()
+        begin = max(text.rfind(c, 0, m.start()) for c in "\n;&|") + 1  # the whole command: not `echo git stash`
+        if not _makes_stash(text[begin:end]):
+            continue
+        dirs, certain = _git_command_dirs(text[:end], where)
+        # every place named up to it (`cd`, any `git -C`): which one this git
+        # runs in is not tracked, so all must be in the repository
+        if certain and dirs and all(_in_repo(os.path.realpath(d), top) for d in dirs):
+            return True
+    return False
+
+
+def _in_repo(path, top):
+    """True when folder `path` is `top` or inside it, with no nested
+    repository between them."""
+    if path == top:
+        return True
+    if not path.startswith(top + os.sep):
+        return False
+    while path != top:
+        if os.path.exists(os.path.join(path, ".git")):
+            return False
+        path = os.path.dirname(path)
+    return True
+
+
+def _session_stash_commands(input_data, repo, deadline):
+    """([(timestamp, command, outcome)] of this session's Bash calls that
+    run a stash-making `git stash` in `repo` (outcome: ok, failed, or no
+    result yet), whether every transcript was read whole)."""
+    top = os.path.realpath(repo)
+    current = input_data.get("tool_use_id")
+    hits, results, whole, read = [], {}, True, 0
+    for path in _session_transcripts(input_data):
+        if time.monotonic() > deadline or read > PROVENANCE_TOTAL_BYTES:
+            whole = False
+            break
+        try:
+            lines, size, cut = _tail_lines(path, PROVENANCE_TAIL_BYTES)
+        except OSError:
+            whole = False
+            continue
+        read += size
+        whole = whole and not cut
+        for line in lines:
+            result = '"tool_result"' in line
+            if not result and ("stash" not in line or '"Bash"' not in line):
+                continue
+            if time.monotonic() > deadline:
+                whole = False
+                break
+            try:
+                record = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(record, dict):
+                continue
+            if result:
+                content = (record.get("message") or {}).get("content") \
+                    if isinstance(record.get("message"), dict) else None
+                for block in content if isinstance(content, list) else []:
+                    if isinstance(block, dict) and block.get("type") == "tool_result" \
+                            and isinstance(block.get("tool_use_id"), str):
+                        results[block["tool_use_id"]] = "failed" if block.get("is_error") else "ok"
+                continue
+            where = record.get("cwd") if isinstance(record.get("cwd"), str) else None
+            for use_id, texts in _bash_inputs(record):
+                if use_id == current:
+                    continue
+                if where and any(_stash_made_in(text, where, top) for text in texts):
+                    hits.append((_ts_seconds(record.get("timestamp", "")), texts[0], use_id))
+    return [(ts, text, results.get(use_id, "no result yet") if isinstance(use_id, str)
+             else "no result yet") for ts, text, use_id in hits], whole
+
+
+def stash_context(command, cwd, input_data, deadline):
+    """Blocks on the stashes a `git stash drop/clear/pop` in `command` acts on."""
+    if not (isinstance(command, str) and _STASH_DISCARD_RE.search(command)):
+        return []
+    scan = min(deadline, time.monotonic() + PROVENANCE_BUDGET_S)  # transcripts: one slice in all
+    starts = [s for s in (_session_start(p) for p in _session_transcripts(input_data)[:2]
+                          if time.monotonic() <= scan) if s]
+    start = min(starts) if starts else None
+    parts = []
+    for repo in _git_context_dirs(command, cwd)[:2]:
+        top = (_git_probe(repo, ["rev-parse", "--show-toplevel"], deadline) or "").strip() or repo
+        listing = _git_probe(top, ["stash", "list", "--format=%gd%x09%ct%x09%gs"], deadline)
+        if listing is None:
+            continue
+        lines = listing.splitlines()
+        out = [f"Stashes in {top} (`git stash list`, newest first): {len(lines) or 'none'}"]
+        for line in lines[:STASH_CONTEXT_MAX]:
+            ref, _, rest = line.partition("\t")
+            ct, _, subject = rest.partition("\t")
+            when = ""
+            if ct.isdigit():
+                when = _local_time(int(ct), "%Y-%m-%d %H:%M")
+                if start:
+                    when += " (after this session started)" if int(ct) >= start \
+                        else " (before this session started)"
+            out.append(f"- {ref} {when}: {subject[:120]}")
+        if len(lines) > STASH_CONTEXT_MAX:
+            out.append(f"- … {len(lines) - STASH_CONTEXT_MAX} more")
+        if start:
+            out.append(f"This session started {_local_time(start, '%Y-%m-%d %H:%M')}.")
+        hits, whole = _session_stash_commands(input_data, top, scan)
+        if hits:
+            ts, text, outcome = hits[-1]
+            failed = sum(1 for h in hits if h[2] == "failed")
+            out.append(f"This session's own Bash calls ran a stash-making `git stash` there {len(hits)} "
+                       f"time(s)" + (f", {failed} of them failed" if failed else "") + "; the latest"
+                       + (f" at {_local_time(ts, '%m-%d %H:%M')}" if ts else "")
+                       + f" ({outcome}): `{' '.join(text.split())[:PROVENANCE_SNIPPET_CHARS]}`."
+                       " From the command text: a call that found nothing to stash made none.")
+        elif _session_transcripts(input_data):
+            out.append("This session's transcripts show no Bash call that ran a stash-making "
+                       "`git stash` there" + ("." if whole else " (not every transcript was read whole)."))
+        parts.append("\n".join(out))
+    return parts
+
+
+# /tmp: a folder there may be private (`/private/tmp/claude-<uid>`, 0700,
+# the developer's) or shared and world-writable. Say which.
+_TEMP_PATH_RE = re.compile(r"(?<![\w.-])(?:/private)?/tmp/[^\s'\"`;&|<>()$*?\[]+")
+
+
+def _temp_top(path):
+    """(the folder right under /tmp that `path` is in, its lstat), or None
+    when `path` is not under /tmp or that folder can't be read."""
+    m = re.match(r"(?:/private)?/tmp/([^/]+)", path or "")
+    if not m or m.group(1) in (".", ".."):
+        return None
+    top = os.path.join(os.path.realpath("/tmp"), m.group(1))
+    try:
+        return top, os.lstat(top)
+    except OSError:
+        return None
+
+
+def _temp_privacy(top, st):
+    """One sentence on who can write into `top`, a folder under /tmp."""
+    import stat as _stat
+    if _stat.S_ISLNK(st.st_mode):
+        return f"{top} is a symbolic link."
+    if not _stat.S_ISDIR(st.st_mode):
+        return None
+    mine = hasattr(os, "getuid") and st.st_uid == os.getuid()
+    mode = st.st_mode & 0o7777
+    owner = "the developer" if mine else f"another user (uid {st.st_uid})"
+    if mode & 0o002:
+        kind = "world-writable"
+    elif mine and not mode & 0o077:
+        kind = "private: no other user can read it or create or change anything in it"
+    elif mine and not mode & 0o022:
+        kind = "no other user can create or change anything in it"
+    else:
+        kind = "writable by its group" if mode & 0o020 else "not world-writable"
+    return f"{top} is a folder owned by {owner}, mode {mode:o} ({kind})."
+
+
+def _private_temp_entries(value):
+    """The private /tmp folder every entry of path list `value` is under
+    (`/private/tmp/claude-501`, the developer's, no group or other write), or
+    None."""
+    tops = set()
+    for entry in value.split(":"):
+        # where the entry really leads: `..` and links may leave the folder
+        real = os.path.realpath(entry) if entry.startswith(("/tmp/", "/private/tmp/")) else ""
+        found = _temp_top(real) if real else None
+        if not found or not real.startswith(found[0] + os.sep):
+            return None
+        top, st = found
+        import stat as _stat
+        if not (_stat.S_ISDIR(st.st_mode) and hasattr(os, "getuid") and st.st_uid == os.getuid()
+                and not st.st_mode & 0o022):
+            return None
+        tops.add(top)
+    return ", ".join(sorted(tops)) or None
+
+
+def temp_privacy_context(paths):
+    """A block on the folders under /tmp that `paths` are in, or ''."""
+    notes, seen = [], set()
+    for path in paths:
+        found = _temp_top(path)
+        if not found or found[0] in seen:
+            continue
+        seen.add(found[0])
+        note = _temp_privacy(*found)
+        if note:
+            notes.append(f"- {note}")
+        if len(notes) >= 3:
+            break
+    return "Folders under /tmp this call names:\n" + "\n".join(notes) if notes else ""
+
+
+def _mcp_context_notes(tool):
+    """The developer's mcp_context sentences for an MCP tool."""
+    notes = []
+    for pattern, sentence in MCP_CONTEXT.items():
+        if fnmatch(tool, pattern) and sentence not in notes:
+            notes.append(sentence)
+    return notes[:5]
+
+
+def _quietly(block, *args):
+    """block(*args), or None when it raises: a context block is evidence,
+    never a reason for the hook to fail."""
+    try:
+        return block(*args)
+    except Exception:
+        return None
+
+
 def build_llm_context(input_data):
     """Context block for the LLM from the hook input ('' when none)."""
     global LLM_CONTEXT_PROVENANCE
     LLM_CONTEXT_PROVENANCE = None
+    SCRIPT_CONTEXT_TEXTS.clear()
     if not isinstance(input_data, dict):
         return ""
     parts = []
@@ -2006,10 +2733,24 @@ def build_llm_context(input_data):
     absolute = isinstance(cwd, str) and os.path.isabs(cwd)
     targets = destructive_targets(command, cwd) if isinstance(command, str) else []
     provenance = []
+    if isinstance(tool, str) and tool.startswith("mcp__"):
+        notes = _mcp_context_notes(tool)
+        if notes:
+            parts.append("The developer's notes on this tool (mcp_context in their config):\n"
+                         + "\n".join(f"- {n}" for n in notes))
+    context_deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S  # scripts and git share it
+    if isinstance(command, str):
+        scripts = script_context(command, cwd, context_deadline)
+        parts.extend([scripts] if scripts else [])
+    temp_paths = _TEMP_PATH_RE.findall(command) if isinstance(command, str) else [
+        tool_input.get(k) for k in ("file_path", "notebook_path", "path")
+        if isinstance(tool_input.get(k), str)]
+    temp = _quietly(temp_privacy_context, temp_paths) if temp_paths else ""
+    parts.extend([temp] if temp else [])
     if targets or absolute and isinstance(command, str) \
             and (_GIT_DISCARD_HINT_RE.search(command) or _GIT_REMOTE_HINT_RE.search(command)):
         now = time.monotonic()
-        deadline = now + GIT_CONTEXT_BUDGET_S
+        deadline = context_deadline
         # Provenance first, in its own slice: slow git probes must not starve it.
         if targets:
             provenance, LLM_CONTEXT_PROVENANCE = session_provenance(
@@ -2020,9 +2761,18 @@ def build_llm_context(input_data):
             covered = {os.path.realpath(d) for d in _git_context_dirs(command, cwd)[:GIT_CONTEXT_MAX_DIRS]}
         if absolute and _GIT_REMOTE_HINT_RE.search(command):
             parts.extend(git_remote_context(command, cwd, deadline))
+        if absolute and _STASH_DISCARD_RE.search(command):
+            parts.extend(_quietly(stash_context, command, cwd, input_data, deadline) or [])
         if targets:
             parts.extend(loss_context(targets, covered, deadline))
     parts.extend(provenance)
+    agent = input_data.get("agent_transcript_path")
+    if isinstance(agent, str) and agent != input_data.get("transcript_path"):
+        brief = subagent_brief(agent)
+        if brief:
+            parts.append("This call comes from a subagent. The brief it works from (its first "
+                         "message, written by the agent that started it, not typed by the "
+                         f"developer):\n--- brief ---\n{brief}\n--- end of brief ---")
     messages = recent_user_messages(input_data.get("transcript_path"))
     if messages:
         parts.append("Developer's recent messages (oldest first):")
@@ -2033,6 +2783,15 @@ def build_llm_context(input_data):
 def llm_is_configured():
     """True if the LLM is fully configured (URL — defaulted for Anthropic —, key, model)."""
     return bool(LLM_API_KEY and LLM_API_URL and LLM_MODEL)
+
+
+def llm_not_configured_reason():
+    """Why there is no judge: what to set, where, and why the key file was
+    ignored, if it was."""
+    reason = ("LLM not configured — set SAFETY_HOOK_MODEL and SAFETY_HOOK_API_KEY "
+              "(+ SAFETY_HOOK_API_URL for OpenAI-compatible APIs) in the environment "
+              f"or in {LLM_ENV_FILE} (chmod 600)")
+    return reason + (f"; {LLM_ENV_FILE_NOTE}" if LLM_ENV_FILE_NOTE else "")
 
 
 def _normalize_flag_token(token):
@@ -2054,6 +2813,10 @@ _INTERPRETER_WRAPPERS = frozenset({
     # H3: xargs runs its trailing argument as a command, so a single-word-safe
     # `xargs` would let `xargs docker run` pass as xargs. Peel it to the inner command.
     "xargs",
+    # macOS: `sandbox-exec -f PROFILE cmd …` runs cmd in a sandbox, and
+    # `script -q FILE cmd …` runs cmd with its output recorded in FILE
+    # (judged as a write: _wrapper_written_files).
+    "sandbox-exec", "script",
 })
 
 
@@ -2086,6 +2849,110 @@ def _shlex_split_safe(cmd):
         return shlex.split(cmd, posix=True)
     except ValueError:
         return cmd.split()
+
+
+# `script` options (util-linux and BSD): those taking no value, and those
+# taking one, with what the value is: shell code, a file it writes, or other.
+_SCRIPT_BOOLS = frozenset("adefFhkpqrV")
+_SCRIPT_VALUES = {"c": "code", "E": None, "m": None, "o": None,
+                  "I": "file", "O": "file", "B": "file", "T": "file"}
+_SCRIPT_LONG = {"append": "", "return": "", "flush": "", "quiet": "", "help": "", "version": "",
+                "command": "code", "echo": None, "logging-format": None, "output-limit": None,
+                "log-in": "file", "log-out": "file", "log-io": "file", "log-timing": "file"}
+
+
+def _script_args(tokens):
+    """Read the words of `script …` (tokens[0] is script): a dict with
+      code     — (index, value) of util-linux's -c/--command, or None
+      files    — the files it writes (FILE, -O/-I/-B/-T, -tFILE; else
+                 `typescript`)
+      start    — index of BSD's command words (`script FILE cmd …`), or None
+      unknown  — the first option it does not know, or a FILE or option value
+                 built at run time; None when there is neither
+    util-linux permutes options: after FILE, a word starting with `-` is
+    another option, never a command (`script out.log -c CMD`)."""
+    out = {"code": None, "files": [], "start": None, "unknown": None}
+    positional = []
+
+    def built(words):
+        # a FILE or option value built at run time (`"$OUT"`, `"$@"`): which word
+        # is FILE, option or command, and what it writes, is not known until then
+        hit = next((w for w in words if re.search(r"[$`*?\[{]", w)), None)
+        out["unknown"] = out["unknown"] or hit
+
+    j = 1
+    while j < len(tokens):
+        t = tokens[j]
+        if t == "--":
+            if positional and out["code"] is None and j + 1 < len(tokens):
+                # util-linux `script FILE -- CMD ARG…` joins them with spaces and
+                # runs that as shell code
+                out["code"] = (j + 1, " ".join(tokens[j + 1:]))
+            elif positional or out["code"] is not None:
+                positional += tokens[j + 1:]
+                built(tokens[j + 1:])
+            else:  # `script -- X …`: X is BSD's FILE or util-linux's command
+                out["unknown"] = out["unknown"] or "--"
+                positional += tokens[j + 1:j + 2]
+            break
+        if not t.startswith("-") or t == "-":
+            positional.append(t)
+            built([t])
+            if out["code"] is None and j + 1 < len(tokens) and not tokens[j + 1].startswith("-"):
+                out["start"] = j + 1  # BSD: FILE, then the command
+                break
+            j += 1
+            continue
+        value_at, kind = None, None
+        if t.startswith("--"):
+            name, eq, val = t[2:].partition("=")
+            # GNU getopt takes any unique prefix (`--log-ou=F` is --log-out)
+            known = list(_SCRIPT_LONG) + ["timing"]
+            matches = [name] if name in known else [k for k in known if name and k.startswith(name)]
+            name = matches[0] if len(matches) == 1 else None
+            if name == "timing":  # optional value, attached only
+                kind, value_at = ("file", (j, val)) if eq else (None, None)
+            elif name is None:
+                out["unknown"] = out["unknown"] or t
+            elif _SCRIPT_LONG[name] != "":
+                kind = _SCRIPT_LONG[name]
+                if eq:
+                    value_at = (j, val)
+                else:
+                    j += 1
+                    value_at = (j, tokens[j]) if j < len(tokens) else None
+        else:
+            for k, c in enumerate(t[1:], 1):
+                if c in _SCRIPT_BOOLS:
+                    continue
+                if c == "t":  # util-linux -t[FILE] (attached only); BSD -t SECONDS
+                    rest = t[k + 1:]
+                    if rest:  # util-linux's FILE (digits too: BSD's interval, or a file)
+                        kind, value_at = "file", (j, rest)
+                    elif not rest and j + 1 < len(tokens) and re.fullmatch(r"\d+(?:\.\d+)?", tokens[j + 1]):
+                        j += 1  # BSD's interval; to util-linux, the output FILE
+                        out["files"].append(tokens[j])
+                    break
+                if c in _SCRIPT_VALUES:
+                    kind = _SCRIPT_VALUES[c]
+                    if t[k + 1:]:
+                        value_at = (j, t[k + 1:])
+                    else:
+                        j += 1
+                        value_at = (j, tokens[j]) if j < len(tokens) else None
+                    break
+                out["unknown"] = out["unknown"] or t
+                break
+        if value_at and kind == "code":
+            out["code"] = value_at
+        elif value_at:
+            built([value_at[1]])
+            out["files"] += [value_at[1]] if kind == "file" else []
+        j += 1
+    out["files"] += positional[:1] if out["start"] else positional
+    if not out["files"]:
+        out["files"].append("typescript")
+    return out
 
 
 @_memo
@@ -2126,6 +2993,18 @@ def _resolve_through_wrappers(cmd, _seen=None):
         return cmd
     if _seen is not None:  # every wrapper on the way, for _xargs_replace_risk
         _seen.append(tokens[start:])
+    if first == "script":
+        parsed = _script_args(tokens[start:])
+        if parsed["code"] is not None:
+            # it is shell code (`script -c 'a; b'`), run by the user's shell: read it as `sh -c`
+            value = parsed["code"][1]
+            return "sh -c " + shlex.quote(value) if value.strip() else cmd
+        if parsed["start"] is None:
+            return cmd  # no command: script runs a shell
+        inner = shlex.join(tokens[start + parsed["start"]:])
+        if os.path.basename(tokens[start + parsed["start"]]) in _INTERPRETER_WRAPPERS:
+            return _resolve_through_wrappers(inner, _seen)
+        return inner
 
     idx = start + 1
     # Skip wrapper-specific flags and positional arguments.
@@ -2194,6 +3073,9 @@ def _resolve_through_wrappers(cmd, _seen=None):
                 idx += 2
                 continue
             if first == "chrt" and tok in ("-p", "--pid"):
+                idx += 2
+                continue
+            if first == "sandbox-exec" and tok in ("-f", "-n", "-p", "-D"):
                 idx += 2
                 continue
             # xargs value-flags that consume the next token, so the real
@@ -2663,6 +3545,31 @@ def _flag_text(decision):
 
 def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
                  rule_reason=None):
+    """_llm_evaluate, with any script text the context showed the judge
+    scrubbed from the reason (it is logged, stored and shown)."""
+    decision, reason, info = _llm_evaluate(tool, tool_input, timeout, context, rule_reason)
+    return decision, scrub_script_text(reason), info
+
+
+def scrub_script_text(reason):
+    """`reason` with each quote of a script this call showed the judge (a
+    whole line, or a quoted span of 6+ characters) replaced by
+    `[script text]`: script contents never reach the decision log."""
+    if not SCRIPT_CONTEXT_TEXTS or not isinstance(reason, str):
+        return reason
+    spans = {line.strip() for text in SCRIPT_CONTEXT_TEXTS for line in text.splitlines()
+             if len(line.strip()) >= 8 and line.strip() in reason}
+    for m in re.finditer(r"`([^`]{6,})`|'([^']{6,})'|\"([^\"]{6,})\"", reason):
+        span = next(g for g in m.groups() if g)
+        if any(span in text for text in SCRIPT_CONTEXT_TEXTS):
+            spans.add(span)
+    for span in sorted(spans, key=len, reverse=True):
+        reason = reason.replace(span, "[script text]")
+    return reason
+
+
+def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
+                  rule_reason=None):
     """Call an LLM to evaluate a tool call that local rules couldn't decide.
 
     Returns (decision, reason, info). decision is "allow" or "ask" — the LLM
@@ -2686,7 +3593,7 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
     """
     if not llm_is_configured():
         return ("ask",
-                "LLM not configured — set SAFETY_HOOK_MODEL and SAFETY_HOOK_API_KEY (+ SAFETY_HOOK_API_URL for OpenAI-compatible APIs)",
+                llm_not_configured_reason(),
                 {"source": "llm", "llm_ms": None, "flagged": False})
 
     prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
@@ -3176,6 +4083,8 @@ def _writes_config(cmd):
     named = _references_always_ask_path(cmd)
     if named and _has_output_redirect(cmd) and _redirect_writes_config(cmd):
         return True
+    if named and any(map(_references_always_ask_path, _wrapper_written_files(cmd))):
+        return True  # `script -q ~/.claude/settings.json cmd`
     inner = _resolve_through_wrappers(cmd)
     first = get_first_command_word(inner) or get_first_command_word(cmd)
     name = os.path.basename(first) if first else ""
@@ -3833,6 +4742,9 @@ def _loop_values(args, cwd, variables, trust_pwd, empty_side=True, ifs=None, spl
         if words is None:
             return _TOO_MANY
         for bw in words:
+            if bw == "":  # a literal empty word (`for x in "" a`) is one empty pass
+                values[""] = None
+                continue
             # literal spaces were quoted
             splits = ("$" in bw or "`" in bw) and (split is None or w in split)
             passes = _expand_passes(bw, cwd, variables, trust_pwd, absolute=False,
@@ -4950,8 +5862,12 @@ def _protected_delete_check(command, cwd, empty_side, bash):
     # what it assigns or cd's to is then one possibility beside the old one.
     text = command.replace("\\\n", "")  # the splitter joins continued lines
     block_depth = paren_depth = loop_depth = 0
+    # Open `for NAME in …; do` loops: (block depth, {name: value before}).
+    # Inside its body a loop name holds one of the loop's values, never the
+    # one it had before; that one comes back beside them at the `done`.
+    loop_frames = []
     pos = 0
-    for segment in segments:
+    for seg_index, segment in enumerate(segments):
         start = text.find(segment, pos)
         found = start >= 0
         start = start if found else pos
@@ -5010,6 +5926,11 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                 loop_depth += words[0] != "case"
             elif words and (words[0] in ("fi", "done", "esac")
                             or words == ["end"] and loop_depth):  # zsh foreach … end
+                if words[0] == "done" and loop_frames and loop_frames[-1][0] == block_depth:
+                    restore = loop_frames.pop()[1]
+                    fold([dict(variables), dict(variables, **{
+                        n: os.environ.get(n) if v is _MISSING else v
+                        for n, v in restore.items()})])
                 block_depth = max(0, block_depth - 1)
                 loop_depth = max(0, loop_depth - (words[0] in ("done", "end")))
             maybe = segment_maybe or block_depth > 0 or repeated
@@ -5352,7 +6273,16 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                         vs[n] = values
                     if values is _TOO_MANY:  # the list's ${Z:=…} words went unread
                         _unfollowed_defaults(args, vs)
-                run(loop_step, maybe)
+                # A plain `for NAME in …` whose body follows as `do …`: the
+                # body sees only the loop's values (see loop_frames).
+                framed = name == "for" and "in" in args and len(names) == 1 \
+                    and not any(_MULTI_FIELD_RE.search(a) for a in args) \
+                    and seg_index + 1 < len(segments) \
+                    and re.match(r"\s*do(?:\s|$)", segments[seg_index + 1]) is not None
+                if framed:
+                    loop_frames.append((block_depth, {
+                        n: variables.get(n, _MISSING) for n in names}))
+                run(loop_step, maybe and not framed)
             elif name == "read":
                 def read_step(where, vs, args=args):
                     for a in args:
@@ -5692,9 +6622,160 @@ def _known_nonempty(command):
     through) saves a round trip."""
     if "$" not in command:
         return frozenset()
-    return frozenset(name for name in _fixed_constants(command) if not re.search(
+    return _prompting_shape_free(command, _fixed_constants(command))
+
+
+def _prompting_shape_free(command, names):
+    """`names` less those written as `$NAME/` before the end of a word, a
+    glob, another `$`, a `/` or a quote (see _known_nonempty)."""
+    return frozenset(name for name in names if not re.search(
         r"\$(?:\{%s\}|%s(?!\w))[\"']*\\?/(?:[*?\[{$/\"'`]|$|[\s;&|)<>])" % (name, name),
         command))
+
+
+_STEER_WRITE_RE = re.compile(
+    r"(?:^|[\s;&|(`{])(?:(?:export|local|declare|readonly|typeset)\s+(?:-\w+\s+)*)?"
+    r"([A-Za-z_]\w*)(?:\[[^\]\n]*\])?\+?=")
+_STEER_LOOP_HEAD_RE = re.compile(r"\b(?:for|foreach|select)((?:\s+[A-Za-z_]\w*)+)")
+_STEER_OPENERS = frozenset({"if", "while", "until", "for", "select", "case", "foreach", "repeat", "{"})
+_STEER_CLOSERS = frozenset({"fi", "done", "esac", "}", "end"})
+
+
+# An expansion that may make several words, the first of them empty, whatever
+# text follows it (`"$@"b` with arguments '' and a is '' and ab): `$@`, `$*`,
+# `${…[@]}`, `${!P@}`, and zsh's `$=X`, `$~X`, `$^X` and `${(…)X}` forms.
+_MULTI_FIELD_RE = re.compile(r"\$(?:[@*=~^]|\{[=~^(]|\{[#!]?[@*]|\{![^}]*[@*]\}|\{[^}]*\[[@*]\])")
+
+
+def _literal_remainder(raw):
+    """What is left of raw shell word `raw` with every expansion and a
+    leading `~`/`~user` taken out: (the literal text, without quotes;
+    whether any quote was left). Text left means the word is never empty.
+    ANSI-C and locale quoting (`$'\\0'`, `$"…"`) count as no text: what they
+    make is not what is written."""
+    if re.search(r"\$['\"]", raw):
+        return "", True
+    pieces, last = [], 0
+    for start, end, _kind, _body in _scan_expansions(raw):
+        pieces.append(raw[last:start])
+        last = end
+    pieces.append(raw[last:])
+    rest = re.sub(r"^~[\w.-]*", "", "".join(pieces))
+    return re.sub(r"[\"'\\]", "", rest), bool(re.search(r"[\"']", rest))
+
+
+def _steer_literal(raw):
+    """The literal text of raw word `raw` when it proves the value is never
+    empty, else "": none from an expansion that may make several words
+    (`"$@"b`) or a brace (`{,abc}`), and no blank in it (`S=' a'` splits off an empty first piece
+    where `$S` is unquoted)."""
+    if _MULTI_FIELD_RE.search(raw) or "{" in raw and ("," in raw or ".." in raw):
+        return ""  # a brace may make an empty word (`{,abc}`)
+    literal = _literal_remainder(raw)[0]
+    return "" if re.search(r"\s", literal) else literal
+
+
+def _steer_nonempty(command, segments):
+    """(names, loops) the empty-value steer may take as never empty, beyond
+    _known_nonempty's strict constants:
+
+      names    — a name set once, by a statement of assignments alone at the
+                 top level (after the start, `;` or a newline: not after
+                 `&&`/`||`, in no condition, loop, group, subshell or
+                 pipeline), to a value with literal text in it
+                 (`F=$E/v9/fit`, `B=~/x`), and read only after that;
+      loops[i] — for segment i, the names of the `for NAME in …; do` loops
+                 around it whose words each have literal text (`for v in a b`,
+                 `for p in /x/q*`, `for d in "$R"/*/`), written nowhere else.
+
+    Each name is read only as `$NAME`, `${NAME}` or `${NAME:?…}`.
+
+    Nothing counts when the command may set a variable some other way: a
+    setter builtin anywhere (read, eval, source, unset, declare, …), IFS,
+    or a command word built at run time other than `$NAME` for one of
+    `names` whose value holds a `/` (a program path: `$PY script.py`).
+    Heredoc bodies are free text: a body runs elsewhere or not at all."""
+    none = (frozenset(), [frozenset()] * len(segments))
+    if "IFS" in command:
+        return none
+    text = command.replace("\\\n", "")  # a line continuation joins words (`S\⏎=` is `S=`)
+    writes = collections.Counter(_STEER_WRITE_RE.findall(text))
+    heads = collections.Counter(n for head in _STEER_LOOP_HEAD_RE.findall(text)
+                                for n in itertools.takewhile(lambda w: w != "in", head.split()))
+    defaults = set(re.findall(r"\$\{([A-Za-z_]\w*)(?:::|:)?=", text))
+
+    def single(name, assigned, looped):
+        # read only as `$N`, `${N}` or `${N:?…}`: `${N:-}` and the like keep the steer
+        return writes[name] == assigned and heads[name] == looped and name not in defaults \
+            and name not in _SPECIAL_NAMES and not _SPECIAL_NAME_RE.fullmatch(name) \
+            and not re.search(r"\$\{[#!]?%s(?![\w}]|:\?)" % name, text)
+
+    candidates, loops, frames = {}, [], []
+    depth = paren = 0
+    pos = 0
+    for index, segment in enumerate(segments):
+        start = text.find(segment, pos)
+        if start < 0:
+            return none
+        before, after = text[pos:start], text[start + len(segment):].lstrip()
+        pos = start + len(segment)
+        paren += before.count("(") - before.count(")") + before.count("{") - before.count("}")
+        line = _heredoc_split(segment)[0]
+        raw = [w for _, w in _iter_word_starts(line)]
+        lead = 0
+        while lead < len(raw) and raw[lead] in ("do", "then", "else", "elif", "!", "time"):
+            lead += 1
+        first = raw[lead] if lead < len(raw) else ""
+        if first in _STEER_CLOSERS:
+            depth = max(0, depth - 1)
+            if first in ("done", "end") and frames:
+                frames.pop()
+        elif first in _STEER_OPENERS:
+            depth += 1
+            names = list(itertools.takewhile(
+                lambda w: w != "in" and re.fullmatch(r"[A-Za-z_]\w*", w), raw[lead + 1:]))
+            items = raw[lead + 1 + len(names):]
+            framed = first in ("for", "select", "foreach", "while", "until", "repeat")
+            if framed:
+                # one name: zsh's `for X Y in a b c` leaves Y empty on the last pass
+                ok = first == "for" and len(names) == 1 and items[:1] == ["in"] and len(items) > 1 \
+                    and index + 1 < len(segments) \
+                    and re.match(r"\s*do(?:\s|$)", segments[index + 1]) is not None \
+                    and all(_steer_literal(w) for w in items[1:])
+                frames.append(frozenset(n for n in names if single(n, 0, 1)) if ok else frozenset())
+        elif lead == 0 and raw and depth == paren == 0 and not frames \
+                and not before.strip(" \t;\n") \
+                and not re.match(r"(?:\|(?!\|)|&(?!&))", after):
+            words = raw[1:] if raw[0] == "export" else raw
+            # a failed redirection may leave the name unset (zsh `S=x >/no/dir/f`)
+            if words and all(_ASSIGNMENT_RE.match(w) for w in words) and not re.search(r"[<>]", line):
+                for w in words:
+                    name, value = w.split("=", 1)
+                    literal = _steer_literal(value)
+                    if literal and not value.startswith("(") and name not in candidates:
+                        candidates[name] = (pos, literal)
+        loops.append(frozenset().union(*frames))
+    names = {}
+    for name, (end, literal) in candidates.items():
+        if single(name, 1, 0) and all(
+                m.start() >= end for m in re.finditer(
+                    r"\$(?:\{[#!]?%s(?!\w)|%s(?!\w))" % (name, name), text)):
+            names[name] = literal
+    for part in _iter_commands(command):
+        if part is None:
+            return none
+        words = _command_line(part)[0]
+        # `export K="$(…)"` sets K, which the counts above see; only a name
+        # or option built at run time (`export $X`) may set another
+        if _sets_variables(part) and not (words[:1] == ["export"] and words[1:] and all(
+                _ASSIGNMENT_RE.match(w) for w in words[1:])):
+            return none
+        if words and re.search(r"[$`]", words[0]):
+            # a path (`$P/pip`, or `$PY` set to one) runs a program, not a builtin
+            m = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", words[0])
+            if "/" not in (names.get(m.group(1), "") if m else _literal_remainder(words[0])[0]):
+                return none
+    return frozenset(names), loops
 
 
 def _classify_target(word, bound, trust_pwd=True, known=frozenset()):
@@ -5872,10 +6953,10 @@ def unguarded_delete_check(command):
     segments, uncertain = split_compound_command(command)
     if uncertain or not segments:
         segments = [command]
-    bound = known = None
+    bound = known = loops = None
     dot_vars = None
     trust_pwd = not _PWD_REDEFINED_RE.search(command)
-    for segment in segments:
+    for seg_index, segment in enumerate(segments):
         for words in _simple_commands(_shell_words(_mask_literals(segment))):
             while words and words[0] in _SEGMENT_KEYWORDS:
                 words = words[1:]
@@ -5894,8 +6975,10 @@ def unguarded_delete_check(command):
                 if bound is None:
                     bound = _bound_names(command)
                     dot_vars = _dot_entry_vars(command)
-                    known = _known_nonempty(command)
-                unguarded, unguardable, components = _classify_target(t, bound, trust_pwd, known)
+                    names, loops = _steer_nonempty(command, segments)
+                    known = _known_nonempty(command) | _prompting_shape_free(command, names)
+                here = known | _prompting_shape_free(command, loops[seg_index])
+                unguarded, unguardable, components = _classify_target(t, bound, trust_pwd, here)
                 shown_t = t.translate(_UNMASK)
                 dotted = sorted(components & dot_vars)
                 if dotted:
@@ -6286,6 +7369,10 @@ def _env_hazard(command):
                     or inert and all(inert.fullmatch(w.replace("_", "-")) for w in value.split())):
                 what = "load code from outside the working folder" if m.group(2) else "run other code"
                 where = f", run elsewhere by {moved}" if m.group(2) and moved else ""
+                private = m.group(2) and _private_temp_entries(value)
+                if private:  # not the shared /tmp: the developer's own, no one else writes there
+                    where += (f"; every entry is under {private}, owned by the developer, with no "
+                              "group or other write: not world-writable")
                 return f"Sets {name} to {what} ({' '.join(value.split())[:60]}{where})"
     return None
 
@@ -6999,6 +8086,19 @@ def _peel_words(words):
     return k, tokens
 
 
+def _script_c_code(words):
+    """(CODE, literal) for the command string of a `script … -c CODE` in
+    `words` (raw words), or None."""
+    plain = [_unquote_word(w) for w in words]
+    for i, u in enumerate(plain):
+        if os.path.basename(u) == "script":
+            code = _script_args(plain[i:])["code"]
+            if code is None:
+                return None
+            return code[1], all(map(_raw_is_literal, words[i + code[0]:]))
+    return None
+
+
 def _shell_fed(part):
     """How the shell that `part` runs gets its code, or None if it runs no
     shell. A tuple (kind, shell, code, literal, hazard, init):
@@ -7014,6 +8114,9 @@ def _shell_fed(part):
     if peeled is None:
         tokens = _shlex_split_safe(_resolve_through_wrappers(" ".join(words)))
         if tokens and os.path.basename(tokens[0]) in _SHELL_NAMES:
+            code = _script_c_code(words)
+            if code and tokens == ["sh", "-c", code[0]]:  # `script -c CODE`: a shell runs CODE
+                return ("c", "sh", code[0], code[1], hazard, [])
             return ("unknown", os.path.basename(tokens[0]), None, False, True, [])
         return None
     k, tokens = peeled
@@ -8397,6 +9500,17 @@ def _wrapper_chain(cmd):
     return seen
 
 
+def _wrapper_written_files(cmd):
+    """The files a wrapper in `cmd` writes besides what its command does:
+    `script` records the session in FILE (default `typescript`) and in the
+    util-linux logs it names (`--log-out=F`, `-O F`, `-tF`, …)."""
+    files = []
+    for tokens in _wrapper_chain(cmd):
+        if os.path.basename(tokens[0]) == "script":
+            files += _script_args(tokens)["files"]
+    return files
+
+
 def _xargs_replace_risk(cmd):
     """Why `cmd` runs xargs with a replace string, or None: xargs then puts
     its input in place of words of the command, the subcommand too
@@ -8439,6 +9553,7 @@ _WRAPPER_FLAGS = {
               "--reset-on-fork"}, {"-p", "--pid"}, None),
     "setsid": ({"-c", "-f", "-w", "--ctty", "--fork", "--wait"}, set(), None),
     "unbuffer": ({"-p"}, set(), None),
+    "sandbox-exec": (set(), {"-f", "-n", "-p", "-D"}, None),
     "xargs": ({"-0", "-r", "-t", "-p", "-x", "-o", "--null", "--no-run-if-empty", "--verbose",
                "--interactive", "--exit", "--open-tty"}, _XARGS_VALUE_OPTS,
               r"-[IJnLPsaEdiRSl].*|--(max-args|max-procs|max-chars|arg-file|delimiter|replace|eof|max-lines)(=.*)?"),
@@ -8461,6 +9576,11 @@ def _wrapper_doubt(cmd):
         if "/" in tokens[0] and os.path.dirname(tokens[0]) not in _SYSTEM_BIN_DIRS:
             return f"program named like a wrapper: {tokens[0]} (what it runs is uncertain)"
         name = os.path.basename(tokens[0])
+        if name == "script":
+            unknown = _script_args(tokens)["unknown"]
+            if unknown:
+                return f"wrapper option {name} {unknown} (what it runs is uncertain)"
+            continue
         bools, values, attached = _WRAPPER_FLAGS.get(name, (set(), set(), None))
         j = 1
         while j < len(tokens):
@@ -8666,7 +9786,7 @@ def _risky_operation(cmd):
     reason = reason or _built_word_risk(cmd)
     if reason:
         return ("ask", f"Risky {reason} — LLM review")
-    for path in targets + _written_operands(name, args):
+    for path in targets + _written_operands(name, args) + _wrapper_written_files(cmd):
         # each word a brace makes of it (`~/.z{s,s}hrc`)
         paths = _brace_expand(path)
         if paths is None:
@@ -8677,7 +9797,9 @@ def _risky_operation(cmd):
             if os.path.basename(full.rstrip("/")) in _STARTUP_FILES \
                     or "Library/LaunchAgents" in full or "Library/LaunchDaemons" in full:
                 return ("ask", f"Risky write to a shell startup file or launch agent: {path} — LLM review")
-    for word in words + targets + reads:
+    # a wrapper's own words too: `sandbox-exec -f PROFILE` reads PROFILE
+    wrapped = [w for tokens in _wrapper_chain(cmd) for w in tokens[1:]]
+    for word in words + targets + reads + wrapped:
         hit = _sensitive_operand(word)
         if hit:
             return ("ask", f"Risky use of a sensitive path ({hit}) — LLM review")
