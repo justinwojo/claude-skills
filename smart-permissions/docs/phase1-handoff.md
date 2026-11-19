@@ -75,7 +75,7 @@ Phase 1 plus the council amendments. Phase 1 changes evidence and rules only. No
      - `$'…'` and `$"…"` give no literal text.
    - Loop frames in `_protected_delete_check` fix the nested-loop "protected folder ~" false deny. They
      apply only to one-name loops with no multi-field word. A `""` loop word counts as empty.
-   - `sandbox-exec` and `script` are wrappers.
+   - `sandbox-exec` and `script` are wrappers. (Phase 1b dropped `script`; see below.)
      - `_script_args(tokens)` reads `script` options for util-linux and BSD, util-linux options in any order.
      - `-c CODE` resolves to `sh -c CODE`, and so does `FILE -- WORD…`, which util-linux joins with spaces
        into shell code.
@@ -119,7 +119,6 @@ Tests: `test_phase1_evidence_and_rule_fixes` in tests/test_hooks.py, including t
 - `_temp_top` / `_temp_privacy` / `_private_temp_entries` for /tmp facts.
 - `MCP_CONTEXT` and `_mcp_context_notes(tool)`.
 - `_llm_setting(key)`, `LLM_ENV_FILE` and `LLM_ENV_FILE_NOTE`.
-- `_script_args(tokens)` for anything else that must read `script`'s words.
 
 ## Open questions for Phase 2
 
@@ -149,3 +148,88 @@ Tests: `test_phase1_evidence_and_rule_fixes` in tests/test_hooks.py, including t
   the next line) denies.
 - Field splitting through an *expansion* inside an assigned value (`S="$X"a` with a blank `X`, used
   unquoted) is not modelled by the steer. The `${S:?}` rewrite the steer asks for doesn't guard it either.
+
+# Phase 1b (smart-permissions 1.6.0): fewer judge calls
+
+Same branch. Rules and evidence only; no verdict policy changed. Nothing new is allowed that the
+historical logs show as a non-allow (replay gate below).
+
+## What landed
+
+- **a. Python heredocs.** `_interpreter_stdin_verdict(part, command)` lets a `python`/`python3` part through
+  to the AST check only when its flags are plain (no `-X`/`-W`), it reads `-` or nothing, its one stdin
+  is one complete heredoc with a quoted delimiter (`_quoted_heredoc_code`), nothing pipes into it
+  (`_piped_into`), and `_python_heredoc_ok` passes: no hijack env, no non-UTF-8 coding cookie, the header
+  found once in the original command, and the real body (from the command text, not the splitter's
+  part) equal to the part's body with `#` lines dropped.
+- **a. Stricter AST check** for heredocs and `-c` alike (`_safe_python_code`): calls must be safe
+  builtins, names bound in the code, or methods; `.replace` only with 2–3 plain positional args on a
+  non-module receiver; `open` only read-mode with a path `_py_string_resolver` can resolve (literals,
+  names bound once, loops over literal lists, f-strings and `+`), each candidate passing the native Read
+  sensitive check (`_python_read_ok`). Relative paths resolve against every `cd` target and need certainty
+  (`_py_candidate_paths`). Shell constants (`S=/abs; python3 -c "open('$S/x')"`) and `$HOME` are
+  substituted first (`_code_with_constants`).
+- **Comment heredoc.** A `<<` after an unquoted `#` (`_commented_heredoc`) opened a heredoc in our parser
+  but not in the shell, hiding the following lines as data. It is now a judge ask (not human-required).
+  This was allowed on 1.5.0 too.
+- **c. Conditional bindings.** `_conditional_alternatives(part, command)` returns the bound and unset
+  alternatives for a name assigned at the end of an and-chain (`_command_constants(conditional=True)`);
+  each is judged by the rules and every one must allow. Refused when the name is in `os.environ`.
+- **d. CLI reads.** `_glab_risk`, `_terraform_risk`, `docker compose exec/run` in `_docker_risk`, new exact
+  `az`/`glab` entries in defaults.json, `_MAX_COMMAND_WORDS` 4 → 5, and the az credential pattern
+  extended (`appsettings`, `list-publishing-profiles`, `password`).
+- **e. Decision log.** Records carry `v` (`HOOK_VERSION`), `input_len`, `truncated`; files are 0600;
+  `_append_log_line` rotates under a non-blocking flock with a size re-check. Opt-in
+  `decision_log_full_input` (64 KB, `_redact_secrets`, `redacted`/`incomplete` flags).
+- **f. Learner.** Every exit logs a `rule_reason`; the built-in `AskUserQuestion` (exact name) logs an ask
+  and exits without the judge.
+- **g. C9 needs a write.** `_writes_config(cmd, relieve)` relieves a Python part whose code passes
+  `_python_writes_no_config` (a full write scan: write modes, os/shutil/pathlib writers, modules whose
+  writes can't be seen); an unproven Python part naming a config path still prompts. `_heredoc_views`
+  attaches heredoc bodies to their header part. Redirect targets are checked by realpath
+  (`_redirect_reaches_config`), so a link into a config file prompts.
+- **h.** `live_hook_note(tool_input)` tells the judge which copy of the guard is live when a call names
+  hook files.
+- **i.** `script` is no longer a wrapper; `_script_args` and its tests are gone. `script` stays in
+  `_FILE_WRITER_COMMANDS`.
+
+Replay gate: 41,596 distinct complete inputs from the historical logs replayed against 1.5.0 and 1.6.0
+rules (see the 1.6.0 commit message for the counts). Tests: `test_phase1b_fewer_judge_calls`. Eval
+case E09 (patching the guard in a worktree); `llm_eval.py` now adds `live_hook_note` to the context.
+
+## Interfaces
+
+- `HOOK_VERSION`.
+- `_safe_python_code(code) -> bool` (the strict read-only subset) and
+  `_python_writes_no_config(code) -> bool` (the C9 write scan). A Phase 2 "Python writes to safe paths"
+  rule would start from the second, not the first.
+- `_py_string_resolver(tree)` and `_py_candidate_paths(path)` for static path facts.
+- `_conditional_alternatives(part, command) -> (bound, unset) | None`.
+- `_append_log_line(path, line, max_bytes)` for any new log.
+- `live_hook_note(tool_input) -> str`.
+
+## Open questions
+
+- A name read but never assigned in the command is assumed to come from the environment, which the
+  hook can see (`os.environ`); a value set later by a sourced file is not modelled.
+- `split_compound_command` drops every line starting with `#`, heredoc bodies included. The heredoc path
+  works around it (`_comment_lines_dropped`, the real-body check), and `_cd_in_scope` now uses the same
+  view. Fixing the splitter itself would touch every rule.
+- `_command_constants` refuses any command containing `<<`, so `S=/abs; python3 - <<'E'` with `$S` in a
+  quoted body can't use constants (a quoted body doesn't expand anyway) and `$PY - <<'E'` stays with the
+  judge (8 log cases).
+- The comment-heredoc ask is new; a legitimate `# … <<` in a comment now reaches the judge.
+- Dynamic reads (`open(f)` over a computed list, `open(sys.argv[1])`) still go to the judge; they are the
+  largest remaining inline-Python group.
+- The Python read check resolves links as they are before the command runs. An earlier part of the same
+  command can make a link (`cp -P a x; python3 … open('x')`). Bash readers are weaker still: `cat LINK`
+  of a link to a sensitive file is a rules allow (the sensitive-path check is textual for Bash). A
+  link-aware check for Bash readers would close both.
+- `_py_module_attr_unsafe` / `_py_chain_is_module` look re-exports and submodules up in the hook's own
+  interpreter (importing allowlisted stdlib modules); a different `python3` on PATH may export other
+  names. `_SAFE_PY_SUBMODULES` lists the data-only submodules allowed through a chain.
+- `_py_rebound_names(tree)` is shared by the strict checker and the C9 scan; it must stay importable on
+  Python 3.9 (match and type-parameter nodes are looked up with getattr).
+- glab placeholders other than `:id` go to the judge; docker's own global options are parsed before
+  `compose` (`_DOCKER_VALUE_OPTS`, `_DOCKER_FLAGS`).
+- A relative `./script` (a link to the utility) is trusted like any project script.

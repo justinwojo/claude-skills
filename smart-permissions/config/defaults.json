@@ -19,6 +19,7 @@
     "dart run *", "dart compile *", "dart doc *", "dart --version",
 
     "__ Infrastructure tools (destructive subcommands prompt) __",
+    "__ output -raw/-json, show -json and console print sensitive values: risky, LLM review __",
     "terraform init", "terraform plan", "terraform validate",
     "terraform fmt *", "terraform show *", "terraform output *",
     "terraform state list *", "terraform state show *",
@@ -73,7 +74,7 @@
     "cargo fmt *", "cargo tree *", "cargo metadata",
     "cargo generate-lockfile", "cargo verify-project",
 
-    "__ Docker (run/exec/push prompt) __",
+    "__ Docker (run/exec/push prompt; so do compose exec/run, a risky operation) __",
     "docker build *", "docker compose *", "docker-compose *",
     "docker ps *", "docker images *", "docker image *",
     "docker logs *", "docker inspect *", "docker info",
@@ -101,13 +102,14 @@
     "gh search *", "gh browse *", "gh gist view *", "gh gist list *",
     "gh status", "gh label list *", "gh config *",
 
-    "__ GitLab CLI (read-only auto-allowed; glab api / mr create / merge prompt) __",
+    "__ GitLab CLI (read-only auto-allowed; mr create / merge prompt; glab api only as one __",
+    "__ literal GET with no field, header or input: anything else is risky, LLM review) __",
     "glab ci list", "glab ci view", "glab ci trace", "glab ci status",
     "glab ci get", "glab ci lint",
     "glab mr list", "glab mr view", "glab mr diff", "glab mr checkout",
     "glab issue list", "glab issue view",
     "glab repo view", "glab repo clone", "glab release list", "glab release view",
-    "glab auth status", "glab version",
+    "glab auth status", "glab version", "glab --version", "glab api",
 
     "__ Azure CLI — read-only verbs only. `*` in the middle matches exactly one __",
     "__ word, and only before any flag (`az group delete -n show` ≠ `az * show`). __",
@@ -118,6 +120,11 @@
     "az account show", "az account list", "az version",
     "az monitor log-analytics query", "az monitor metrics list",
     "az monitor activity-log list", "az graph query",
+    "az monitor log-analytics workspace list", "az monitor log-analytics workspace show",
+    "az cognitiveservices account deployment list", "az cognitiveservices account deployment show",
+    "az cognitiveservices account list-models", "az ad app owner list",
+    "az acr manifest list-metadata", "az acr repository show-tags",
+    "az containerapp ingress traffic show",
 
     "__ uv (project-local; `uv run` executes arbitrary code so only linters/tests) __",
     "uv sync", "uv lock", "uv tree", "uv version", "uv --version",
@@ -339,7 +346,7 @@
     "__ download-and-execute chain: curl/wget then run interpreter on a temp file __",
     "\\b(curl|wget)\\b[^|&;]*[;&|]+[^|&;]*\\b(bash|sh|zsh|python[0-9.]*|node|ruby|perl|deno|osascript)\\s+(/private)?/(tmp|var/folders)/",
     "__ Azure CLI reads that return credentials (the `az * show/list` safe entries would allow them) __",
-    "\\baz\\s+(\\S+\\s+){0,4}?(keys?|secrets?|credentials?|admin-key|query-key|api-key|list-keys|list-secrets|show-connection-string|connection-string|get-access-token|list-publishing-credentials|list-credentials)\\b",
+    "\\baz\\s+(\\S+\\s+){0,4}?(keys?|secrets?|credentials?|admin-key|query-key|api-key|list-keys|list-secrets|show-connection-string|connection-string|get-access-token|list-publishing-credentials|list-credentials|appsettings|list-publishing-profiles|passwords?)\\b",
     "\\baz\\b[^|;&\\n]*--(show|include)-(secrets|values|keys)\\b"
   ],
 

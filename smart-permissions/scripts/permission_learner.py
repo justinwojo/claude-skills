@@ -44,6 +44,7 @@ from pretool_safety import (  # noqa: E402
     build_llm_context,
     llm_evaluate,
     llm_is_configured,
+    llm_not_configured_reason,
     _flag_get,
     log_decision,
     parse_hook_payload,
@@ -80,7 +81,8 @@ def main():
     except Exception as e:
         try:
             log_decision("permission_request", "", {}, "ask", "learner",
-                         f"smart-permissions could not evaluate this call ({type(e).__name__})")
+                         f"smart-permissions could not evaluate this call ({type(e).__name__})",
+                         rule_reason="hook error")
         except Exception:
             pass
         sys.exit(0)
@@ -93,7 +95,8 @@ def _main():
     except json.JSONDecodeError:
         # Can't parse — let the normal prompt show, but still record it.
         log_decision("permission_request", "", {}, "ask", "learner",
-                     "Could not parse hook input", duration_ms=_elapsed_ms(start))
+                     "Could not parse hook input", duration_ms=_elapsed_ms(start),
+                     rule_reason="malformed hook input")
         sys.exit(0)
 
     if not isinstance(input_data, dict):
@@ -102,11 +105,19 @@ def _main():
     tool, tool_input = parse_hook_payload(input_data)
 
     set_hook_cwd(input_data)
+    # The built-in question tool (this exact name; an MCP tool ending in
+    # it is an ordinary tool): its prompt is the question itself, so no
+    # decision and no judge
+    if tool == "AskUserQuestion":
+        log_decision("permission_request", tool, tool_input, "ask", "learner",
+                     "AskUserQuestion is answered by the human", duration_ms=_elapsed_ms(start),
+                     rule_reason="built-in question tool")
+        sys.exit(0)
     verdict, reason = classify_request(tool, tool_input)
 
     if verdict == "deny":
         log_decision("permission_request", tool, tool_input, "deny", "learner",
-                     reason, duration_ms=_elapsed_ms(start))
+                     reason, duration_ms=_elapsed_ms(start), rule_reason=reason)
         # The reason says what to do instead (a steer's rewrite, or the
         # alternative to a blocked pattern), as PreToolUse shows it.
         _emit_deny(reason)
@@ -116,7 +127,8 @@ def _main():
     # without an LLM every call the rules could not settle goes to the human.
     if verdict == "ask" or not llm_is_configured():
         log_decision("permission_request", tool, tool_input, "ask", "learner",
-                     reason, duration_ms=_elapsed_ms(start))
+                     reason if verdict == "ask" else llm_not_configured_reason(),
+                     duration_ms=_elapsed_ms(start), rule_reason=reason)
         sys.exit(0)
 
     # verdict == "consult": lean on the LLM, human as last resort.
@@ -125,7 +137,7 @@ def _main():
     flagged = _flag_get(tool, tool_input)
     if flagged:
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
-                     flagged, duration_ms=_elapsed_ms(start))
+                     flagged, duration_ms=_elapsed_ms(start), rule_reason=reason)
         sys.exit(0)
     decision, llm_reason, info = llm_evaluate(
         tool, tool_input, timeout=15, context=build_llm_context(input_data),

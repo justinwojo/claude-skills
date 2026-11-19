@@ -271,6 +271,12 @@ def _build_context(p, case, tmpdir):
     if case.get("mcp_context"):  # the tool's name picks the notes; no probes run for MCP calls
         payload.update(tool_name=case["tool"], tool_input=case["input"])
     context = p.build_llm_context(payload)
+    # The hook's note on which copy of the guard is live (a pure function of
+    # the input, so no probes run for it); the payload above carries the
+    # input only for MCP cases, where build_llm_context already added it
+    live = p.live_hook_note(case["input"]) if hasattr(p, "live_hook_note") else ""
+    if live and live not in context:
+        context = f"{context}\n{live}" if context else live
     # What the hook would compute from a real repository (worktree note, git status).
     before = case.get("context_before")
     return f"{before}\n{context}" if before else context
