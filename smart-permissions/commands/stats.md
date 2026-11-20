@@ -33,7 +33,8 @@ Read the JSONL (one JSON object per line). Each record has these fields:
 | `tool` | tool name (`Bash`, `Write`, `WebFetch`, `mcp__…`, …) |
 | `input` | the tool input (command / path / url), truncated to 500 chars for an allow and 8000 for an ask or deny |
 | `decision` | `allow`, `deny`, or `ask` |
-| `source` | `rule`, `llm`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules); `llm-cache` in logs from versions that cached LLM allows |
+| `source` | `rule`, `llm`, `llm-recheck`, or `learner` (the PermissionRequest hook's own rules); with holds on, `llm-hold` (a call held as a question for the agent) and `hold-retry` (its retry); `llm-cache` in logs from versions that cached LLM allows |
+| `hold` | With holds on: `held`, `cleared` or `asked` for a hold and its retry, `not held: …` for a flag that went to the developer, `remote-exec` for a remote-execution ask |
 | `reason` | human-readable decision reason |
 | `duration_ms` | hook wall-clock time (optional) |
 | `llm_ms` | LLM round-trip time, when an LLM was called (optional) |
@@ -82,7 +83,8 @@ PY
 Show the user:
 
 1. **Totals** — decisions by outcome (allow/deny/ask) and by source
-   (rule / llm / llm-recheck / learner; `llm-cache` only in older logs).
+   (rule / llm / llm-recheck / learner, plus llm-hold / hold-retry with holds
+   on; `llm-cache` only in older logs).
 2. **What's prompting most** — the most frequent `ask` inputs. These are good
    candidates to add to `safe_commands` (or configure LLM evaluation for).
 3. **What's being denied** — the most frequent `deny` inputs, so the user can

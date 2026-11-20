@@ -50,7 +50,12 @@ Tool call
   │  Known-safe command/subcommand?                 ──→  ALLOW         │
   │  MCP tool in safe list? (glob patterns)         ──→  ALLOW         │
   │  Otherwise (unknown)                            ──→  LLM eval      │
-  │  LLM flagged it and the recheck confirmed       ──→  ASK (human)   │
+  │  Remote/prod exec (kubectl exec, az … exec)     ──→  LLM, strict   │
+  │  LLM flagged it and the recheck confirmed:                         │
+  │    the agent can settle it                      ──→  HOLD (deny +  │
+  │                                                      a question)   │
+  │    retried with an answer the judge accepts     ──→  ALLOW         │
+  │    the developer's call, or flagged again       ──→  ASK (human)   │
   └───────────────────────────────────────────────────────────────────┘
                           │ still undecided ("ask")
                           ▼
@@ -175,10 +180,84 @@ upload needs explicit authorization.
   emits an explicit `ask`, so you decide — even in auto mode, where a silent
   fall-through would go to Claude's classifier instead. The PermissionRequest
   hook that fires for that prompt leaves it to you rather than asking the LLM a
-  third time. If the recheck can't run in time, the call falls through to the
-  normal prompt path.
+  third time. If the recheck can't run in time, errors or gives no verdict,
+  the first flag stands and the hook asks you explicitly.
 - **No LLM hard denies.** Only the local rules deny outright: the
-  dangerous patterns and the protected-delete guard below.
+  dangerous patterns and the protected-delete guard below. A hold (next
+  section) is a deny in form only: a question for the agent, not a refusal.
+
+### Holds: the agent answers first
+
+A flag the agent can settle is put to the agent before it reaches you (on
+by default; `"holds": false` turns it off). The judge's verdict says who can
+settle it (`resolver`: `agent` or `developer`) and what to ask (`question`).
+When both
+passes flag a call and the agent can settle it, the PreToolUse hook denies
+the call with a question instead of prompting you:
+
+> Held by smart-permissions (a question, not a refusal): the judge flagged it
+> (category 1: …). Are those commits pushed anywhere? Write your answer as a
+> message first, with the evidence (what you checked and what it showed; only
+> text written after this hold is read), then retry the identical call; if
+> you can't vouch for it, ask the developer.
+
+The agent checks, writes its answer, and retries the same call. On that retry
+the judge (one pass, at the recheck effort, with the evidence gathered again)
+sees the hold and the agent's answer: the assistant text the acting agent
+wrote to its own transcript since the hold, and the thinking the transcript
+keeps (agents often settle the question there and retry with no visible
+message); a subagent's answer is read from the subagent's transcript, never
+the lead's; 3000 characters at most, tool input and harness notices left
+out. The answer is a claim, not your approval: the judge clears the call when
+it is specific, about this call's own targets and payload, contradicted by
+nothing in the evidence or your messages, and settles the flag. Otherwise the call comes to you, with the hold reason in
+the hook's words and the agent's answer labelled as its claim, not verified.
+
+- **What is never held.** Category 2 (making things public) and 5 (lasting
+  security weakening), destroying cloud, production or remote resources or
+  data (`az … delete`/`purge`, `kubectl delete`, `terraform destroy`, `gh api
+  -X DELETE`, …), sending secrets off the machine (a category 3 flag on a call
+  that sends anything out), a refused or malformed verdict, a verdict that does
+  not name the agent as the one who can settle it or gives no category, and
+  remote execution (below). These come to you directly.
+- **One hold per call.** A hold is bound to the session, the acting agent, the
+  working directory, the tool and its input (a Bash `description` is left out,
+  so a cosmetic edit keeps the hold); a changed command is judged afresh. It
+  lasts 15 minutes. A retry with no answer, a second flag, or a flag on a call
+  already held once comes to you. A session gets at most 4 holds in 15 minutes;
+  past that, flags come to you.
+- **Your prompt stays yours.** When a retry comes to you, the PermissionRequest
+  hook leaves the prompt to you, as it does for every explicit ask.
+- **Off.** With `"holds": false` a confirmed flag is an explicit ask, as in
+  1.6.0.
+
+The holds live in `~/.claude/hooks/smart-permissions-holds/` (one small file
+per hold: the reason, the question, the time and its state; never the agent's
+answer). A write to that folder is a permission-config write (C9) and prompts.
+Auto mode's denial limits (3 in a row, 20 in all) count its classifier's
+blocks; as far as the docs and Claude Code 2.1.328 show, a hook's deny is not
+counted, so holds do not push an auto-mode session into its fallback. In `-p`
+mode a call that comes to you is denied, with the reason in the tool result.
+
+### Remote and production execution
+
+A command that runs code on another machine (`kubectl exec`/`cp`/`debug`,
+`oc rsh`, `az containerapp exec`, `az vm run-command`, `az webapp ssh`, `aws
+ecs execute-command`, `aws ssm send-command`, `gcloud compute ssh`, `fly ssh
+console`, `heroku run`, `docker`/`podman` on a remote host: `-H`, `--context`,
+`--remote`, `DOCKER_HOST`, or a remote `docker context use`) is judged
+strictly, even when your `safe_commands` would allow it. It runs without a
+prompt only when the judge is confident (`confident: true`) that it does what
+your messages or the brief ask and nothing more, and the whole payload is in
+the command text itself (inline, or a heredoc). A payload read from a local
+file or another command (`< diag.sh`, a pipe, `--scripts @file`, `file://…`,
+`--script-uri`, `source`), anything with a `$` or a backtick (a variable or
+`$(…)` filled in when it runs), or a file copy comes to you directly, with no
+judge call: its payload never goes to the judge. Quoting is not parsed for
+this, so a quoted pipe (`sh -c "ps | grep x"`) or a literal `$` asks too. Anything else (a flag, an unsure
+verdict, no judge, an error) is an explicit ask that the PermissionRequest
+hook leaves to you.
+Remote execution is never held. Plain `ssh host cmd` is not in this class.
 
 ### Recursive deletes
 
@@ -323,6 +402,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `risky_patterns` | string array | Regex patterns that prompt instead of auto-allowing |
 | `interpreter_exec_flags` | object | `{"interpreter": ["-flag"]}` — flag combos that trigger a prompt |
 | `remove_from_defaults` | object | Subtract shipped entries from allowlist keys (see [Subtracting defaults](#subtracting-defaults)) |
+| `holds` | bool | Put a flag the agent can settle to the agent first, as a question, before it reaches you (default `true`; see [Holds](#holds-the-agent-answers-first)) |
 | `decision_log` | bool | Log every decision to `~/.claude/hooks/smart-permissions-decisions.jsonl` (default `true`) |
 | `decision_log_full_input` | bool | Log each input up to 64 KB instead of 500/8000 chars, with obvious secrets redacted (default `false`; see [Decision log](#decision-log)) |
 
@@ -345,7 +425,7 @@ Removal is applied last, after defaults + platform overlay + your additions. A c
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, the plugin version (`v`), hook, tool, input (truncated at 500 chars for an allow, 8000 for an ask or deny, so the calls that stopped you can be read in full; `input_len` is the full length and `truncated` says whether it was cut), decision, source (`rule` / `llm` / `llm-recheck` / `learner`; logs from older versions also hold `llm-cache`), reason, and timing. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Every PermissionRequest record carries one (also for a prior flag, a missing judge, or input the hook couldn't parse). Calls from other agent CLIs (see below) also record the original `client_tool` name. When the LLM was asked about a delete or reset whose target it could name, `provenance` says whether session provenance was attached: `found` (this session made or used a target), `none` (nothing ties a target to it) or `unavailable` (no readable transcript). The log is created readable by you only (0600; an existing log with group or other bits is narrowed). It rotates to a single `.jsonl.1` generation at 20 MB, under a lock so the two hooks never rotate twice. With `"decision_log_full_input": true`, each input is kept up to 64 KB with obvious secrets (private key blocks, bearer and basic auth headers, URL passwords, common token shapes, `*_KEY`/`*_SECRET`/`*_TOKEN`/`*_PASSWORD` values and `--password`-style flags) replaced by `[REDACTED]`; such records add `redacted`, and `incomplete` when the input was redacted or cut. Redaction is best-effort, so the privacy note below still applies. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, the plugin version (`v`), hook, tool, input (truncated at 500 chars for an allow, 8000 for an ask or deny, so the calls that stopped you can be read in full; `input_len` is the full length and `truncated` says whether it was cut), decision, source (`rule` / `llm` / `llm-recheck` / `learner`, and with holds `llm-hold` for a held call and `hold-retry` for its retry; logs from older versions also hold `llm-cache`), reason, and timing. With holds on, a flag records `hold`: `held`, `cleared` or `asked` for a hold and its retry, or why a flag was not held (`not held: …`); a remote-exec ask records `remote-exec`. The agent's answer is never logged. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Every PermissionRequest record carries one (also for a prior flag, a missing judge, or input the hook couldn't parse). Calls from other agent CLIs (see below) also record the original `client_tool` name. When the LLM was asked about a delete or reset whose target it could name, `provenance` says whether session provenance was attached: `found` (this session made or used a target), `none` (nothing ties a target to it) or `unavailable` (no readable transcript). The log is created readable by you only (0600; an existing log with group or other bits is narrowed). It rotates to a single `.jsonl.1` generation at 20 MB, under a lock so the two hooks never rotate twice. With `"decision_log_full_input": true`, each input is kept up to 64 KB with obvious secrets (private key blocks, bearer and basic auth headers, URL passwords, common token shapes, `*_KEY`/`*_SECRET`/`*_TOKEN`/`*_PASSWORD` values and `--password`-style flags) replaced by `[REDACTED]`; such records add `redacted`, and `incomplete` when the input was redacted or cut. Redaction is best-effort, so the privacy note below still applies. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
 
@@ -554,6 +634,14 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 - macOS, Linux, or Windows
 
 ## Changelog
+
+- **1.7.0 (2026-11-19) — the agent answers first; strict remote execution.**
+  - Holds (on by default, `"holds": false` turns them off): a flag the agent can settle is a deny that reads as a question ("Held by smart-permissions …"); the agent answers with its evidence and retries the identical call, and one judge pass at the recheck effort, with the evidence gathered again, clears it or sends it to you with the hold reason in the hook's words and the agent's answer labelled as its claim. See [Holds](#holds-the-agent-answers-first). The judge's verdict gains `confident`, `resolver` and `question`.
+  - Never held, always yours: category 2 and 5 flags, destroying cloud, production or remote resources or data, sending secrets off the machine, a refused or malformed verdict, and remote execution. A hold is bound to the session, the acting agent, the working directory and the call (a Bash `description` aside), lasts 15 minutes, is used once, and a session gets at most 4 in 15 minutes. Holds are one file each under `~/.claude/hooks/smart-permissions-holds/`, written with exclusive creates, so two identical concurrent calls make one hold; the folder is a permission-config path (C9).
+  - Remote and production execution (`kubectl exec`, `az containerapp exec`, `az vm run-command`, `aws ecs execute-command`, `docker` on a remote host, …) is judged strictly in both hooks, even when `safe_commands` would allow it: it runs without a prompt only on a confident verdict with the whole payload in the command text (inline or a heredoc); a payload from a local file, a pipe, `@file`/`file://`, any `$` or backtick, or a file copy comes to you without a judge call. Anything else is an explicit ask the PermissionRequest hook leaves to you. See [Remote and production execution](#remote-and-production-execution).
+  - The judge's script evidence marks a script the command itself writes before running it.
+  - A verdict with no valid `safe` (a reply that is not JSON or has no answer included), and a flag whose recheck times out, errors or gives no verdict, are now explicit asks (it used to fall through to the normal prompt path, where auto mode's classifier or the learner's own judge could approve it). Parallel hooks no longer overwrite each other's entries in the store that tells the PermissionRequest hook a call is yours.
+  - Decision log: sources `llm-hold` and `hold-retry`, and a `hold` field. The agent's answer is never logged.
 
 - **1.6.0 (2026-11-19) — fewer judge calls, fewer false config-write prompts.**
   - A Python heredoc is checked like `python3 -c` code when it is the only code source: one complete heredoc with a quoted delimiter (`python3 - <<'EOF'`), plain flags, no pipe or second redirect into it, no `PYTHON*`/loader variable in the command and no non-UTF-8 `coding:` line. Code that only transforms data is allowed by rule; anything else still goes to the judge.

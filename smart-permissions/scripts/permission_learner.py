@@ -18,7 +18,10 @@ prompt as the true last resort.
      - LLM configured → call it (client timeout 15s, inside the hook budget).
        allow → approve; a flag the second pass confirms, error or
        unparseable → manual prompt (logged). A call PreToolUse already
-       flagged skips the LLM and prompts.
+       put to the developer (a confirmed flag, a held call flagged again, a
+       developer-only or remote-exec ask) skips the LLM and prompts. Remote
+       or production execution is approved only on a confident verdict with
+       its whole payload visible.
      - LLM NOT configured → manual prompt.
 
 Nothing is ever written to the user config: an approval covers this one call.
@@ -46,6 +49,9 @@ from pretool_safety import (  # noqa: E402
     llm_is_configured,
     llm_not_configured_reason,
     _flag_get,
+    remote_exec,
+    remote_gap,
+    remote_exec_verdict,
     log_decision,
     parse_hook_payload,
     _elapsed_ms,
@@ -134,16 +140,29 @@ def _main():
     # verdict == "consult": lean on the LLM, human as last resort.
     # PreToolUse already ran both LLM passes on this exact call and
     # confirmed a flag — this prompt is the human decision it asked for.
+    # PreToolUse put it to the developer explicitly (a confirmed flag, a held
+    # call flagged again, a developer-only or remote-exec ask): never overrule
+    # that here. The prompt has no tool_use_id, so the store is keyed by the
+    # call itself.
     flagged = _flag_get(tool, tool_input)
     if flagged:
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
                      flagged, duration_ms=_elapsed_ms(start), rule_reason=reason)
+        sys.exit(0)
+    remote = remote_exec(tool_input.get("command", "")) if tool == "Bash" else None
+    gap = remote and remote_gap(tool_input.get("command"), remote)
+    if gap:  # a payload the judge can't see: the developer's, no judge call
+        log_decision("permission_request", tool, tool_input, "ask", "rule",
+                     f"Remote or production execution ({remote}): {gap}",
+                     duration_ms=_elapsed_ms(start), rule_reason=reason)
         sys.exit(0)
     decision, llm_reason, info = llm_evaluate(
         tool, tool_input, timeout=15, context=build_llm_context(input_data),
         rule_reason=reason)
     source = info["source"]
     llm_ms = info.get("llm_ms")
+    if remote:  # the same strict policy as PreToolUse: confident, payload visible
+        decision, llm_reason, _ = remote_exec_verdict(decision, llm_reason, info, remote)
     if decision == "allow":
         log_decision("permission_request", tool, tool_input, "allow",
                      source, llm_reason, duration_ms=_elapsed_ms(start),

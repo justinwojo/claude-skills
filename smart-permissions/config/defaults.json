@@ -368,5 +368,6 @@
   },
 
   "__ Behavior toggles (scalars — replaced, not merged) __": "",
-  "decision_log": true
+  "decision_log": true,
+  "holds": true
 }

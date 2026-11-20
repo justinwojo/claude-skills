@@ -233,3 +233,118 @@ case E09 (patching the guard in a worktree); `llm_eval.py` now adds `live_hook_n
 - glab placeholders other than `:id` go to the judge; docker's own global options are parsed before
   `compose` (`_DOCKER_VALUE_OPTS`, `_DOCKER_FLAGS`).
 - A relative `./script` (a link to the utility) is trusted like any project script.
+
+# Phase 2 (smart-permissions 1.7.0): hold and ask
+
+Same branch. Verdict policy changes: a flag the agent can settle is held as a question; remote and
+production execution is judged strictly. Holds are on by default after a live `claude -p` trial (below).
+
+## What landed
+
+- **Verdict fields.** `LLM_SAFETY_PROMPT` and `_SAFETY_SCHEMA` add `confident` (bool), `resolver`
+  (`agent`/`developer`) and `question`; only `safe` stays required. `_llm_evaluate`'s info carries the
+  deciding pass as `verdict` (a refused pass is marked `refused`). `_llm_user_prompt` is factored out.
+- **Holds** (`HOLDS_ENABLED`, config `holds`, default true in defaults.json). `_hold_new` (after both
+  passes flag): `hold_resolver` → `("agent", "")` or `("developer", why)`; developer when the verdict is
+  missing or refused, category 2/5, category 3 on WebFetch/MCP/egress (`_sends_off_machine`),
+  `cloud_destroy`, `remote_exec`, or a `resolver` other than `"agent"`. Not held either without a session id or
+  a readable transcript, at the session cap (`HOLD_SESSION_CAP` 4 per `HOLD_CAP_WINDOW_S` 900s), or for a
+  call held once already. A held call is a PreToolUse deny with `hold_message`, logged `llm-hold`.
+- **Retry** (`_hold_retry`, before the normal judge): a live `held` hold made before this hook started,
+  claimed once (`hold_claim`, an O_EXCL `.retry` marker). No answer → the developer without a judge call;
+  otherwise `llm_evaluate_retry` (one pass at `LLM_RECHECK_REASONING_EFFORT`, `LLM_HOLD_RETRY_NOTE` with
+  the reason, question and answer) clears (`hold-retry` allow) or asks (`hold_retry_ask`: question,
+  hold reason, what the retry found, the claim labelled and cut to 600 chars). Every explicit ask goes
+  through `_ask_developer`, which writes the flag store, so the learner never overrules it.
+- **Answer** (`agent_answer_since`): assistant `text` and `thinking` blocks after the hold, from the acting
+  agent's transcript (`acting_transcript`: `agent_transcript_path`, else
+  `<session>/subagents/agent-<agent_id>.jsonl` when `agent_id` is set, never the lead's), reminders stripped, last 3000 chars.
+  Thinking counts because the live trial showed agents settling the question there and retrying with no
+  visible message.
+- **Store.** `HOLD_DIR` (`~/.claude/hooks/smart-permissions-holds/`, in the C9 state paths), one JSON file per
+  `hold_key` (sha256 of session, agent, cwd, tool, input minus Bash `description`). `_hold_write` writes
+  a unique temp file and links it in (exclusive) or replaces; `hold_create` returns the hold in force on
+  a race, so two identical concurrent calls make one hold and both are denied. TTL 900s, files pruned
+  after a day by `hold_count`. The answer is never stored or logged.
+- **Remote exec** (`remote_exec(command) -> label | None`): az/aws/gcloud/fly pairs, kubectl/oc exec verbs,
+  `heroku run`, docker/podman on a remote host (`-H`, `--context`/`-c`, `--connection`, podman
+  `--remote`/`--url`, `DOCKER_HOST`/`DOCKER_CONTEXT`, a `docker context use` in the command or docker's
+  current context; local contexts excluded), also behind runners such as `script`, `timeout`, `env`, and
+  through the guard's constants (`K=kubectl; $K exec`). Plain `ssh` is excluded (the decision log showed
+  it routinely approved). First `remote_gap(command, label)` (fail-closed `remote_payload_gap`): the
+  payload must be the command text (inline or a heredoc), with no redirect or pipe outside heredoc
+  bodies, no `$` or backtick anywhere (quoting is not parsed), no `@file`/`file://`/`--…-uri`, no
+  `source`, no file copy in any of its remote commands (`_remote_execs`). A gap is an explicit ask before
+  any judge call, in both hooks, so an opaque payload is never sent to the judge. Otherwise a rules
+  allow becomes a judge call and `remote_exec_verdict(decision, reason, info, label)` keeps the judge's
+  allow only with `confident is True`. A docker config that can't be read whole counts as a remote
+  context. Every such ask is `hold: remote-exec`.
+- **Review-driven redesign.** The first version allowed a remote exec fed from a local script the judge
+  was shown in full (script gaps tracked per file). Review kept finding ways around that bookkeeping
+  (the file cap, wrappers, writes through variables, credential files read as payloads), so it was cut
+  back to the text rule above. E07 (a diagnostics script piped into a prod container shell) is now
+  labelled `flag`/`developer_only`. `script_context` still marks a script the command writes first.
+- **Eval.** `llm_eval.py` scores each run's outcome (`outcome_of`: allow/hold/developer/fallthrough) and
+  each case's `sequence` (hold → answer → `llm_evaluate_retry`; a run that did not hold uses the case's
+  stand-in `hold`; `retry_setup` changes the sandbox before the retry's evidence). New cases S01-S06 and
+  sequences on E01, E04, P02, P05, P08; E08 is `developer_only`. Final `--runs 3` (judge
+  claude-haiku-5-5, effort low, recheck high): recall 100% of 228 runs; false flags 6 of 192 (first pass
+  11); 233 stopped runs, 20 held, 213 to the developer, 4 holds on should-allow runs; developer-only
+  72 runs, held 0, allowed 0; sequences: natural retries right 1/4 (one retry ran out of time, one
+  answer twice not accepted), forced retries 44/44; latency p50 3219 ms, p90 4879, max 24010 (the
+  budget); retry p50 3198, p90 9400, max 24003.
+- **Tests.** `test_phase2_holds`, `test_phase2_remote_exec`; `_run_cfg` gains `outputs` and
+  `SP_MOCK_DELAY`.
+- **Also changed.** A verdict with no valid `safe`, and a first-pass flag whose recheck times out,
+  errors or is unparseable, are explicit asks recorded in the flag store (1.6.0 fell through). The flag
+  store's writes take an `fcntl` lock and a unique temp file, so parallel hooks keep every entry.
+
+## Live trial (`claude -p`, Claude Code 2.1.328)
+
+Scratch repos, the plugin from this worktree via `--plugin-dir`, `--setting-sources project` so the
+installed copy did not load (one smart-permissions instance in the init record), a scratch config with
+holds on. A pre-session stash whose change is already on main, with "drop leftover state whose changes
+are already committed on main": nine runs, seven holds. After a hold the agent rewrote the command into
+a guarded one once (judged fresh, allowed); retried with no visible answer three times (two of them
+with a system-prompt hint to retry; the answer was in its thinking, fixed by reading thinking); twice
+answered briefly, was flagged again on the retry, then rewrote the command (allowed); and once, after
+the thinking fix, answered and retried the identical call, which the retry judge cleared (`hold-retry`
+allow). The other two runs were allowed without a hold. A prod namespace delete under a
+staging request reached an explicit ask (`not held: it deletes cloud, production or remote resources`)
+and `-p` denied it with the reason. In `-p`, that ask produced no PermissionRequest record.
+
+## Denial limit
+
+Auto mode's limits (3 consecutive, 20 total) count classifier blocks. In the 2.1.328 binary the counter
+is incremented on the classifier-block path, not the "Hook denied" path, and `PermissionDenied` does not
+fire for PreToolUse blocks, so hook denies (holds) are not counted. In `-p` the limit never aborts a run.
+This is read from minified code and the docs, not from a documented guarantee.
+
+## Interfaces
+
+- `hold_key(input_data, tool, tool_input)`, `hold_get/hold_create/hold_claim/hold_finish/hold_count`.
+- `hold_resolver(tool, tool_input, verdict) -> (resolver, why)`.
+- `remote_exec(command)`, `remote_payload_gap(command, label)`,
+  `remote_gap(command, label)`, `remote_exec_verdict(decision, reason, info, label)`, `cloud_destroy(command)`.
+- `llm_evaluate_retry(tool, tool_input, hold, answer, timeout, context, rule_reason)`.
+- `agent_answer_since(path, since, limit)`, `acting_transcript(input_data)`.
+
+## Open questions
+
+- The judge sends most flags to the developer (in the final eval, 20 of 233 stopped runs were held).
+  Most are true dangers, but some agent-resolvable ones (a pre-session stash under "tidy") go to the
+  developer too. Worth watching in the decision log (`hold: not held: …`).
+- The retry judge clears well-evidenced answers but rejects ones that do not address the question's
+  point; agents often answer briefly. The hold message could carry a short example of a good answer.
+- `bash script.sh` / `./script.sh` is a rules allow by default (since before 1.7.0), so a local script that
+  deletes production resources never reaches the judge; the remote-exec class only covers commands
+  that name a remote exec. A rule that reads a local script for cloud-destroy or remote-exec commands
+  would close it.
+- The review loop ran its five Codex rounds (security scope). The round-5 fixes (a reply that is not
+  JSON or has malformed content → explicit ask; a heredoc body run by local bash checked for remote
+  payload gaps; docker config keys matched without case, anything unreadable or too deep → remote) are
+  tested but were not re-reviewed by Codex.
+- `cloud_destroy` and `_sends_off_machine` are pattern lists; they gate only the resolver (never hold),
+  so a miss falls back to the judge's own `resolver`.
+- A held call that the agent rewrites is judged fresh; a rewrite that only adds a cosmetic wrapper gets
+  a fresh hold (one per distinct call), bounded by the session cap.
