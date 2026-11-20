@@ -405,23 +405,30 @@ for project scripts.
 - **Script hazard** (`script_hazard(command, cwd=None, deadline=None)`). For each file `script_files`
   finds that runs as shell code (`_runs_as_shell`: run by a shell runner, sourced, fed on stdin to a
   shell, or run directly with a shell `#!` or none), read up to `SCRIPT_SCAN_MAX_BYTES` (64 KB) with
-  `_read_script` and scanned with `_remote_execs` and `cloud_destroy`. Every script is scanned; returns
-  `(remote, gap, destroy)` (each the first of its kind across the scripts, or None) or None for no hit.
-  The gap, for a remote hit: the call writes the script first; the judge is not shown all of it (the
-  8 KB per-file and 16 KB total budgets of `script_context`, in the same order); the call feeds it input
-  (a `<` redirect, or a pipe before its name); else `remote_gap` on the script text. A docker endpoint
-  the command names (`DOCKER_CONTEXT=… ./x.sh`, `_names_docker_endpoint`) applies to the script. A
+  `_read_script` and scanned with `_remote_execs` and `cloud_destroy`. Every script is scanned (up to
+  `SCRIPT_SCAN_MAX_FILES` = 12, `script_files(…, limit)`; scripts run inside `$(…)`, backticks or `<(…)`
+  count as run, `_substitution_bodies`); returns `(remote, gap, destroy)` or None for no hit. `remote` is
+  the first hit with a gap (so the reason names the script that has it), else the first hit; `destroy`
+  is the first delete, labelled with its program and verb only (no resource names from the script reach
+  the log, the flag store or a prompt). The gap, for a remote hit: the call writes the script first; the
+  judge is not shown all of it (`script_context`'s own read, repeated with its limits and order: past
+  the first three files, or past the 8 KB per-file and 16 KB total budgets); the call has a redirect or
+  a pipe outside heredocs (`_outside_heredocs`, the same rule as a direct remote command); else
+  `remote_gap` on the script text. A docker endpoint the command names (`DOCKER_CONTEXT=… ./x.sh`,
+  `_names_docker_endpoint`) applies to the script, and `remote_gap`/`remote_payload_gap` take it
+  (`env_remote`). A
   script the call writes first (`_written_files`, factored out of `script_context`) is scanned both as
   the file is now and as the command's heredoc bodies and quoted words. Unreadable files and files over
   64 KB give no hit (the rules' answer, as before).
   - PreToolUse: a remote hit becomes the call's `remote` when the command has none, and a script gap is
     the call's gap when the command has none (gap → explicit ask with no judge call; else the strict
     confident-only judge path). A destroy hit turns a rules allow into a judge call with rule reason
-    "Runs a local script that deletes …: judged", skips `_hold_retry`, and is an explicit ask when the
-    judge gives no answer (no judge, an error). `hold_resolver` sends both to the developer. The learner
+    "Runs a local script that deletes …: judged", skips `_hold_retry` and `_hold_new` (a flag on it is
+    an explicit ask), and is an explicit ask when the judge gives no answer (no judge, an error). `hold_resolver` sends both to the developer. The learner
     applies the remote hit and gap the same way (gap → developer, no judge).
 - **Script collector** (`script_files`, also the judge's evidence): `bash -e x.sh` (any shell option but
-  `-c`) runs `x.sh`; a script read and then run (`cat x.sh; bash x.sh`) is labelled by the run.
+  `-c`; `-o`/`-eo` take the next word) runs `x.sh`; a script first read or fed to a non-shell
+  (`cat x.sh; bash x.sh`, `cat < x.sh; …`) and then run is labelled by the run.
 
 Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 
@@ -431,8 +438,9 @@ Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 - `permission_learner.parked_message(reason, minutes)`, `_developer_prompt(input_data, tool, tool_input,
   reason, start, rule_reason)`, `_unattended()`, `_prompt_answered(input_data)`, `_sleep` (the one wait; tests patch it).
 - `script_hazard(command, cwd=None, deadline=None)`, `_runs_as_shell(how, text=None)`,
-  `_written_files(command, cwd)`, `_heredoc_bodies(text)`, `_names_docker_endpoint(command)`,
-  `SCRIPT_SCAN_MAX_BYTES`.
+  `_written_files(command, cwd)`, `_heredoc_bodies(text)`, `_outside_heredocs(text)`,
+  `_substitution_bodies(command)`, `_names_docker_endpoint(command)`, `script_files(…, limit)`,
+  `remote_gap(command, label, env_remote=None)`, `SCRIPT_SCAN_MAX_BYTES`, `SCRIPT_SCAN_MAX_FILES`.
 
 ## Open questions
 
@@ -444,7 +452,8 @@ Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 - `ATTENDED`/`ENTRYPOINT` are observed, not documented. A future Claude Code that drops both would make
   `-p` runs wait (bounded by the timeout), not approve anything.
 - The script scan: shell scripts only (not `python3 x.py`, `make`, `npm run`), one level (a script that
-  calls another script is not followed), at most `SCRIPT_CONTEXT_MAX_FILES` files, text patterns only
+  calls another script is not followed), at most 12 files, not `xargs bash x.sh` or `find -exec ./x.sh`
+  (the collector does not see those runs), text patterns only
   (`$CLI delete` is missed), and `cloud_destroy`'s word match can send a read-only script to the judge
   (`kubectl get pods --context delete`). A remote script past about 50 lines hits `remote_payload_gap`'s
   50-round cap and is "it could not be read" (an explicit ask), unchanged so direct remote calls keep

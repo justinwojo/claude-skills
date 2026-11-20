@@ -7750,7 +7750,11 @@ def test_script_hazard_1_8_0():
     put('lib2.sh', '#!/bin/sh\n' + 'echo two\n' * 1200)
     put('dock.sh', '#!/bin/sh\ndocker exec web-1 ls /srv\n')
     put('early.sh', '#!/bin/sh\naz group delete -n rg-example-dev --yes\n' + 'echo x\n' * 12000)
-    tear = 'az group delete rg-example-dev in teardown.sh'
+    put('bin/rexec', '#!/bin/sh\nkubectl exec w -- ls\n')
+    with open(os.path.join(work, 'wide.sh'), 'wb') as f:  # each byte re-encodes as three
+        f.write(b'#!/bin/sh\n# ' + b'\xff' * 6000 + b'\necho hi\n')
+    tear = 'az group delete in teardown.sh'
+    fed = 'the call has a redirect or a pipe: input the script may pass on'
     for cmd, want in [
             ('bash teardown.sh', (None, None, tear)),
             ('./teardown.sh', (None, None, tear)),
@@ -7763,11 +7767,18 @@ def test_script_hazard_1_8_0():
             ('./peekvar.sh', ('kubectl exec in peekvar.sh',
                               'part of it is read from a file or built when it runs', None)),
             ('source teardown.sh', (None, None, tear)),
-            ('bash < peek.sh', ('kubectl exec in peek.sh',
-                                'the call feeds the script input from a file or another command', None)),
-            ('./peek.sh < input.txt', ('kubectl exec in peek.sh',
-                                       'the call feeds the script input from a file or another command', None)),
-            ('./peek.sh | tee out.log', ('kubectl exec in peek.sh', None, None)),
+            ('bash < peek.sh', ('kubectl exec in peek.sh', fed, None)),
+            ('./peek.sh < input.txt', ('kubectl exec in peek.sh', fed, None)),
+            ('./peek.sh | tee out.log', ('kubectl exec in peek.sh', fed, None)),
+            ('bash -eo pipefail teardown.sh', (None, None, tear)),
+            ('cat < teardown.sh; bash teardown.sh', (None, None, tear)),
+            ('printf "%s" "$(bash teardown.sh)"', (None, None, tear)),
+            ('echo "$(./bin/rexec)"', ('kubectl exec in rexec', 'the judge is not shown all of the script', None)),
+            ('./peek.sh; ./peekvar.sh', ('kubectl exec in peekvar.sh',
+                                         'part of it is read from a file or built when it runs', None)),
+            ('cat lib1.sh lib2.sh build.sh; ./peek.sh', ('kubectl exec in peek.sh',
+                                                         'the judge is not shown all of the script', None)),
+            ('./wide.sh; ./peek.sh', ('kubectl exec in peek.sh', 'the judge is not shown all of the script', None)),
             ('./dock.sh', None),
             ('DOCKER_CONTEXT=example-prod ./dock.sh', ('docker exec on a remote host in dock.sh', None, None)),
             ('./peek.sh; ./teardown.sh', ('kubectl exec in peek.sh', None, tear)),
@@ -7776,11 +7787,11 @@ def test_script_hazard_1_8_0():
             ('env X=1 ./teardown.sh', (None, None, tear)),
             ('timeout 60 ./teardown.sh', (None, None, tear)),
             ('cd bin && cd .. && ./teardown.sh', (None, None, tear)),
-            ('bash noshebang.sh', (None, None, 'helm uninstall example-release in noshebang.sh')),
+            ('bash noshebang.sh', (None, None, 'helm uninstall in noshebang.sh')),
             ('./envshebang', (None, None, 'terraform destroy in envshebang')),
             ('./longremote.sh', ('kubectl exec in longremote.sh', 'the judge is not shown all of the script', None)),
             ("cat > new.sh <<'EOF'\nkubectl delete ns example\nEOF\nbash new.sh",
-             (None, None, 'kubectl delete ns example in new.sh')),
+             (None, None, 'kubectl delete in new.sh')),
             ('echo "kubectl exec w -- ls" > n2.sh; sh n2.sh',
              ('kubectl exec in n2.sh', 'the call writes the script first', None)),
             ('echo "# x" >> peek.sh; sh peek.sh',
@@ -7821,6 +7832,9 @@ def test_script_hazard_1_8_0():
           (1, True, True))
     check('destroy script: no judge → an explicit ask, never a silent exit',
           _run_cfg(PRETOOL, call('./teardown.sh'), cp, full=True), ('ask', True))
+    check('destroy script: no resource name from the script in the log or the flag store',
+          ('rg-example-dev' in json.dumps(_last_pretool(cfg)), 'rg-example-dev' in json.dumps(
+              _read_json(_flag_file(cfg), {}))), (False, False))
     cfg, cp, tr = _hold_env()
     check('destroy script: flagged → never held, an explicit ask',
           _run_cfg(PRETOOL, _hcall('./teardown.sh', tr, cwd=work), cp, llm=[_HFLAG, _HFLAG], full=True),

@@ -2458,6 +2458,9 @@ def _script_operand(name, args):
         if name in _SHELL_RUNNERS:  # `bash -e x.sh`: only -c (`-ec`) is code
             if re.fullmatch(r"-\w*c\w*", a):
                 return None
+            if re.fullmatch(r"[-+]\w*[oO]", a):  # `-eo pipefail`: the option's value is next
+                i += 2
+                continue
         elif a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
             return None
         if not a.startswith(("-", "+")) or a == "-":
@@ -2488,10 +2491,11 @@ def _looks_like_script(path):
         return False
 
 
-def script_files(command, cwd, deadline=None):
+def script_files(command, cwd, deadline=None, limit=SCRIPT_CONTEXT_MAX_FILES):
     """[(absolute path, how the call uses it)] for the local script files
     `command` runs, sources, feeds on stdin or reads into a pipe or an
-    encoder, in order, at most SCRIPT_CONTEXT_MAX_FILES. Follows `cd` and
+    encoder, in order, at most `limit` (the first SCRIPT_CONTEXT_MAX_FILES
+    are the same whatever the limit). Follows `cd` and
     names set to one literal path (`D=~/x; bash $D/run.sh`); a shell script
     named anywhere else in the command (inside `python3 -c "…"`) counts too."""
     if not isinstance(command, str) or not command.strip() or not hasattr(os, "getuid"):
@@ -2516,10 +2520,10 @@ def script_files(command, cwd, deadline=None):
             return
         at = next((i for i, (p, _) in enumerate(found) if p == path), None)
         if at is None:
-            if len(found) < SCRIPT_CONTEXT_MAX_FILES:
+            if len(found) < limit:
                 found.append((path, how))
-        elif found[at][1].startswith("read by"):  # `cat x.sh; bash x.sh`: what matters is the run
-            found[at] = (path, how)
+        elif not _runs_as_shell(found[at][1]) and _runs_as_shell(how):
+            found[at] = (path, how)  # `cat x.sh; bash x.sh`: what matters is the run
 
     for segment in segments:
         raw, stdin, _hazard = _parse_simple_command(segment)
@@ -2552,12 +2556,12 @@ def script_files(command, cwd, deadline=None):
         elif "/" in tokens[k] and os.path.dirname(tokens[k]) not in _SYSTEM_BIN_DIRS:
             add(tokens[k], "run", base, check=True)
     for m in itertools.islice(_SHELL_SCRIPT_NAME_RE.finditer(spelled), 20):
-        if time.monotonic() > deadline or len(found) >= SCRIPT_CONTEXT_MAX_FILES:
+        if time.monotonic() > deadline or len(found) >= limit:
             break
         path = _evidence_path(m.group(0), base)
         if path and os.path.isfile(path):
             add(m.group(0), "named in the command", base)
-    return found[:SCRIPT_CONTEXT_MAX_FILES]
+    return found[:limit]
 
 
 def _private_file(path):
@@ -4703,11 +4707,12 @@ _REMOTE_FILE_ARG_RE = re.compile(r"""(?:^|[\s=])['"]?(?:@|fileb?://)['"]?[^\s'";
                                  r"""|(?:^|[\s;&|(])(?:source|\.)\s""")
 
 
-def remote_payload_gap(command, label):
+def remote_payload_gap(command, label, env_remote=None):
     """Why the judge can't see all that remote exec `command` (`label`, from
-    remote_exec) runs, or None when the payload is the command text itself."""
+    remote_exec) runs, or None when the payload is the command text itself.
+    `env_remote` as for _remote_execs."""
     text = _constant_text(command) or command
-    hits = list(_remote_execs(text))
+    hits = list(_remote_execs(text, env_remote))
     if any(re.search(r"\b(?:cp|rsync|sftp)\b", hit) for hit in hits):
         return "it copies files whose contents are not shown"
     if any(re.search(r"\bcompose run\b", hit) for hit in hits):  # docker compose, docker-compose
@@ -4736,10 +4741,10 @@ def remote_payload_gap(command, label):
     return None
 
 
-def remote_gap(command, label):
+def remote_gap(command, label, env_remote=None):
     """remote_payload_gap, failing closed: a payload it can't read is a gap."""
     try:
-        return remote_payload_gap(command, label) if isinstance(command, str) else "no command"
+        return remote_payload_gap(command, label, env_remote) if isinstance(command, str) else "no command"
     except Exception:
         return "its payload could not be read"
 
@@ -4776,50 +4781,95 @@ def _runs_as_shell(how, text=None):
     return prog in _SHELL_RUNNERS
 
 
+# At most this many local scripts a call names are scanned (the judge is shown
+# the first SCRIPT_CONTEXT_MAX_FILES).
+SCRIPT_SCAN_MAX_FILES = 12
+
+
 def _script_hits(text, env_remote=None):
-    """(remote exec label or None, cloud delete label or None) in shell `text`."""
-    return next(_remote_execs(text, env_remote), None), cloud_destroy(text)
+    """(remote exec label or None, cloud delete label or None) in shell `text`.
+    A delete's label stops at its verb: no resource names from the script."""
+    destroy = cloud_destroy(text)
+    if destroy:
+        words = destroy.split()
+        at = next((k for k, w in enumerate(words) if k and any(
+            _CLOUD_DESTROY_RE.fullmatch(part) for part in re.split(r"[:=]", w.lower()))), 0)
+        destroy = " ".join(words[:at + 1])
+    return next(_remote_execs(text, env_remote), None), destroy
+
+
+def _substitution_bodies(command, depth=3):
+    """The commands `$(…)`, backticks and `<(…)` in `command` run, nested ones too."""
+    bodies, _uncertain = extract_substitutions(command)
+    out = []
+    for body in bodies:
+        out.append(body)
+        if depth > 1:
+            out += _substitution_bodies(body, depth - 1)
+    return out
+
+
+def _outside_heredocs(text):
+    """`text` without its heredoc bodies (at most 50 of them)."""
+    heads, rest = [], text
+    for _ in range(50):
+        head, _bodies, rest, _missing = _heredoc_split(rest)
+        heads.append(head)
+        if not rest:
+            break
+    else:
+        heads.append(rest)
+    return "\n".join(heads)
 
 
 def script_hazard(command, cwd=None, deadline=None):
     """What the local shell scripts Bash `command` runs, sources or feeds to
-    a shell (script_files) hold that the command text does not show, as
-    (remote, gap, destroy), or None for nothing:
-      remote  — the first remote exec in them (remote_exec's label and the
-                script's name), or None;
-      gap     — why the judge can't see all that a remote exec in them runs,
-                or None: the first one any remote hit has (the call writes
-                the script first, the judge is not shown it whole, the call
-                feeds it input, or remote_gap on its text);
-      destroy — the first cloud delete in them (cloud_destroy's label and
-                the script's name), or None.
-    Every script is scanned. One the call writes first is read both as the
-    file is now and as the text the call writes (heredoc bodies, quoted
-    words). A file that can't be read, or is over SCRIPT_SCAN_MAX_BYTES,
-    gives no hit. `cwd` defaults to the hook's."""
+    a shell (script_files, also inside `$(…)`) hold that the command text does
+    not show, as (remote, gap, destroy), or None for nothing:
+      remote  — a remote exec in them (remote_exec's label and the script's
+                name): the first with a gap, else the first; or None;
+      gap     — why the judge can't see all that remote exec runs, or None:
+                the call writes the script first, the judge is not shown it
+                whole, the call has a redirect or a pipe (input the script
+                may pass on), or remote_gap on its text;
+      destroy — the first cloud delete in them (cloud_destroy's program and
+                verb, and the script's name), or None.
+    Every script is scanned, up to SCRIPT_SCAN_MAX_FILES. One the call
+    writes first is read both as the file is now and as the text the call
+    writes (heredoc bodies, quoted words). A file that can't be read, or is
+    over SCRIPT_SCAN_MAX_BYTES, gives no hit. `cwd` defaults to the hook's."""
     if not isinstance(command, str) or not command.strip():
         return None
     cwd = cwd if cwd is not None else HOOK_CWD
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     written, written_names = _written_files(command, cwd)
-    outer = next(iter(_heredoc_split(command)[:1]), command)
+    fed = bool(_REMOTE_INPUT_RE.search(_outside_heredocs(command)))
     env_remote = True if _names_docker_endpoint(command) else None
-    budget = SCRIPT_CONTEXT_TOTAL_BYTES  # what script_context will show the judge, in the same order
+    # a script run inside `$(…)` is only "named in the command" to the collector
+    inner = {}
+    for body in _substitution_bodies(command):
+        for path, how in script_files(body, cwd, deadline, SCRIPT_SCAN_MAX_FILES):
+            if _runs_as_shell(how):
+                inner.setdefault(path, how)
+    budget = SCRIPT_CONTEXT_TOTAL_BYTES  # what script_context shows the judge, in the same order
     remote = gap = destroy = None
-    for path, how in script_files(command, cwd, deadline):
+    files = script_files(command, cwd, deadline, SCRIPT_SCAN_MAX_FILES)
+    judged = min(len(files), SCRIPT_CONTEXT_MAX_FILES)  # the ones script_context reads
+    files += [(path, how) for path, how in inner.items() if path not in {p for p, _ in files}]
+    for index, (path, how) in enumerate(files[:SCRIPT_SCAN_MAX_FILES]):
         if time.monotonic() > deadline:
             break
+        how = how if _runs_as_shell(how) else inner.get(path, how)
         name = os.path.basename(path)
+        whole = False  # the judge is shown all of it: script_context's own read
+        if index < judged:
+            shown, shown_note = _read_script(path, min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0)))
+            budget -= len(shown.encode("utf-8", "replace")) if shown else 0
+            whole = shown is not None and "TRUNCATED" not in shown_note
+        rewritten = path in written or name in written_names
         text, note = _read_script(path, SCRIPT_SCAN_MAX_BYTES)
-        size = len(text.encode("utf-8", "replace")) if text is not None else 0
         if "TRUNCATED" in note:  # over the scan cap: the rules' answer, as before
             text = None
-        shown = min(size, SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0))
-        budget -= shown
-        rewritten = path in written or name in written_names
-        at = outer.find(name)  # input the script may pass on: a redirect, or a pipe into it
-        fed = bool(re.search(r"(?<!<)<(?![<&(])", outer)
-                   or at > 0 and re.search(r"(?<!\|)\|(?!\|)", outer[:at]))
         if not _runs_as_shell(how, None if rewritten else text) or text is None and not rewritten:
             continue
         texts = [text] if text is not None else []
@@ -4829,18 +4879,19 @@ def script_hazard(command, cwd=None, deadline=None):
         for t in texts:
             hit, gone = _script_hits(t, env_remote)
             destroy = destroy or gone and f"{gone} in {name}"
-            if not hit:
+            if not hit or gap:
+                remote = remote or hit and f"{hit} in {name}"
                 continue
-            remote = remote or f"{hit} in {name}"
             if rewritten:
                 why = "the call writes the script first"
-            elif shown < size:
+            elif not whole:
                 why = "the judge is not shown all of the script"
             elif fed:
-                why = "the call feeds the script input from a file or another command"
+                why = "the call has a redirect or a pipe: input the script may pass on"
             else:
-                why = remote_gap(t, hit)
-            gap = gap or why
+                why = remote_gap(t, hit, env_remote)
+            remote = f"{hit} in {name}" if why else remote or f"{hit} in {name}"
+            gap = why
     return (remote, gap, destroy) if remote or destroy else None
 
 
@@ -5113,8 +5164,10 @@ def _main():
         # in front of the human explicitly. A silent exit would hand it to
         # auto mode's classifier instead.
         elif info.get("flagged"):
-            not_held = _hold_new(input_data, tool, tool_input, reason, info, start, wall_start,
-                                 rule_reason) if HOLDS_ENABLED else "holds are off"
+            not_held = "holds are off" if not HOLDS_ENABLED else (
+                f"it runs a local script that deletes cloud, production or remote resources ({destroy})"
+                if destroy else _hold_new(input_data, tool, tool_input, reason, info, start, wall_start,
+                                          rule_reason))
             if not_held is None:
                 return
             _ask_developer(tool, tool_input, reason, reason, start, source, llm_ms, rule_reason,
@@ -5124,7 +5177,7 @@ def _main():
         # the developer's, never a silent exit to a native allow rule.
         elif destroy and decision == "ask":
             shown = f"Runs a local script that deletes cloud, production or remote resources " \
-                    f"({destroy}); the judge did not clear it ({reason}) — confirm it yourself"
+                    f"({destroy}); the judge gave no answer — confirm it yourself"
             _ask_developer(tool, tool_input, shown, shown, start, source, llm_ms, rule_reason)
             return
 

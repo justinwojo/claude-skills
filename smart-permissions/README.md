@@ -264,19 +264,20 @@ hook leaves to you.
 Remote execution is never held. Plain `ssh host cmd` is not in this class.
 
 **Local scripts.** Running a project script (`./deploy.sh`, `bash x.sh`, `sh
-x.sh`, also behind `env` or `timeout`) is a rules allow, so the hooks read the
-script before allowing it: a local shell script the call runs, sources or feeds
-to a shell (the same files the judge is shown, up to 64 KB, only regular files
-you own) is scanned for the remote-execution commands above and for deleting
+x.sh`, also behind `env` or `timeout`, or inside `$(…)`) is a rules allow, so
+the hooks read the script before allowing it: a local shell script the call
+runs, sources or feeds to a shell (up to 12 of them, 64 KB each, only regular
+files you own) is scanned for the remote-execution commands above and for deleting
 cloud, production or remote resources. A remote exec inside it gets the strict
 policy above, judged on the script's text (a script with a `$`, a pipe or a
-redirect, one the judge is not shown whole, one the call feeds input to, or
-one the call writes first comes to you without a judge call); a cloud delete
+redirect, one the judge is not shown whole, a call with a redirect or a pipe,
+or one the call writes first comes to you without a judge call); a cloud delete
 inside it goes to the judge instead of being allowed, comes to you when the
 judge gives no answer, and a flag on it is never held. A script that can't be
 read or is over 64 KB keeps the rules' answer, and so does a script in another
 language (`python3 x.py`) or one a script calls in turn. Ordinary project
-scripts are unaffected.
+scripts are unaffected; one whose cloud CLI line has a delete word anywhere in
+it (`kubectl get pods --context delete`) gets a judge call.
 
 ### Unanswered prompts: parked, not a freeze
 
