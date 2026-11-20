@@ -2458,8 +2458,8 @@ def _script_operand(name, args):
         if name in _SHELL_RUNNERS:  # `bash -e x.sh`: only -c (`-ec`) is code
             if re.fullmatch(r"-\w*c\w*", a):
                 return None
-            if re.fullmatch(r"[-+][A-Za-z]*[oO][A-Za-z]*", a):  # `-eo pipefail`, `-oe pipefail`
-                i += 2
+            if re.fullmatch(r"[-+][A-Za-z]*[oO][A-Za-z]*", a):  # `-eo pipefail`, `-Oo extglob pipefail`
+                i += 1 + len(re.findall(r"[oO]", a))
                 continue
         elif a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
             return None
@@ -2540,10 +2540,12 @@ def script_files(command, cwd, deadline=None, limit=SCRIPT_CONTEXT_MAX_FILES):
         peeled = _peel_words(raw)
         k = peeled[0] if peeled else 0
         name, args = os.path.basename(tokens[k]), tokens[k + 1:]
-        if stdin and stdin[0] == "file":
-            add(_unquote_word(stdin[1]), f"fed on stdin to {name}", base, check=True)
-        if name in _SCRIPT_RUNNERS or re.fullmatch(r"python\d+(?:\.\d+)?", name):
-            op = _script_operand(name, args)
+        runner = name in _SCRIPT_RUNNERS or re.fullmatch(r"python\d+(?:\.\d+)?", name)
+        op = _script_operand(name, args) if runner else None
+        if stdin and stdin[0] == "file":  # `bash x.sh < y`: y is x.sh's input, not code
+            add(_unquote_word(stdin[1]), f"read by {name}" if op else f"fed on stdin to {name}",
+                base, check=True)
+        if runner:
             if op:
                 add(op, f"run by {name}", base)
         elif name in ("source", "."):
@@ -4792,9 +4794,9 @@ def _script_hits(text, env_remote=None):
     destroy = cloud_destroy(text)
     if destroy:
         words = destroy.split()
-        at = next((k for k, w in enumerate(words) if k and any(
-            _CLOUD_DESTROY_RE.fullmatch(part) for part in re.split(r"[:=]", w.lower()))), 0)
-        destroy = " ".join(words[:1] + (["…"] if at > 1 else []) + (words[at:at + 1] if at else []))
+        verb = next(((k, part) for k, w in enumerate(words) if k
+                     for part in re.split(r"[:=]", w.lower()) if _CLOUD_DESTROY_RE.fullmatch(part)), None)
+        destroy = words[0] if verb is None else " ".join(words[:1] + (["…"] if verb[0] > 1 else []) + [verb[1]])
     return next(_remote_execs(text, env_remote), None), destroy
 
 
@@ -4844,7 +4846,8 @@ def script_hazard(command, cwd=None, deadline=None):
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     written, written_names = _written_files(command, cwd)
     # input the script may pass on: a redirect, a pipe, a here-string or a heredoc
-    fed = bool(_REMOTE_INPUT_RE.search(_outside_heredocs(command))) or "<<" in command
+    outside = _outside_heredocs(command)
+    fed = bool(_REMOTE_INPUT_RE.search(outside) or "<<<" in outside or _heredoc_bodies(command))
     env_remote = True if _names_docker_endpoint(command) else None
     # a script run inside `$(…)` is only "named in the command" to the collector
     inner = {}
@@ -4856,13 +4859,15 @@ def script_hazard(command, cwd=None, deadline=None):
     seen = []  # [bool]: whether script_context shows each of its files whole
 
     def whole(index):
+        if index >= judged:
+            return False
         if not seen:  # script_context's own reads, its limits and order; only on a remote hit
             budget = SCRIPT_CONTEXT_TOTAL_BYTES
             for p, _ in files[:judged]:
                 shown, shown_note = _read_script(p, min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0)))
                 budget -= len(shown.encode("utf-8", "replace")) if shown else 0
                 seen.append(shown is not None and "TRUNCATED" not in shown_note)
-        return index < judged and seen[index]
+        return seen[index]
 
     files = script_files(command, cwd, deadline, SCRIPT_SCAN_MAX_FILES)
     judged = min(len(files), SCRIPT_CONTEXT_MAX_FILES)  # the ones script_context reads
@@ -4870,7 +4875,8 @@ def script_hazard(command, cwd=None, deadline=None):
     for index, (path, how) in enumerate(files[:SCRIPT_SCAN_MAX_FILES]):
         if time.monotonic() > deadline:
             break
-        how = how if _runs_as_shell(how) else inner.get(path, how)
+        if path in inner and (how == "run" or not _runs_as_shell(how)):
+            how = inner[path]
         name = os.path.basename(path)
         rewritten = path in written or name in written_names
         text, note = _read_script(path, SCRIPT_SCAN_MAX_BYTES)

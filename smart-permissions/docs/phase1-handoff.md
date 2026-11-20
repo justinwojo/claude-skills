@@ -429,8 +429,10 @@ for project scripts.
     an explicit ask), and is an explicit ask when the judge gives no answer (no judge, an error). `hold_resolver` sends both to the developer. The learner
     applies the remote hit and gap the same way (gap → developer, no judge).
 - **Script collector** (`script_files`, also the judge's evidence): `bash -e x.sh` (any shell option but
-  `-c`; `-o`/`-eo` take the next word) runs `x.sh`; a script first read or fed to a non-shell
-  (`cat x.sh; bash x.sh`, `cat < x.sh; …`) and then run is labelled by the run.
+  `-c`; each `o`/`O` in an option cluster takes a word: `-eo pipefail`, `-Oo extglob pipefail`) runs
+  `x.sh`; a script first read or fed to a non-shell (`cat x.sh; bash x.sh`, `cat < x.sh; …`) and then
+  run is labelled by the run, and an explicit shell run (also inside `$(…)`) wins over a `./x.sh` that
+  depends on the shebang; `bash x.sh < y` labels `y` "read by bash" (input, not code).
 
 Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 
