@@ -5143,12 +5143,12 @@ def test_final_review_fixes():
                    '(exec -ca cat /bin/ln -s ~ /tmp/link) && ' + rf + '/tmp/link/Documents',
                    '/usr/bin/time -o cat /bin/ln -s ~ /tmp/link && ' + rf + '/tmp/link/Documents',
                    'env -P ./tools ls && ' + rf + '/tmp/sp-r3-link/Documents',
-                   'env -C /Users/wojo ' + rf + '__pycache__', '/usr/bin/time -o out.txt ls',
+                   'env -C /Users/dev ' + rf + '__pycache__', '/usr/bin/time -o out.txt ls',
                    # round 4 F15: `builtin` before the wrappers hides none of them
                    '(builtin exec -ca cat /bin/ln -s ~ /tmp/link) && ' + rf + '/tmp/link/Documents',
                    'builtin command /usr/bin/time -ao cat /bin/ln -s ~ /tmp/link && ' + rf + '/tmp/link/Documents',
                    'builtin command env -P ./tools ls && ' + rf + '/tmp/link/Documents',
-                   'builtin command env -C /Users/wojo ' + rf + '__pycache__',
+                   'builtin command env -C /Users/dev ' + rf + '__pycache__',
                    'printf x | builtin command xargs -I X git X',
                    # and xargs -I is seen whatever command a wrapper hands it
                    'printf x | env xargs -I X git X', 'printf x | command xargs -I X curl X',
