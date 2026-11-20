@@ -348,3 +348,25 @@ This is read from minified code and the docs, not from a documented guarantee.
   so a miss falls back to the judge's own `resolver`.
 - A held call that the agent rewrites is judged fresh; a rewrite that only adds a cosmetic wrapper gets
   a fresh hold (one per distinct call), bounded by the session cap.
+
+## Branch review (1.7.0 review fixes)
+
+One Codex round on `main..HEAD` (emphasis on each phase's unreviewed round-5 fixes) and one on its
+fixes; the second round's fixes were not re-reviewed. Tests: `test_review_fixes_1_7_0`.
+
+- Fixed: def/class rebinding of an imported name in `_python_writes_no_config`; glab `triggers` and
+  `clusters` endpoints; `script` code (separate or attached to its option) and standalone
+  `docker-compose`/`podman-compose` (exec, run, cp, attach) in `_remote_execs` (which now takes an
+  `env_remote`); a Compose `run` on a remote host is a payload gap (local compose file); a local-bash
+  heredoc body is scanned with docker counted as remote; `hold_resolver_info` (the first pass's
+  developer-only category blocks a hold; llm_eval uses it too); a recheck whose category differs
+  from the first pass names both; `git push`/`send-email` (by subcommand, `_git_subcommand`) in
+  `_sends_off_machine`; `_stash_made_in` walks `split_compound_command` segments.
+- Left open (Low or by design): the judge-reply JSON fallback and the recheck clearing a first-pass
+  flag (both on main); a script that exists only on the remote side (the judge's `confident` call);
+  project-local modules imported by `python3 -` (project scripts are rule-allowed already); docker
+  contexts with local-looking names pointing at a remote daemon; a remote docker delete in
+  `cloud_destroy`; embedded credentials in script evidence; the hold cap race; the judge's free-text
+  retry reason in the log; a standalone Compose service named like a verb (over-strict); a quoted
+  backslash-newline before a stash (under-credit); glab resource names matching secret components
+  (over-strict); BSD `script` printing remote-exec text (over-strict).

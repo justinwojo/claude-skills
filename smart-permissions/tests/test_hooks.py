@@ -7416,8 +7416,102 @@ def test_phase2_remote_exec():
     check('schema: only safe required', p._SAFETY_SCHEMA['required'], ['safe'])
 
 
+def test_review_fixes_1_7_0():
+    print('\n--- 1.7.0 branch review fixes ---')
+    p = _pretool_module()
+    # C4: a def or class bound over an imported Path is a rebinding too.
+    settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+    for kind, binding in (('def', 'def Path(x):\n    return CFG\n'),
+                          ('class', 'class Path(str):\n    def __new__(cls, x):\n        return CFG\n')):
+        code = (f"from pathlib import Path\nCFG = {settings!r}\n{binding}"
+                "open(Path('/tmp/sp-fixture.txt'), 'w').write('x')\n")
+        check(f'C9 scan: a {kind} rebinding an imported Path is no proof', p._python_writes_no_config(code), False)
+        check(f'C9: …so that heredoc asks the human ({kind})', p.human_required_reason(
+            'Bash', {'command': f"python3 - <<'E'\n{code}E"}) is not None, True)
+    # C6: GitLab GETs that return trigger or cluster tokens stay with the judge.
+    for cmd in ('glab api projects/:id/triggers', 'glab api projects/1/triggers/2',
+                'glab api projects/1/clusters/3'):
+        check(f'glab secret endpoint: {cmd}', p.evaluate_bash(cmd, log_unknowns=False)[0], 'ask')
+    check('glab: other reads still allowed',
+          p.evaluate_bash('glab api projects/1/pipelines', log_unknowns=False)[0], 'allow')
+    # C7: script -c CODE and standalone Compose are in the remote-exec class.
+    saved = {k: os.environ.pop(k, None) for k in ('DOCKER_HOST', 'DOCKER_CONTEXT')}
+    try:
+        for cmd, want in [
+                ("script -q /dev/null -c 'kubectl exec w -- ls'", 'kubectl exec'),
+                ("DOCKER_HOST=ssh://h script -q /dev/null -c 'docker exec web ls'", 'docker exec on a remote host'),
+                ("script -q out.log make build", None),
+                ('DOCKER_HOST=ssh://h docker-compose exec web ls', 'docker-compose exec on a remote host'),
+                ('docker-compose -H ssh://h exec web ls', 'docker-compose exec on a remote host'),
+                ('docker-compose --context prod run web ls', 'docker-compose run on a remote host'),
+                ('timeout 60 docker-compose -H ssh://h exec web ls', 'docker-compose exec on a remote host'),
+                ("docker-compose exec web sh -c 'ls'", None),
+                ('docker-compose --context default exec web ls', None),
+                ('docker-compose -H ssh://h logs web', None),
+                ("script --command='kubectl exec w -- ls' /dev/null", 'kubectl exec'),
+                ("script -qc'kubectl exec w -- ls' /dev/null", 'kubectl exec'),
+                ('DOCKER_CONTEXT=prod docker-compose cp ./a web:/tmp/a', 'docker-compose cp on a remote host')]:
+            check(f'remote_exec: {cmd[:60]}', p.remote_exec(cmd), want)
+        for cmd, gap in [
+                ('DOCKER_CONTEXT=prod docker-compose cp ./a web:/tmp/a', True),
+                ('DOCKER_CONTEXT=prod docker-compose run demo', True),  # the command is in a local file
+                ('DOCKER_CONTEXT=prod docker compose run demo ls', True),
+                ('DOCKER_CONTEXT=prod docker-compose exec web ls', False),
+                ("DOCKER_CONTEXT=prod bash <<'EOF'\ndocker exec -i web sh < local.sh\nEOF", True),
+                ("DOCKER_CONTEXT=prod bash <<'EOF'\ndocker exec web ls\nEOF", False)]:
+            check(f'remote gap: {cmd[:50]}', bool(p.remote_gap(cmd, p.remote_exec(cmd))), gap)
+    finally:
+        os.environ.update({k: v for k, v in saved.items() if v is not None})
+    # C9: a git push flagged for secrets is the developer's.
+    check('hold_resolver: git push with a category 3 flag → developer',
+          p.hold_resolver('Bash', {'command': 'git push origin main'},
+                          {'safe': False, 'category': 3, 'resolver': 'agent'})[0], 'developer')
+    check('hold_resolver: a local git category 3 flag may still be held',
+          p.hold_resolver('Bash', {'command': 'git add notes.txt'},
+                          {'safe': False, 'category': 3, 'resolver': 'agent'})[0], 'agent')
+    check('hold_resolver: a ref named push is no egress',
+          p.hold_resolver('Bash', {'command': 'git show push'},
+                          {'safe': False, 'category': 3, 'resolver': 'agent'})[0], 'agent')
+    check('hold_resolver: git -C DIR push → developer',
+          p.hold_resolver('Bash', {'command': 'git -C repo push origin main'},
+                          {'safe': False, 'category': 3, 'resolver': 'agent'})[0], 'developer')
+    # C2: a recheck can't turn a developer-only first flag into a hold.
+    agent = {'safe': False, 'category': 1, 'resolver': 'agent'}
+    for first, want in [({'safe': False, 'category': 5}, 'developer'), ({'safe': False, 'category': '2'}, 'developer'),
+                        ({'safe': False, 'category': 1, 'resolver': 'developer'}, 'agent'), (None, 'agent')]:
+        check(f'hold_resolver_info: first {first} → {want}',
+              p.hold_resolver_info('Bash', {'command': 'frob'}, {'verdict': agent, 'first': first})[0], want)
+    cfg, cp, tr = _hold_env()
+    first5 = {'safe': False, 'category': 5, 'reason': 'removes the developer\'s data', 'resolver': 'developer'}
+    outs = []
+    check('hook: first pass category 5, recheck agent-resolvable → explicit ask, not held',
+          _run_cfg(PRETOOL, _hcall('frobnicate --purge c5', tr), cp, llm=[first5, _HFLAG], full=True,
+                   outputs=outs), ('ask', True))
+    check('hook: …logged as not held for the first pass',
+          _last_pretool(cfg).get('hold', '').startswith('not held: the first pass: category 5'), True)
+    check('hook: …no hold file', _hold_files(cfg), [])
+    check('hook: …the developer is shown both passes\' concerns',
+          [w in _out_reason(outs[-1] if outs else None) for w in ('category 1', 'first pass: category 5')],
+          [True, True])
+    # C10: a separator inside quotes starts no command.
+    base = tempfile.mkdtemp(prefix='sp-stash-')
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    repo, other = os.path.join(base, 'repo'), os.path.join(base, 'other')
+    for d in (repo, other):
+        os.makedirs(os.path.join(d, '.git'))
+    top = os.path.realpath(repo)
+    for text in (f'echo "note; git stash push"; git -C {other} stash',
+                 f'git commit -m "x; git stash push" && git -C {other} stash',
+                 f"printf 'a; git stash'; cd {other} && git stash"):
+        check(f'stash: quoted mention not credited: {text[:30]}', p._stash_made_in(text, repo, top), False)
+    check('stash: a real one still credited',
+          p._stash_made_in('echo "a; b" && git stash push -m wip', repo, top), True)
+
+
 if __name__ == '__main__':
-    # no docker config of this machine's (a remote current context) in the results
+    # no docker config or endpoint of this machine's (a remote current context) in the results
+    for name in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'CONTAINER_HOST', 'CONTAINER_CONNECTION'):
+        os.environ.pop(name, None)
     os.environ['DOCKER_CONFIG'] = tempfile.mkdtemp(prefix='sp-docker-')
     atexit.register(shutil.rmtree, os.environ['DOCKER_CONFIG'], ignore_errors=True)
     print('Smart Permissions Hook Test Suite')
@@ -7548,6 +7642,7 @@ if __name__ == '__main__':
     test_phase1b_fewer_judge_calls()
     test_phase2_holds()
     test_phase2_remote_exec()
+    test_review_fixes_1_7_0()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

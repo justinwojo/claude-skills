@@ -325,7 +325,7 @@ def outcome_of(p, case, decision, info):
         _, _, developer = p.remote_exec_verdict(decision, "", info, case["remote"])
         return "developer" if developer else "allow"
     if info.get("flagged"):
-        return "hold" if p.HOLDS_ENABLED and p.hold_resolver(case["tool"], case["input"], info.get("verdict"))[0] == "agent" \
+        return "hold" if p.HOLDS_ENABLED and p.hold_resolver_info(case["tool"], case["input"], info)[0] == "agent" \
             else "developer"
     return "allow" if decision == "allow" else "fallthrough"
 

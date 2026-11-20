@@ -2626,8 +2626,6 @@ def script_context(command, cwd, deadline=None):
 # `git stash drop/clear/pop`: the stashes, when each was made against this
 # session's start, and whether this session's own commands made one there.
 _STASH_DISCARD_RE = re.compile(r"\bgit\b[^\n;&|]*?\bstash(?:\s+-\S+)*\s+(?:drop|clear|pop)\b")
-_STASH_CREATE_RE = re.compile(
-    r"\bgit\b[^\n;&|]*?\bstash\b(?!\s+(?:list|show|drop|clear|pop|apply|branch|create|store)\b)")
 STASH_CONTEXT_MAX = 10
 
 
@@ -2659,14 +2657,22 @@ def _stash_made_in(text, where, top):
     `where`) runs in repository `top`: where git runs is the last place the
     command moved to by then (`cd X`, `git -C X`), named with certainty;
     every directory named up to it must be in `top`."""
-    if not _makes_stash(text):  # parsed whole: not text inside quotes (`printf 'a; git stash'`)
+    if not _makes_stash(text):
         return False
-    for m in _STASH_CREATE_RE.finditer(text):
-        end = re.compile(r"[^\n;&|]*").match(text, m.end()).end()
-        begin = max(text.rfind(c, 0, m.start()) for c in "\n;&|") + 1  # the whole command: not `echo git stash`
-        if not _makes_stash(text[begin:end]):
+    # each command as the shell splits it, so a separator inside quotes
+    # (`echo "a; git stash"`) starts nothing; unsure is no credit
+    segments, uncertain = split_compound_command(text)
+    if uncertain:
+        return False
+    view, pos = _comment_lines_dropped(text).replace("\\\n", ""), 0  # the splitter's view
+    for segment in segments:
+        start = view.find(segment, pos)
+        if start < 0:
+            return False
+        pos = start + len(segment)
+        if not _makes_stash(segment):
             continue
-        dirs, certain = _git_command_dirs(text[:end], where)
+        dirs, certain = _git_command_dirs(view[:pos], where)
         # every place named up to it (`cd`, any `git -C`): which one this git
         # runs in is not tracked, so all must be in the repository
         if certain and dirs and all(_in_repo(os.path.realpath(d), top) for d in dirs):
@@ -4123,11 +4129,15 @@ def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
         return ("allow", f"LLM recheck cleared first-pass flag ({flag})",
                 info("llm-recheck", verdict=second))
     confirmed = flag if second.get("refused") else _flag_text(second)
+    if not second.get("refused") and second.get("category") != first.get("category"):
+        confirmed += f" (first pass: {flag})"  # the developer sees both concerns
     if DEBUG:
         print(f"LLM RECHECK CONFIRMED: {tool} — {confirmed}", file=sys.stderr)
     if second.get("refused"):
         second = dict(first, refused=True)  # the first pass's words, never held
-    return ("ask", f"LLM: {confirmed}", info("llm-recheck", flagged=True, verdict=second))
+    flagged = info("llm-recheck", flagged=True, verdict=second)
+    flagged["first"] = first  # a developer-only first flag stays one (_hold_new)
+    return ("ask", f"LLM: {confirmed}", flagged)
 
 
 # ============================================================
@@ -4417,7 +4427,7 @@ _KUBE_VALUE_GLOBALS = frozenset({"-n", "--namespace", "--context", "--cluster", 
                                  "--request-timeout", "-v", "--profile", "--cache-dir"})
 _DOCKER_EXEC_VERBS = frozenset({"exec", "run", "cp", "attach"})
 _REMOTE_EXEC_CLIS = frozenset(_REMOTE_EXEC_PAIRS) | frozenset(_KUBE_EXEC_VERBS) \
-    | {"docker", "podman", "heroku"}
+    | {"docker", "podman", "docker-compose", "podman-compose", "heroku"}
 # Programs that run the command after their own words (when the rules have
 # not unwrapped them already).
 _REMOTE_EXEC_RUNNERS = frozenset({"script", "unbuffer", "stdbuf", "nohup", "caffeinate", "time",
@@ -4486,25 +4496,50 @@ def remote_exec(command):
     return next(_remote_execs(command), None)
 
 
-def _remote_execs(command):
-    """The remote_exec label of each simple command in `command` that is one."""
+def _remote_execs(command, env_remote=None):
+    """The remote_exec label of each simple command in `command` that is one.
+    `env_remote`: whether docker/podman talk to a remote endpoint when no
+    option names one (None: worked out from `command` and the environment)."""
     if not isinstance(command, str) or not command.strip():
         return
-    # the endpoint docker or podman talks to, when no option names one
-    env_remote = bool(re.search(r"\b(?:DOCKER_(?:HOST|CONTEXT|CONFIG)|CONTAINER_(?:HOST|CONNECTION))=",
-                                command)) \
-        or bool(re.match(r"(?:tcp|ssh|https?)://", os.environ.get("DOCKER_HOST", ""))) \
-        or os.environ.get("DOCKER_CONTEXT", "") not in _DOCKER_LOCAL_CONTEXTS \
-        or bool(os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION")) \
-        or any(c not in _DOCKER_LOCAL_CONTEXTS for c in re.findall(r"\bcontext\s+use\s+(\S+)", command))
-    if not env_remote and re.search(r"\b(?:docker|podman)\b", command):
-        env_remote = _docker_current_context() not in _DOCKER_LOCAL_CONTEXTS
+    if env_remote is None:  # the endpoint docker or podman talks to, when no option names one
+        env_remote = bool(re.search(
+            r"\b(?:DOCKER_(?:HOST|CONTEXT|CONFIG)|CONTAINER_(?:HOST|CONNECTION))=", command)) \
+            or bool(re.match(r"(?:tcp|ssh|https?)://", os.environ.get("DOCKER_HOST", ""))) \
+            or os.environ.get("DOCKER_CONTEXT", "") not in _DOCKER_LOCAL_CONTEXTS \
+            or bool(os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION")) \
+            or any(c not in _DOCKER_LOCAL_CONTEXTS
+                   for c in re.findall(r"\bcontext\s+use\s+(\S+)", command))
+        if not env_remote and re.search(r"\b(?:docker|podman)\b", command):
+            env_remote = _docker_current_context() not in _DOCKER_LOCAL_CONTEXTS
     command = _constant_text(command) or command  # `K=kubectl; "$K" exec …`
     for words in _commands_words(command):
+        if os.path.basename(words[0]) == "script":  # util-linux `script -c CODE`: CODE is shell code
+            for word in words[1:]:
+                if not re.search(r"\s", word):
+                    continue
+                # attached to its option (`--command=CODE`, `-qcCODE`): each
+                # start inside the option word is tried
+                head = len(re.match(r"-*[^\s=]*=?", word).group(0)) if word.startswith("-") else 0
+                for at in range(head, -1, -1):
+                    hit = next(_remote_execs(word[at:], env_remote), None)
+                    if hit:
+                        yield hit
+                        break
         if os.path.basename(words[0]) in _REMOTE_EXEC_RUNNERS:  # `script -q out az … exec`
             at = next((i for i, w in enumerate(words) if os.path.basename(w) in _REMOTE_EXEC_CLIS), None)
             words = words[at:] if at else words
         name, args = os.path.basename(words[0]), words[1:]
+        if name in ("docker-compose", "podman-compose"):  # standalone Compose
+            verb = next((i for i, w in enumerate(args) if w in _DOCKER_EXEC_VERBS), None)
+            # its own -H/--host and -c/--context name the endpoint
+            remote = env_remote or verb is not None and any(
+                w.startswith(("-H", "--host")) or w.split("=")[0] in ("-c", "--context")
+                and (w.partition("=")[2] or (args[i + 1] if i + 1 < len(args) else ""))
+                not in _DOCKER_LOCAL_CONTEXTS for i, w in enumerate(args[:verb]))
+            if remote and verb is not None:
+                yield f"{name} {args[verb]} on a remote host"
+            continue
         head = [w.lower() for w in args if not w.startswith("-")]
         pair = next((pair for pair in _REMOTE_EXEC_PAIRS.get(name, ())
                      if any(tuple(head[i:i + 2]) == pair for i in range(len(head)))), None)
@@ -4558,7 +4593,17 @@ _EGRESS_COMMANDS = frozenset({
 
 def _sends_off_machine(command):
     """True when Bash `command` runs a program that sends data off the machine."""
-    return any(os.path.basename(w[0]) in _EGRESS_COMMANDS for w in _commands_words(command))
+    return any(os.path.basename(w[0]) in _EGRESS_COMMANDS
+               or os.path.basename(w[0]) == "git" and _git_subcommand(w) in ("push", "send-email")
+               for w in _commands_words(command))
+
+
+def _git_subcommand(words):
+    """The subcommand of git command `words` (after git's own options), or None."""
+    i = 1
+    while i < len(words) and words[i].startswith("-"):
+        i += 2 if words[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else 1
+    return words[i] if i < len(words) else None
 
 
 def hold_resolver(tool, tool_input, verdict):
@@ -4589,6 +4634,18 @@ def hold_resolver(tool, tool_input, verdict):
     return "agent", ""
 
 
+def hold_resolver_info(tool, tool_input, info):
+    """hold_resolver on a flagged llm_evaluate outcome: the deciding pass
+    names the resolver, and a first pass's developer-only flag (category 2
+    or 5, …) stays the developer's whatever the recheck called it."""
+    resolver, why = hold_resolver(tool, tool_input, info.get("verdict"))
+    first = info.get("first")
+    if resolver == "agent" and isinstance(first, dict):
+        resolver, why = hold_resolver(tool, tool_input, dict(first, resolver="agent"))
+        why = why and f"the first pass: {why}"
+    return resolver, why
+
+
 # A remote payload read from a local file or another command, or built at run
 # time: a redirect or a pipe outside heredoc bodies; any `$` or backtick (no
 # quoting is parsed here, so a literal one asks too); an `@file`, `file://`
@@ -4603,8 +4660,11 @@ def remote_payload_gap(command, label):
     """Why the judge can't see all that remote exec `command` (`label`, from
     remote_exec) runs, or None when the payload is the command text itself."""
     text = _constant_text(command) or command
-    if any(re.search(r"\b(?:cp|rsync|sftp)\b", hit) for hit in _remote_execs(text)):
+    hits = list(_remote_execs(text))
+    if any(re.search(r"\b(?:cp|rsync|sftp)\b", hit) for hit in hits):
         return "it copies files whose contents are not shown"
+    if any(re.search(r"\bcompose run\b", hit) for hit in hits):  # docker compose, docker-compose
+        return "its service's command and settings come from a local compose file"
     # a heredoc's body is in the text the judge sees; quoting is not parsed (a
     # `bash -c '… < x'` hides a redirect in quotes), so a quoted `|` asks too
     outside, rest = [], text
@@ -4612,7 +4672,9 @@ def remote_payload_gap(command, label):
         head, bodies, rest, _missing = _heredoc_split(rest)
         outside.append(head)
         for body, _quoted in bodies:  # `bash <<EOF` running `kubectl exec … < x` here
-            if next(_remote_execs(body), None):
+            # the call is remote already: docker in the body counts as remote,
+            # whatever endpoint the outer command gave it
+            if next(_remote_execs(body, True), None):
                 gap = remote_payload_gap(body, label)
                 if gap:
                     return gap
@@ -4763,7 +4825,7 @@ def _hold_new(input_data, tool, tool_input, reason, info, start, wall_start, rul
     """Hold a call both passes flagged, if the agent may settle it: write the
     deny with the question and return None. Else return why not (the flag
     then goes to the developer)."""
-    resolver, why = hold_resolver(tool, tool_input, info.get("verdict"))
+    resolver, why = hold_resolver_info(tool, tool_input, info)
     if resolver != "agent":
         return why
     key = hold_key(input_data, tool, tool_input)
@@ -5285,9 +5347,11 @@ def _python_writes_no_config(code):
                 else:
                     funcs[a.asname or a.name] = (node.module, a.name)
     counts = _py_import_counts(tree)
-    if (set(modules) | set(funcs)) & _py_rebound_names(tree) \
+    defined = {n.name for n in ast.walk(tree)
+               if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+    if (set(modules) | set(funcs)) & (_py_rebound_names(tree) | defined) \
             or any(counts[n] > 1 for n in set(modules) | set(funcs)):
-        return False  # an imported name bound again (`Path = lambda p: …`)
+        return False  # an imported name bound again (`Path = lambda p: …`, `def Path(p): …`)
     checked = set()  # ids of Names/Attributes that are the func of a checked call
 
     def static_path(node):
@@ -11191,7 +11255,8 @@ def _docker_risk(name, args):
 # GitLab API paths whose GET returns secrets (CI/CD variable values, token
 # and key material), like `glab variable get`
 _GLAB_SECRET_ENDPOINT_RE = re.compile(
-    r"(?i)(?:^|/)(?:variables|[a-z_]*tokens?|secure_files|deploy_keys|keys|registration)(?:[/?#]|$)")
+    r"(?i)(?:^|/)(?:variables|[a-z_]*tokens?|triggers|clusters|secure_files|deploy_keys|keys"
+    r"|registration)(?:[/?#]|$)")
 # `glab api` options that only shape a read (`-X GET` is checked apart)
 _GLAB_API_READ_FLAGS = frozenset({"-i", "--include", "--paginate", "--silent"})
 

@@ -217,9 +217,11 @@ the hook's words and the agent's answer labelled as its claim, not verified.
   security weakening), destroying cloud, production or remote resources or
   data (`az … delete`/`purge`, `kubectl delete`, `terraform destroy`, `gh api
   -X DELETE`, …), sending secrets off the machine (a category 3 flag on a call
-  that sends anything out), a refused or malformed verdict, a verdict that does
-  not name the agent as the one who can settle it or gives no category, and
-  remote execution (below). These come to you directly.
+  that sends anything out, a `git push` included), a refused or malformed
+  verdict, a verdict that does not name the agent as the one who can settle it
+  or gives no category, a first pass that flagged one of these even when the
+  recheck called it something else, and remote execution (below). These come
+  to you directly.
 - **One hold per call.** A hold is bound to the session, the acting agent, the
   working directory, the tool and its input (a Bash `description` is left out,
   so a cosmetic edit keeps the hold); a changed command is judged afresh. It
@@ -244,14 +246,16 @@ mode a call that comes to you is denied, with the reason in the tool result.
 A command that runs code on another machine (`kubectl exec`/`cp`/`debug`,
 `oc rsh`, `az containerapp exec`, `az vm run-command`, `az webapp ssh`, `aws
 ecs execute-command`, `aws ssm send-command`, `gcloud compute ssh`, `fly ssh
-console`, `heroku run`, `docker`/`podman` on a remote host: `-H`, `--context`,
-`--remote`, `DOCKER_HOST`, or a remote `docker context use`) is judged
+console`, `heroku run`, `docker`/`podman`/`docker-compose` on a remote host:
+`-H`, `--context`, `--remote`, `DOCKER_HOST`, or a remote `docker context use`;
+also inside `script -c`) is judged
 strictly, even when your `safe_commands` would allow it. It runs without a
 prompt only when the judge is confident (`confident: true`) that it does what
 your messages or the brief ask and nothing more, and the whole payload is in
 the command text itself (inline, or a heredoc). A payload read from a local
 file or another command (`< diag.sh`, a pipe, `--scripts @file`, `file://…`,
-`--script-uri`, `source`), anything with a `$` or a backtick (a variable or
+`--script-uri`, `source`, a Compose `run` whose service is defined in a local
+compose file), anything with a `$` or a backtick (a variable or
 `$(…)` filled in when it runs), or a file copy comes to you directly, with no
 judge call: its payload never goes to the judge. Quoting is not parsed for
 this, so a quoted pipe (`sh -c "ps | grep x"`) or a literal `$` asks too. Anything else (a flag, an unsure
@@ -642,6 +646,7 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
   - The judge's script evidence marks a script the command itself writes before running it.
   - A verdict with no valid `safe` (a reply that is not JSON or has no answer included), and a flag whose recheck times out, errors or gives no verdict, are now explicit asks (it used to fall through to the normal prompt path, where auto mode's classifier or the learner's own judge could approve it). Parallel hooks no longer overwrite each other's entries in the store that tells the PermissionRequest hook a call is yours.
   - Decision log: sources `llm-hold` and `hold-retry`, and a `hold` field. The agent's answer is never logged.
+  - Branch review fixes: a `def` or `class` bound over an imported `Path` (or any imported name) no longer passes the config-write scan; `glab api` reads of pipeline trigger and cluster endpoints go to the judge; `script -c`/`--command` code, standalone `docker-compose` (exec, run, cp) and a Compose `run` on a remote host are in the remote-execution class, the last always yours; a heredoc run by local bash under a remote endpoint is checked for local payloads; a `git push` flagged for secrets is never held, nor a call whose first judge pass flagged a developer-only category, and the developer sees both passes' concerns when they differ; stash provenance no longer credits a `git stash` quoted inside another command.
 
 - **1.6.0 (2026-11-19) — fewer judge calls, fewer false config-write prompts.**
   - A Python heredoc is checked like `python3 -c` code when it is the only code source: one complete heredoc with a quoted delimiter (`python3 - <<'EOF'`), plain flags, no pipe or second redirect into it, no `PYTHON*`/loader variable in the command and no non-UTF-8 `coding:` line. Code that only transforms data is allowed by rule; anything else still goes to the judge.
