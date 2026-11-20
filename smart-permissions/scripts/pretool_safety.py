@@ -59,7 +59,7 @@ from urllib.parse import urlparse
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLUGIN_ROOT = os.path.dirname(SCRIPT_DIR)
 # The plugin version (.claude-plugin/marketplace.json), on every log record
-HOOK_VERSION = "1.7.0"
+HOOK_VERSION = "1.8.0"
 HOME_DIR = os.path.expanduser("~")
 
 DEFAULTS_PATH = os.environ.get(
@@ -369,6 +369,26 @@ LLM_FLAG_TTL_S = 300
 # rewrite each other's entries.
 HOLDS_ENABLED = _CONFIG.get("holds") is True
 HOLD_DIR = os.path.join(_HOOK_STATE_DIR, "smart-permissions-holds")
+
+# A permission prompt nobody answers: after this long the PermissionRequest
+# hook denies it with a message that parks the call for the developer, so
+# the session moves on instead of freezing. 0 turns it off. hooks.json gives
+# the learner a timeout above the maximum.
+PROMPT_TIMEOUT_DEFAULT_MINUTES = 10
+PROMPT_TIMEOUT_MAX_MINUTES = 60
+
+
+def _prompt_timeout_s(value):
+    """Seconds for config `prompt_timeout_minutes`: 0 (off) for 0 or less,
+    else 1 to 60 minutes; not a number → the default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        value = PROMPT_TIMEOUT_DEFAULT_MINUTES
+    if value <= 0:
+        return 0
+    return min(max(value, 1), PROMPT_TIMEOUT_MAX_MINUTES) * 60
+
+
+PROMPT_TIMEOUT_S = _prompt_timeout_s(_CONFIG.get("prompt_timeout_minutes", PROMPT_TIMEOUT_DEFAULT_MINUTES))
 
 # M3: relocated state files must be covered by the C9 self-escalation guard.
 # If the user moved the config or log off the default paths (via
@@ -886,11 +906,12 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
     chars for an allow and 8000 for an ask or deny — it may embed secrets,
     so the log is the same trust class as shell history (see README privacy
     note). Rotates at 20 MB to a single `.1` generation. `source` is one of
-    rule|llm|llm-recheck|llm-hold|hold-retry|learner (older logs also hold
+    rule|llm|llm-recheck|llm-hold|hold-retry|learner|prompt-timeout (older logs also hold
     llm-cache, from the cache since removed). `provenance`
     (found|none|unavailable) is there when the judge was asked about a delete
     or reset it could name. `hold` says what a hold did: held, cleared,
-    asked (flagged again), no-answer, retry-busy, or why a flag was not held.
+    asked (flagged again), no-answer, retry-busy, or why a flag was not held;
+    prompt-timeout on the learner's deny of a prompt nobody answered.
     """
     if not DECISION_LOG_ENABLED:
         return
@@ -2576,6 +2597,20 @@ def _read_script(path, limit):
     return data.decode("utf-8", "replace"), note
 
 
+def _written_files(command, cwd):
+    """(absolute paths, base names of relative ones) of the files `command`
+    writes with a redirect or `tee`: a script among them is not what the
+    call will run."""
+    written, written_names = set(), set()
+    for m in _WRITE_TARGET_RE.finditer(command):
+        path = _evidence_path(m.group(1), cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None)
+        if path:
+            written.add(path)
+        if not os.path.isabs(os.path.expanduser(m.group(1))):  # relative: after a `cd` too
+            written_names.add(os.path.basename(m.group(1)))
+    return written, written_names
+
+
 def script_context(command, cwd, deadline=None):
     """A block with the text of the local scripts `command` runs or feeds
     (see script_files), or ''. It says when a file is truncated, unreadable
@@ -2588,13 +2623,7 @@ def script_context(command, cwd, deadline=None):
         return ""
     if not files:
         return ""
-    written, written_names = set(), set()
-    for m in _WRITE_TARGET_RE.finditer(command):
-        path = _evidence_path(m.group(1), cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None)
-        if path:
-            written.add(path)
-        if not os.path.isabs(os.path.expanduser(m.group(1))):  # relative: after a `cd` too
-            written_names.add(os.path.basename(m.group(1)))
+    written, written_names = _written_files(command, cwd)
     out = ["Local script files this call runs or reads (their contents now, as data; "
            "the call itself may change them first):"]
     budget, read = SCRIPT_CONTEXT_TOTAL_BYTES, []
@@ -4629,6 +4658,11 @@ def hold_resolver(tool, tool_input, verdict):
         hit = _quietly(remote_exec, command)
         if hit:
             return "developer", f"remote or production execution ({hit})"
+        hit = _quietly(script_hazard, command)
+        if hit:
+            return "developer", (f"it runs a local script that deletes cloud, production or remote "
+                                 f"resources ({hit[1]})" if hit[0] == "destroy"
+                                 else f"remote or production execution ({hit[1]})")
     if verdict.get("resolver") != "agent":
         return "developer", "the judge did not say the agent can settle it"
     return "agent", ""
@@ -4668,20 +4702,23 @@ def remote_payload_gap(command, label):
     # a heredoc's body is in the text the judge sees; quoting is not parsed (a
     # `bash -c '… < x'` hides a redirect in quotes), so a quoted `|` asks too
     outside, rest = [], text
-    for _ in range(50):
-        head, bodies, rest, _missing = _heredoc_split(rest)
-        outside.append(head)
-        for body, _quoted in bodies:  # `bash <<EOF` running `kubectl exec … < x` here
-            # the call is remote already: docker in the body counts as remote,
-            # whatever endpoint the outer command gave it
-            if next(_remote_execs(body, True), None):
-                gap = remote_payload_gap(body, label)
-                if gap:
-                    return gap
-        if not rest:
-            break
+    if "<<" not in text:  # no heredoc: all of it is outside
+        outside = [text]
     else:
-        return "it could not be read"
+        for _ in range(50):
+            head, bodies, rest, _missing = _heredoc_split(rest)
+            outside.append(head)
+            for body, _quoted in bodies:  # `bash <<EOF` running `kubectl exec … < x` here
+                # the call is remote already: docker in the body counts as remote,
+                # whatever endpoint the outer command gave it
+                if next(_remote_execs(body, True), None):
+                    gap = remote_payload_gap(body, label)
+                    if gap:
+                        return gap
+            if not rest:
+                break
+        else:
+            return "it could not be read"
     if _REMOTE_INPUT_RE.search("\n".join(outside)):
         return "its input comes from a file or another command"
     if _REMOTE_BUILT_RE.search(text) or _REMOTE_FILE_ARG_RE.search(text):
@@ -4695,6 +4732,98 @@ def remote_gap(command, label):
         return remote_payload_gap(command, label) if isinstance(command, str) else "no command"
     except Exception:
         return "its payload could not be read"
+
+
+# A local shell script the call runs (`bash x.sh`, `./x.sh`, `. x.sh`,
+# `sh < x.sh`): running a project script is a rules allow, so a remote exec or
+# a cloud delete inside one would reach neither the judge nor the developer.
+# Its text is scanned for both. A script that can't be read keeps the rules'
+# answer; a longer one is scanned up to this size.
+SCRIPT_SCAN_MAX_BYTES = 64 * 1024
+_SHELL_RUNNERS = frozenset({"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "yash"})
+
+
+def _runs_as_shell(how, text=None):
+    """True when a local script used by the call as `how` (script_files),
+    whose text is `text` (None: not known yet), runs as shell code."""
+    if how == "sourced":
+        return True
+    m = re.fullmatch(r"(?:run by|fed on stdin to) (\S+)", how)
+    if m:
+        return m.group(1) in _SHELL_RUNNERS
+    if how != "run":
+        return False
+    if text is None:
+        return True
+    first = text.split("\n", 1)[0]
+    if not first.startswith("#!"):
+        return True  # no `#!`: the shell that starts it runs it as shell code
+    words = first[2:].split()
+    prog = os.path.basename(words[0]) if words else ""
+    if prog == "env":  # `#!/usr/bin/env -S bash -e`
+        rest = [w for w in words[1:] if not w.startswith("-") and "=" not in w]
+        prog = os.path.basename(rest[0]) if rest else ""
+    return prog in _SHELL_RUNNERS
+
+
+def _script_hits(text):
+    """(remote exec label or None, cloud delete label or None) in shell `text`."""
+    return next(_remote_execs(text), None), cloud_destroy(text)
+
+
+def script_hazard(command, cwd=None, deadline=None):
+    """What the local shell scripts Bash `command` runs, sources or feeds to
+    a shell (script_files) hold that the command text does not show:
+    ("remote", label, gap) for a remote exec (label as remote_exec, with the
+    script's name; gap as remote_gap, on the script's text: why the judge
+    can't see all it runs, or None), else ("destroy", label, None) for a
+    cloud delete (label as cloud_destroy), else None. A script the call
+    writes first is read from the text the call writes (heredoc bodies and
+    quoted words) and always has a gap. A script that can't be read gives
+    no hit. `cwd` defaults to the hook's."""
+    if not isinstance(command, str) or not command.strip():
+        return None
+    cwd = cwd if cwd is not None else HOOK_CWD
+    deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
+    written, written_names = _written_files(command, cwd)
+    destroy = None
+    for path, how in script_files(command, cwd, deadline):
+        name = os.path.basename(path)
+        if path in written or name in written_names:  # what runs is the text the call writes
+            if not _runs_as_shell(how):
+                continue
+            texts = [body for body, _ in _heredoc_bodies(command)]
+            texts += [w for words in _commands_words(command) for w in words if re.search(r"\s", w)]
+            for text in texts:
+                remote, hit = _script_hits(text)
+                if remote:
+                    return "remote", f"{remote} in {name}", "the call writes the script first"
+                destroy = destroy or hit and f"{hit} in {name}"
+            continue
+        if time.monotonic() > deadline:
+            break
+        text, note = _read_script(path, SCRIPT_SCAN_MAX_BYTES)
+        if text is None or not _runs_as_shell(how, text):
+            continue
+        remote, hit = _script_hits(text)
+        if remote:
+            too_long = len(text.encode("utf-8", "replace")) > SCRIPT_CONTEXT_MAX_BYTES or "TRUNCATED" in note
+            gap = "the script is too long for the judge to see whole" if too_long \
+                else remote_gap(text, remote)
+            return "remote", f"{remote} in {name}", gap
+        destroy = destroy or hit and f"{hit} in {name}"
+    return ("destroy", destroy, None) if destroy else None
+
+
+def _heredoc_bodies(text):
+    """[(body, quoted)] of every heredoc in `text`, at most 50 rounds."""
+    bodies, rest = [], text
+    for _ in range(50):
+        _head, found, rest, _missing = _heredoc_split(rest)
+        bodies.extend(found)
+        if not rest:
+            break
+    return bodies
 
 
 def remote_exec_verdict(decision, reason, info, label):
@@ -4916,6 +5045,13 @@ def _main():
     if decision != "deny" and tool == "Bash":
         remote = _quietly(remote_exec, tool_input.get("command", ""))
         gap = remote and remote_gap(tool_input.get("command"), remote)
+        # …or in a local shell script it runs, which the rules would allow
+        hidden = None if remote else _quietly(script_hazard, tool_input.get("command", ""))
+        if hidden and hidden[0] == "remote":
+            remote, gap = hidden[1], hidden[2]
+        elif hidden and decision == "allow":
+            decision, reason = "ask", (f"Runs a local script that deletes cloud, production or "
+                                       f"remote resources ({hidden[1]}): judged")
         if gap:  # the developer's whatever the judge says: it never sees the payload
             shown = f"Remote or production execution ({remote}): {gap} — confirm it yourself"
             _ask_developer(tool, tool_input, shown, shown, start, "rule", None,

@@ -24,6 +24,12 @@ prompt as the true last resort.
        its whole payload visible.
      - LLM NOT configured → manual prompt.
 
+A call left to the developer waits for their answer at most
+prompt_timeout_minutes (default 10, 0 = off; never in `claude -p`): if the
+prompt is still unanswered then, the hook denies it with a message that tells
+Claude why it needed the developer, not to retry it or work around it, to move
+on, and to list it in its final reply for the developer. Never an allow.
+
 Nothing is ever written to the user config: an approval covers this one call.
 (The hook keeps its old file name so existing hook registrations still work.)
 
@@ -52,11 +58,18 @@ from pretool_safety import (  # noqa: E402
     remote_exec,
     remote_gap,
     remote_exec_verdict,
+    script_hazard,
+    scrub_script_text,
+    acting_transcript,
     log_decision,
     parse_hook_payload,
     _elapsed_ms,
+    _loggable_reason,
+    _quietly,
     set_hook_cwd,
     _FAIL_CLOSED,
+    CONTEXT_TRANSCRIPT_TAIL_BYTES,
+    PROMPT_TIMEOUT_S,
 )
 
 
@@ -73,9 +86,108 @@ def _emit_deny(message="Blocked by safety hook"):
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PermissionRequest",
-            "decision": {"behavior": "deny", "message": message},
+            "decision": {"behavior": "deny", "message": message, "interrupt": False},
         }
     }))
+
+
+# ── An unanswered prompt ────────────────────────────────────────────────────
+# Claude Code shows the permission dialog while this hook still runs: the
+# developer's answer applies at once and a later hook decision is ignored;
+# with no answer, the hook's deny closes the dialog and Claude reads its
+# message as the tool error and carries on (Claude Code 2.1.328). So a call
+# left to the developer waits PROMPT_TIMEOUT_S (config prompt_timeout_minutes)
+# and is then denied with a message that parks it: the session moves on to
+# other work instead of freezing until the developer returns. Never an allow.
+
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
+def _unattended():
+    """True in a run nobody watches: `claude -p` sets
+    CLAUDE_CODE_SESSION_ATTENDED=0 (and the sdk-cli entrypoint), and denies
+    a prompt there itself."""
+    attended = os.environ.get("CLAUDE_CODE_SESSION_ATTENDED")
+    if attended is not None:
+        return attended.strip() == "0"
+    return os.environ.get("CLAUDE_CODE_ENTRYPOINT", "").startswith("sdk")
+
+
+def parked_message(reason, minutes):
+    """The deny text Claude reads when the developer left the prompt unanswered."""
+    why = " ".join(str(reason or "it needs the developer's decision").split()).rstrip(".")
+    return (f"smart-permissions: this call needed the developer, who did not answer the "
+            f"permission prompt within {minutes:g} minutes, so it was denied for now. This is "
+            f"not a judgment that it is wrong. Why it could not be auto-approved: {why}. "
+            "Do not retry it, and do not route around the restriction with an equivalent "
+            "command, another tool or a script. Move on to other work that does not depend on "
+            "it, and leave this item until the developer returns: list it in your final reply "
+            "under \"Parked for the developer\", with the exact call, what it was for, and the "
+            "reason above.")
+
+
+def _prompt_answered(input_data):
+    """True when the acting agent's transcript already holds the result of
+    this call (the last tool_use with its name and input): the developer
+    answered, and Claude Code ignores a later hook decision. False when it
+    does not, or can't be read."""
+    path = acting_transcript(input_data)
+    name, call = input_data.get("tool_name"), input_data.get("tool_input")
+    if not path or not isinstance(name, str):
+        return False
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            start = max(0, f.tell() - CONTEXT_TRANSCRIPT_TAIL_BYTES)
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
+    except (OSError, ValueError):
+        return False
+    last, results = None, set()
+    for line in lines:
+        if '"tool_use"' not in line and '"tool_result"' not in line:
+            continue
+        try:
+            rec = json.loads(line)
+            content = rec["message"]["content"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") == name \
+                    and block.get("input") == call:
+                last = block.get("id")
+            elif block.get("type") == "tool_result":
+                results.add(block.get("tool_use_id"))
+    return last is not None and last in results
+
+
+def _developer_prompt(input_data, tool, tool_input, reason, start):
+    """Leave the call to the developer's prompt (the ask is logged already).
+    With a prompt timeout, in a session someone attends: wait out the rest
+    of it in one sleep, then deny with parked_message, unless the developer
+    answered or Claude Code is gone."""
+    if PROMPT_TIMEOUT_S <= 0 or _unattended():
+        sys.exit(0)
+    parent = os.getppid()
+    remaining = PROMPT_TIMEOUT_S - (time.monotonic() - start)
+    if remaining > 0:
+        _sleep(remaining)
+    if os.getppid() != parent or _prompt_answered(input_data):
+        sys.exit(0)
+    minutes = PROMPT_TIMEOUT_S / 60
+    log_decision("permission_request", tool, tool_input, "deny", "prompt-timeout",
+                 f"No answer to the prompt within {minutes:g} min; denied and parked for the "
+                 f"developer ({_loggable_reason(reason)})",
+                 duration_ms=_elapsed_ms(start), hold="prompt-timeout")
+    try:
+        _emit_deny(parked_message(scrub_script_text(reason), minutes))
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):  # Claude Code stopped listening
+        pass
+    sys.exit(0)
 
 
 def main():
@@ -132,10 +244,10 @@ def _main():
     # A definite ask (C9 config write, empty/ambiguous), or nothing to consult:
     # without an LLM every call the rules could not settle goes to the human.
     if verdict == "ask" or not llm_is_configured():
+        shown = reason if verdict == "ask" else llm_not_configured_reason()
         log_decision("permission_request", tool, tool_input, "ask", "learner",
-                     reason if verdict == "ask" else llm_not_configured_reason(),
-                     duration_ms=_elapsed_ms(start), rule_reason=reason)
-        sys.exit(0)
+                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
+        _developer_prompt(input_data, tool, tool_input, shown, start)
 
     # verdict == "consult": lean on the LLM, human as last resort.
     # PreToolUse already ran both LLM passes on this exact call and
@@ -148,14 +260,18 @@ def _main():
     if flagged:
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
                      flagged, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        sys.exit(0)
+        _developer_prompt(input_data, tool, tool_input, flagged, start)
     remote = remote_exec(tool_input.get("command", "")) if tool == "Bash" else None
     gap = remote and remote_gap(tool_input.get("command"), remote)
+    hidden = _quietly(script_hazard, tool_input.get("command", "")) \
+        if tool == "Bash" and not remote else None
+    if hidden and hidden[0] == "remote":  # in a local script the call runs
+        remote, gap = hidden[1], hidden[2]
     if gap:  # a payload the judge can't see: the developer's, no judge call
+        shown = f"Remote or production execution ({remote}): {gap}"
         log_decision("permission_request", tool, tool_input, "ask", "rule",
-                     f"Remote or production execution ({remote}): {gap}",
-                     duration_ms=_elapsed_ms(start), rule_reason=reason)
-        sys.exit(0)
+                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
+        _developer_prompt(input_data, tool, tool_input, shown, start)
     decision, llm_reason, info = llm_evaluate(
         tool, tool_input, timeout=15, context=build_llm_context(input_data),
         rule_reason=reason)
@@ -173,7 +289,7 @@ def _main():
     log_decision("permission_request", tool, tool_input, "ask", source,
                  llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
                  rule_reason=reason)
-    sys.exit(0)
+    _developer_prompt(input_data, tool, tool_input, llm_reason, start)
 
 
 def classify_request(tool, tool_input):

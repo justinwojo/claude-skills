@@ -370,3 +370,74 @@ fixes; the second round's fixes were not re-reviewed. Tests: `test_review_fixes_
   retry reason in the log; a standalone Compose service named like a verb (over-strict); a quoted
   backslash-newline before a stash (under-credit); glab resource names matching secret components
   (over-strict); BSD `script` printing remote-exec text (over-strict).
+
+# 1.8.0: unanswered prompts are parked; local scripts are read
+
+Same branch. A policy change for prompts (a deny after a wait, never an allow) and a narrow rule change
+for project scripts.
+
+## What landed
+
+- **Prompt timeout** (`permission_learner._developer_prompt`). Every learner path that used to exit with
+  no decision (a definite ask, no judge, a PreToolUse flag or explicit ask from the flag store, a remote
+  payload gap, a judge flag or error) logs its `ask` as before, then, unless the timeout is off or the
+  run is unattended, sleeps once for the rest of `PROMPT_TIMEOUT_S` (counted from hook start) and prints
+  a PermissionRequest deny (`interrupt: false`) with `parked_message(reason, minutes)`. Not for allows,
+  rule denies, `AskUserQuestion`, malformed input or a hook error.
+  - Config `prompt_timeout_minutes` (defaults.json 10). `_prompt_timeout_s`: bool/non-number/NaN → 10,
+    `<= 0` → off, else clamped to 1–60 minutes (`PROMPT_TIMEOUT_MAX_MINUTES`). hooks.json gives the
+    learner `timeout: 3660`.
+  - `_unattended()`: `CLAUDE_CODE_SESSION_ATTENDED == "0"`, or the variable absent and
+    `CLAUDE_CODE_ENTRYPOINT` starting with `sdk`. Checked on Claude Code 2.1.329: `claude -p` runs the
+    PermissionRequest hook for a fall-through with `ATTENDED=0`, `ENTRYPOINT=sdk-cli`; an interactive
+    session has `1` and `cli`. Without this a `-p` run would stall for the full timeout.
+  - After the sleep: nothing if the parent process changed (Claude Code gone) or `_prompt_answered`
+    finds a `tool_result` for the last `tool_use` in the acting transcript with this call's name and
+    input (the developer answered; Claude Code ignores a late hook decision anyway, this keeps the log
+    true). A transcript it can't read counts as unanswered: the deny is harmless if ignored.
+  - The message carries the reason the developer would have seen, through `scrub_script_text`; the log
+    record (`source: prompt-timeout`, `hold: prompt-timeout`, decision `deny`) keeps
+    `_loggable_reason(reason)`. It follows the call's `ask` record.
+  - Tests set `CLAUDE_CODE_SESSION_ATTENDED=0` for the whole suite; `_run_cfg(patch=…)` injects
+    `_m.PROMPT_TIMEOUT_S` and a recording `_m._sleep`.
+- **Script hazard** (`script_hazard(command, cwd=None, deadline=None)`). For each file `script_files`
+  finds that runs as shell code (`_runs_as_shell`: run by a shell runner, sourced, fed on stdin to a
+  shell, or run directly with a shell `#!` or none), read up to `SCRIPT_SCAN_MAX_BYTES` (64 KB) with
+  `_read_script` and scanned with `_remote_execs` and `cloud_destroy`. Returns `("remote", label, gap)`
+  (first remote hit wins; gap: too long for the judge's 8 KB view, else `remote_gap` on the script text),
+  `("destroy", label, None)`, or None. A script the call writes first (`_written_files`, factored out of
+  `script_context`) is read from the command's heredoc bodies and quoted words, and a remote hit there
+  always has a gap. Unreadable files give no hit.
+  - PreToolUse: a remote hit becomes the call's `remote` (gap → explicit ask with no judge call; else the
+    strict confident-only judge path); a destroy hit turns a rules allow into a judge call with
+    rule reason "Runs a local script that deletes …: judged". `hold_resolver` sends both to the developer.
+    The learner applies the remote hit the same way (gap → developer, no judge).
+- **`remote_payload_gap`** reads a text with no `<<` whole instead of walking it 50 lines at a time, so a
+  long heredoc-free payload is no longer "it could not be read" (it is checked for `$`, pipes, redirects
+  like any other).
+
+Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
+
+## Interfaces
+
+- `PROMPT_TIMEOUT_S`, `PROMPT_TIMEOUT_MAX_MINUTES`, `_prompt_timeout_s(value)` (pretool_safety).
+- `permission_learner.parked_message(reason, minutes)`, `_developer_prompt(input_data, tool, tool_input,
+  reason, start)`, `_unattended()`, `_prompt_answered(input_data)`, `_sleep` (the one wait; tests patch it).
+- `script_hazard(command, cwd=None, deadline=None)`, `_runs_as_shell(how, text=None)`,
+  `_written_files(command, cwd)`, `_heredoc_bodies(text)`, `SCRIPT_SCAN_MAX_BYTES`.
+
+## Open questions
+
+- Not live-tested end to end in an interactive session with the plugin (the dialog-during-hook behaviour
+  was verified with a plain sleeping hook on 2.1.328/329). Whether Claude Code kills the learner when the
+  developer answers is unknown; either way nothing reaches Claude.
+- Parallel tool calls: if Claude Code queues their dialogs while every learner runs, the later prompts'
+  timers start before their dialog shows.
+- `ATTENDED`/`ENTRYPOINT` are observed, not documented. A future Claude Code that drops both would make
+  `-p` runs wait (bounded by the timeout), not approve anything.
+- The script scan: shell scripts only (not `python3 x.py`, `make`, `npm run`), one level (a script that
+  calls another script is not followed), at most `SCRIPT_CONTEXT_MAX_FILES` files, text patterns only
+  (`$CLI delete` is missed). `cat x.sh | bash` already asks (shell reading stdin) but is not scanned.
+  `llm_eval.py` does not apply it (its sandbox scripts are built after the rule verdict).
+- A remote exec in a script with any `$` is a gap, so nearly every real remote script comes to the
+  developer; that is the 1.7.0 text rule applied to the script, by design.

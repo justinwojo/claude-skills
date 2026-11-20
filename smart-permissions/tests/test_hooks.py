@@ -35,6 +35,10 @@ LEARNER = os.path.join(SCRIPT_DIR, 'permission_learner.py')
 _TEST_CONFIG_DIR = tempfile.mkdtemp(prefix='sp-test-')
 HERMETIC_CONFIG_PATH = os.path.join(_TEST_CONFIG_DIR, 'smart-permissions-config.json')
 atexit.register(shutil.rmtree, _TEST_CONFIG_DIR, ignore_errors=True)
+# Every hook run here is an unattended one (as under `claude -p`), so a call
+# the learner leaves to the developer never waits out the prompt timeout;
+# the prompt-timeout tests set it back to attended for their own runs.
+os.environ['CLAUDE_CODE_SESSION_ATTENDED'] = '0'
 
 # Counters
 passed = 0
@@ -1272,7 +1276,8 @@ def _cache_key(tool, tool_input):
 
 
 def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
-             raw_input=None, extra_env=None, requests_log=None, full=False, outputs=None):
+             raw_input=None, extra_env=None, requests_log=None, full=False, outputs=None,
+             patch=''):
     """Run a hook against config_path with the LLM optionally mocked.
 
     llm:
@@ -1291,6 +1296,7 @@ def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
       tell an explicit hook "ask" from a silent fall-through.
     outputs: optional list; the hook's parsed output (or None) is appended.
     SP_MOCK_DELAY in extra_env makes each mocked request wait that long.
+    patch: Python run after the hook module is imported (as `_m`), before main().
     Returns the decision string ('allow' | 'deny' | 'ask').
     """
     env = os.environ.copy()
@@ -1343,8 +1349,9 @@ def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
         "import urllib.request\n"
         "%s"
         "import %s as _m\n"
+        "%s\n"
         "_m.main()\n"
-    ) % (SCRIPT_DIR, mock, module)
+    ) % (SCRIPT_DIR, mock, module, patch)
 
     stdin = raw_input if raw_input is not None else json.dumps(payload)
     r = subprocess.run([sys.executable, '-c', wrapper], input=stdin,
@@ -7508,6 +7515,321 @@ def test_review_fixes_1_7_0():
           p._stash_made_in('echo "a; b" && git stash push -m wip', repo, top), True)
 
 
+def _wait_patch(timeout_s, sleeps):
+    """_run_cfg patch: the learner's prompt timeout set to `timeout_s` (None:
+    as configured), each wait appended to the file `sleeps` and slept."""
+    code = ("import time as _t\n"
+            "def _rec(s, _p=%r):\n"
+            "    open(_p, 'a').write(repr(s) + '\\n')\n"
+            "    _t.sleep(min(s, 0.2))\n"
+            "_m._sleep = _rec\n") % sleeps
+    if timeout_s is not None:
+        code += "_m.PROMPT_TIMEOUT_S = %r\n" % timeout_s
+    return code
+
+
+def _sleeps(path):
+    try:
+        with open(path) as f:
+            return [float(line) for line in f if line.strip()]
+    except OSError:
+        return []
+
+
+def _attended(**extra):
+    env = {'CLAUDE_CODE_SESSION_ATTENDED': '1', 'CLAUDE_CODE_ENTRYPOINT': 'cli'}
+    env.update(extra)
+    return env
+
+
+def _learner_out(out):
+    return ((out or {}).get('hookSpecificOutput') or {}).get('decision') or {}
+
+
+def test_prompt_timeout_1_8_0():
+    print('\n--- 1.8.0: an unanswered prompt is parked, not a freeze ---')
+    p = _pretool_module()
+    for value, want in [(0, 0), (-5, 0), (0.5, 60), (10, 600), (1000, 3600), (True, 600),
+                        ('10', 600), (None, 600), (float('nan'), 600), (float('inf'), 3600)]:
+        check(f'prompt timeout bounds: {value!r}', p._prompt_timeout_s(value), want)
+    with open(os.path.join(os.path.dirname(SCRIPT_DIR), 'hooks', 'hooks.json')) as f:
+        hooks = json.load(f)['hooks']
+    learner_timeout = hooks['PermissionRequest'][0]['hooks'][0]['timeout']
+    check('hooks.json: the learner outlives the longest prompt timeout',
+          learner_timeout > p.PROMPT_TIMEOUT_MAX_MINUTES * 60, True)
+    with open(os.path.join(os.path.dirname(SCRIPT_DIR), 'config', 'defaults.json')) as f:
+        check('defaults: prompt_timeout_minutes 10', json.load(f).get('prompt_timeout_minutes'), 10)
+
+    work = tempfile.mkdtemp(prefix='sp-park-')
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+    unknown = {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate --all'}, 'cwd': work}
+
+    # No judge, attended: the developer's prompt, then a parked deny.
+    cfg, cp = _fresh_cfg()
+    sl = os.path.join(cfg, 'sleeps')
+    outs = []
+    t0 = time.monotonic()
+    got = _run_cfg(LEARNER, unknown, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl), outputs=outs)
+    check('parked: denied after the wait', got, 'deny')
+    check('parked: one sleep, no longer than the timeout',
+          (len(_sleeps(sl)), all(0 < s <= 0.05 for s in _sleeps(sl))), (1, True))
+    check('parked: the hook returned promptly', time.monotonic() - t0 < 10, True)
+    dec = _learner_out(outs[-1])
+    msg = dec.get('message', '')
+    check('parked: interrupt false', dec.get('interrupt'), False)
+    check('parked: says it needed the developer', 'needed the developer' in msg, True)
+    check('parked: gives the reason it was not auto-approved',
+          'Why it could not be auto-approved: LLM not configured' in msg, True)
+    check('parked: no retry, no route around it',
+          'Do not retry it' in msg and 'route around the restriction' in msg, True)
+    check('parked: move on, list it for the developer',
+          'Move on to other work' in msg and 'Parked for the developer' in msg and 'final reply' in msg, True)
+    recs = [r for r in _decision_records(cfg) if r.get('hook') == 'permission_request']
+    check('parked: the ask is logged first, then the timeout',
+          [(r.get('decision'), r.get('source')) for r in recs],
+          [('ask', 'learner'), ('deny', 'prompt-timeout')])
+    check('parked: the timeout record says so', (recs[-1].get('hold'),
+          recs[-1].get('reason', '').startswith('No answer to the prompt within')), ('prompt-timeout', True))
+
+    # Off, unattended, -p: never waits.
+    for title, initial, env in [
+            ('prompt_timeout_minutes 0', {'prompt_timeout_minutes': 0}, _attended()),
+            ('unattended session', None, {'CLAUDE_CODE_SESSION_ATTENDED': '0', 'CLAUDE_CODE_ENTRYPOINT': 'cli'}),
+            ('-p entrypoint, no attended flag', None, {'CLAUDE_CODE_SESSION_ATTENDED': '', 'CLAUDE_CODE_ENTRYPOINT': 'sdk-cli'}),
+    ]:
+        cfg, cp = _fresh_cfg(initial)
+        sl = os.path.join(cfg, 'sleeps')
+        env = dict(env)
+        patch = _wait_patch(None if initial else 0.05, sl)
+        if env.get('CLAUDE_CODE_SESSION_ATTENDED') == '':
+            env.pop('CLAUDE_CODE_SESSION_ATTENDED')
+            patch += "import os as _o\n_o.environ.pop('CLAUDE_CODE_SESSION_ATTENDED', None)\n"
+        got = _run_cfg(LEARNER, unknown, cp, extra_env=env, patch=patch, full=True)
+        check(f'no wait ({title}): falls through to the prompt', (got, _sleeps(sl)), (('ask', False), []))
+    cfg, cp = _fresh_cfg()
+    sl = os.path.join(cfg, 'sleeps')
+    patch = _wait_patch(0.05, sl) + "import os as _o\n_o.environ.pop('CLAUDE_CODE_SESSION_ATTENDED', None)\n"
+    check('no attended flag, interactive entrypoint: waits',
+          (_run_cfg(LEARNER, unknown, cp, extra_env={'CLAUDE_CODE_ENTRYPOINT': 'cli'}, patch=patch),
+           len(_sleeps(sl))), ('deny', 1))
+    cfg, cp = _fresh_cfg({'prompt_timeout_minutes': 10})
+    lp = _learner_module_attr('PROMPT_TIMEOUT_S', cp)
+    check('configured minutes reach the learner', lp, 600)
+
+    # Never for a decision the learner makes itself.
+    for title, payload, llm, want in [
+            ('judge allow', unknown, {'safe': True}, 'allow'),
+            ('rule deny', {'tool_name': 'Bash', 'tool_input': {'command': d('cm0gLXJmIC8=')}, 'cwd': work}, None, 'deny'),
+            ('AskUserQuestion', {'tool_name': 'AskUserQuestion', 'tool_input': {'questions': []}}, None, 'ask')]:
+        cfg, cp = _fresh_cfg()
+        sl = os.path.join(cfg, 'sleeps')
+        outs = []
+        got = _run_cfg(LEARNER, payload, cp, llm=llm, extra_env=_attended(), patch=_wait_patch(0.05, sl),
+                       outputs=outs)
+        check(f'no wait ({title})', (got, _sleeps(sl)), (want, []))
+        if want == 'deny':
+            check('rule deny: its own reason, not a parked message',
+                  'Parked for the developer' in _learner_out(outs[-1]).get('message', ''), False)
+
+    # A judge flag in the learner, and an explicit ask from PreToolUse.
+    cfg, cp = _fresh_cfg()
+    sl = os.path.join(cfg, 'sleeps')
+    outs = []
+    check('judge flag: parked after the wait',
+          _run_cfg(LEARNER, unknown, cp, llm=[_HFLAG, _HFLAG], extra_env=_attended(),
+                   patch=_wait_patch(0.05, sl), outputs=outs), 'deny')
+    check('judge flag: its reason in the message',
+          'deletes runner checkouts' in _learner_out(outs[-1]).get('message', ''), True)
+    cfg, cp = _fresh_cfg()
+    k_exec = {'tool_name': 'Bash', 'tool_input': {'command': 'kubectl exec app-prod-worker -- ls /app'},
+              'cwd': work}
+    check('explicit ask: PreToolUse asks', _run_cfg(PRETOOL, k_exec, cp, llm={'safe': True}, full=True),
+          ('ask', True))
+    sl = os.path.join(cfg, 'sleeps')
+    outs = []
+    check('explicit ask: the learner parks it, never allows',
+          _run_cfg(LEARNER, k_exec, cp, llm={'safe': True, 'confident': True}, extra_env=_attended(),
+                   patch=_wait_patch(0.05, sl), outputs=outs), 'deny')
+    check('explicit ask: the reason the developer saw',
+          'Remote or production execution (kubectl exec)' in _learner_out(outs[-1]).get('message', ''), True)
+    cfg, cp = _fresh_cfg()
+    outs = []
+    check('remote payload gap in the learner: parked',
+          _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'kubectl exec -i w -- bash < d.sh'},
+                             'cwd': work}, cp, llm={'safe': True, 'confident': True}, extra_env=_attended(),
+                   patch=_wait_patch(0.05, os.path.join(cfg, 'sleeps')), outputs=outs), 'deny')
+
+    # The developer answered first: the transcript holds the call's result.
+    cfg, cp = _fresh_cfg()
+    tr = os.path.join(cfg, 't.jsonl')
+    call = dict(unknown, transcript_path=tr, session_id='s1')
+
+    def write(*recs):
+        with open(tr, 'w') as f:
+            for rec in recs:
+                f.write(json.dumps(rec) + '\n')
+    use = {'type': 'assistant', 'message': {'content': [
+        {'type': 'tool_use', 'id': 'tu1', 'name': 'Bash', 'input': unknown['tool_input']}]}}
+    result = {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'tu1',
+                                                       'content': 'ok'}]}}
+    write(use, result)
+    sl = os.path.join(cfg, 'sleeps')
+    got = _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl), full=True)
+    check('answered first: no deny after the wait', (got, len(_sleeps(sl))), (('ask', False), 1))
+    check('answered first: no timeout record',
+          [r.get('source') for r in _decision_records(cfg) if r.get('source') == 'prompt-timeout'], [])
+    other = {'type': 'assistant', 'message': {'content': [
+        {'type': 'tool_use', 'id': 'tu2', 'name': 'Bash', 'input': unknown['tool_input']}]}}
+    write(use, result, other)  # an earlier identical call answered; this one is not
+    check('only the latest identical call counts',
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+    write(use)
+    check('no result yet: parked',
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+
+    # The parked message: judge words that quote a script shown to it are scrubbed.
+    sys.path.insert(0, SCRIPT_DIR)
+    import permission_learner as pl
+    p.SCRIPT_CONTEXT_TEXTS[:] = ['az group delete -n rg-example --yes\n']
+    try:
+        msg = pl.parked_message(p.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`'), 10)
+    finally:
+        p.SCRIPT_CONTEXT_TEXTS.clear()
+    check('parked message: script text scrubbed', ('rg-example' in msg, '[script text]' in msg), (False, True))
+    check('parked message: minutes shown', 'within 10 minutes' in pl.parked_message('x', 10), True)
+
+
+def _learner_module_attr(name, config_path):
+    """An attribute of the learner module imported fresh against config_path."""
+    env = dict(os.environ, SMART_PERMISSIONS_CONFIG=config_path)
+    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import permission_learner as m; '
+                        'print(repr(m.%s))' % (SCRIPT_DIR, name)], capture_output=True, text=True, env=env)
+    try:
+        return eval(r.stdout.strip())
+    except Exception:
+        return r.stdout + r.stderr
+
+
+def test_script_hazard_1_8_0():
+    print('\n--- 1.8.0: a local script hiding remote or destructive commands ---')
+    p = _pretool_module()
+    work = tempfile.mkdtemp(prefix='sp-scr-')
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+
+    def put(name, text, mode=0o755):
+        path = os.path.join(work, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            f.write(text)
+        os.chmod(path, mode)
+    put('teardown.sh', '#!/bin/bash\nset -e\naz group delete -n rg-example-dev --yes\n')
+    put('peek.sh', '#!/bin/sh\nkubectl exec -n prod web-1 -- ls /srv\n')
+    put('peekvar.sh', '#!/bin/sh\nkubectl exec -n prod "$POD" -- ls /srv\n')
+    put('build.sh', '#!/bin/sh\nnpm test\nkubectl get pods\n')
+    put('tool.py', '#!/usr/bin/env python3\nprint("kubectl delete ns example")\n')
+    put('bin/tool', '#!/usr/bin/env python3\nprint("kubectl delete ns example")\n')
+    put('noshebang.sh', 'helm uninstall example-release\n', 0o644)
+    put('envshebang', '#!/usr/bin/env -S bash -e\nterraform destroy -auto-approve\n')
+    put('locked.sh', '#!/bin/sh\naz group delete -n rg-example-dev --yes\n', 0o000)
+    put('huge.sh', '#!/bin/sh\n' + 'echo x\n' * 12000 + 'az group delete -n rg-example-dev --yes\n')
+    put('longremote.sh', '#!/bin/sh\nkubectl exec -n prod web-1 -- ls /srv\n' + 'echo x\n' * 2000)
+    for cmd, want in [
+            ('bash teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('sh ./peek.sh', ('remote', 'kubectl exec in peek.sh', None)),
+            ('./peekvar.sh', ('remote', 'kubectl exec in peekvar.sh',
+                              'part of it is read from a file or built when it runs')),
+            ('source teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('bash < peek.sh', ('remote', 'kubectl exec in peek.sh', None)),
+            ('env X=1 ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('timeout 60 ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('cd bin && cd .. && ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
+            ('bash noshebang.sh', ('destroy', 'helm uninstall example-release in noshebang.sh', None)),
+            ('./envshebang', ('destroy', 'terraform destroy in envshebang', None)),
+            ('./longremote.sh', ('remote', 'kubectl exec in longremote.sh',
+                                 'the script is too long for the judge to see whole')),
+            ("cat > new.sh <<'EOF'\nkubectl delete ns example\nEOF\nbash new.sh",
+             ('destroy', 'kubectl delete ns example in new.sh', None)),
+            ('echo "kubectl exec w -- ls" > n2.sh; sh n2.sh',
+             ('remote', 'kubectl exec in n2.sh', 'the call writes the script first')),
+            ('./build.sh', None),
+            ('python3 tool.py', None),
+            ('./bin/tool', None),
+            ('cat teardown.sh', None),
+            ('git add teardown.sh', None),
+            ('./locked.sh', None),
+            ('./huge.sh', None),
+            ("cat > n3.sh <<'EOF'\nnpm test\nEOF\n./n3.sh", None),
+            ('ls', None),
+    ]:
+        check(f'script_hazard: {cmd[:50]!r}', p.script_hazard(cmd, work), want)
+
+    call = lambda c: {'tool_name': 'Bash', 'tool_input': {'command': c}, 'cwd': work}  # noqa: E731
+    sure = {'safe': True, 'confident': True}
+    # Ordinary project scripts stay rule allows, with no judge call.
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    for cmd in ('./build.sh', 'bash build.sh', 'python3 tool.py', './locked.sh', './huge.sh', 'cat teardown.sh'):
+        check(f'rules allow, no judge: {cmd}', _run_cfg(PRETOOL, call(cmd), cp, llm=sure, requests_log=reqs),
+              'allow')
+    check('…no judge call for any of them', _requests(reqs), [])
+
+    # A cloud delete in the script: the judge decides.
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    check('destroy script: judged, allow stands',
+          _run_cfg(PRETOOL, call('./teardown.sh'), cp, llm={'safe': True}, requests_log=reqs), 'allow')
+    sent = _requests(reqs)
+    prompt = json.dumps(sent[0]) if sent else ''
+    check('destroy script: the judge saw the script and why it was asked',
+          (len(sent), 'az group delete -n rg-example-dev' in prompt, 'Runs a local script that deletes' in prompt),
+          (1, True, True))
+    check('destroy script: no judge → the prompt (falls through)',
+          _run_cfg(PRETOOL, call('./teardown.sh'), cp, full=True), ('ask', False))
+    cfg, cp, tr = _hold_env()
+    check('destroy script: flagged → never held, an explicit ask',
+          _run_cfg(PRETOOL, _hcall('./teardown.sh', tr, cwd=work), cp, llm=[_HFLAG, _HFLAG], full=True),
+          ('ask', True))
+    check('destroy script: …logged as not held for the developer',
+          _last_pretool(cfg).get('hold', '').startswith('not held: it runs a local script that deletes'), True)
+    check('hold_resolver: a sourced destroy script is the developer\'s',
+          p.hold_resolver('Bash', {'command': f'. {work}/teardown.sh'}, dict(_HFLAG))[0], 'developer')
+
+    # A remote exec in the script: the strict policy.
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    check('remote script, payload visible: not confident → explicit ask',
+          _run_cfg(PRETOOL, call('sh ./peek.sh'), cp, llm={'safe': True}, full=True), ('ask', True))
+    check('remote script: that ask names the script',
+          'kubectl exec in peek.sh' in (_read_json(_flag_file(cfg), {}).get(
+              _cache_key('Bash', {'command': 'sh ./peek.sh'})) or {}).get('reason', ''), True)
+    cfg, cp = _fresh_cfg()
+    check('remote script, payload visible: confident → allow',
+          _run_cfg(PRETOOL, call('sh ./peek.sh'), cp, llm=sure), 'allow')
+    reqs = os.path.join(cfg, 'reqs2.jsonl')
+    for cmd in ('./peekvar.sh', './longremote.sh', 'echo "kubectl exec w -- ls" > n2.sh; sh n2.sh'):
+        check(f'remote script with a gap → explicit ask, no judge: {cmd[:30]}',
+              _run_cfg(PRETOOL, call(cmd), cp, llm=sure, requests_log=reqs, full=True), ('ask', True))
+    check('…and the judge never saw those payloads', _requests(reqs), [])
+    cfg, cp = _fresh_cfg()
+    reqs = os.path.join(cfg, 'reqs.jsonl')
+    check('learner: remote script with a gap → ask, no judge',
+          (_run_cfg(LEARNER, call('./peekvar.sh'), cp, llm=sure, requests_log=reqs), _requests(reqs)),
+          ('ask', []))
+    check('learner: remote script, not confident → ask',
+          _run_cfg(LEARNER, call('sh ./peek.sh'), cp, llm={'safe': True}), 'ask')
+    check('learner: remote script, confident → allow',
+          _run_cfg(LEARNER, call('sh ./peek.sh'), cp, llm=sure), 'allow')
+    # A payload over 50 lines with no heredoc is read whole (it used to be
+    # a gap: "it could not be read"); with a heredoc the cap still holds.
+    many = 'kubectl exec w -- ls\n' + 'echo x\n' * 60
+    check('remote payload gap: 60 plain lines are read', p.remote_payload_gap(many, 'kubectl exec'), None)
+    check('remote payload gap: 60 plain lines with a $ still ask',
+          bool(p.remote_payload_gap(many + 'echo $X\n', 'kubectl exec')), True)
+    check('remote payload gap: 60 lines with a heredoc → could not be read',
+          p.remote_payload_gap("cat <<'E'\nx\nE\n" + many, 'kubectl exec'), 'it could not be read')
+
+
 if __name__ == '__main__':
     # no docker config or endpoint of this machine's (a remote current context) in the results
     for name in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'CONTAINER_HOST', 'CONTAINER_CONNECTION'):
@@ -7643,6 +7965,8 @@ if __name__ == '__main__':
     test_phase2_holds()
     test_phase2_remote_exec()
     test_review_fixes_1_7_0()
+    test_prompt_timeout_1_8_0()
+    test_script_hazard_1_8_0()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')

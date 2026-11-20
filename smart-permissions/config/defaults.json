@@ -369,5 +369,6 @@
 
   "__ Behavior toggles (scalars — replaced, not merged) __": "",
   "decision_log": true,
-  "holds": true
+  "holds": true,
+  "prompt_timeout_minutes": 10
 }

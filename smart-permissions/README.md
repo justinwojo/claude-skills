@@ -263,6 +263,38 @@ verdict, no judge, an error) is an explicit ask that the PermissionRequest
 hook leaves to you.
 Remote execution is never held. Plain `ssh host cmd` is not in this class.
 
+**Local scripts.** Running a project script (`./deploy.sh`, `bash x.sh`, `sh
+x.sh`, also behind `env` or `timeout`) is a rules allow, so the hooks read the
+script before allowing it: a local shell script the call runs, sources or feeds
+to a shell (the same files the judge is shown, up to 64 KB, only regular files
+you own) is scanned for the remote-execution commands above and for deleting
+cloud, production or remote resources. A remote exec inside it gets the strict
+policy above, judged on the script's text (a script with a `$`, a pipe or a
+redirect, one too long for the judge to see whole, or one the call writes
+first comes to you without a judge call); a cloud delete inside it goes to the
+judge instead of being allowed, and a flag on it is never held. A script that
+can't be read keeps the rules' answer, and so does a script in another
+language (`python3 x.py`) or one a script calls in turn. Ordinary project
+scripts are unaffected.
+
+### Unanswered prompts: parked, not a freeze
+
+A call that needs you (a permission prompt) no longer stops the session
+until you come back. Claude Code shows the prompt while the PermissionRequest
+hook is still running, and your answer applies at once. If you haven't
+answered after `prompt_timeout_minutes` (default 10; `0` turns it off; 1 to
+60), the hook denies the call with a message to Claude: it needed you, why it
+couldn't be auto-approved (the reason you'd have seen), not to retry it or
+get around the restriction with an equivalent command, to move on to other
+work, and to list the call under "Parked for the developer" in its final
+reply. It is never an allow. The decision log records it with source
+`prompt-timeout`. The hook waits in one sleep and checks the session
+transcript before denying: if you answered in the meantime, it does nothing.
+In `claude -p` and other unattended runs (`CLAUDE_CODE_SESSION_ATTENDED=0`, or
+an `sdk-*` entrypoint without that variable) it never waits: Claude Code
+denies a prompt there itself. The hooks.json timeout of the learner (3660 s)
+is above the longest setting; with manual setup, set yours the same way.
+
 ### Recursive deletes
 
 Deleting your home folder or anything at its top level (`~/Dev`, `~/Desktop`,
@@ -407,6 +439,7 @@ Your personal config lives at `~/.claude/smart-permissions-config.json`. It's ge
 | `interpreter_exec_flags` | object | `{"interpreter": ["-flag"]}` — flag combos that trigger a prompt |
 | `remove_from_defaults` | object | Subtract shipped entries from allowlist keys (see [Subtracting defaults](#subtracting-defaults)) |
 | `holds` | bool | Put a flag the agent can settle to the agent first, as a question, before it reaches you (default `true`; see [Holds](#holds-the-agent-answers-first)) |
+| `prompt_timeout_minutes` | number | Deny a permission prompt you leave unanswered this long, with a message that parks the call for you (default `10`, `0` off, 1 to 60; see [Unanswered prompts](#unanswered-prompts-parked-not-a-freeze)) |
 | `decision_log` | bool | Log every decision to `~/.claude/hooks/smart-permissions-decisions.jsonl` (default `true`) |
 | `decision_log_full_input` | bool | Log each input up to 64 KB instead of 500/8000 chars, with obvious secrets redacted (default `false`; see [Decision log](#decision-log)) |
 
@@ -429,7 +462,7 @@ Removal is applied last, after defaults + platform overlay + your additions. A c
 
 ### Decision log
 
-Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, the plugin version (`v`), hook, tool, input (truncated at 500 chars for an allow, 8000 for an ask or deny, so the calls that stopped you can be read in full; `input_len` is the full length and `truncated` says whether it was cut), decision, source (`rule` / `llm` / `llm-recheck` / `learner`, and with holds `llm-hold` for a held call and `hold-retry` for its retry; logs from older versions also hold `llm-cache`), reason, and timing. With holds on, a flag records `hold`: `held`, `cleared` or `asked` for a hold and its retry, or why a flag was not held (`not held: …`); a remote-exec ask records `remote-exec`. The agent's answer is never logged. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Every PermissionRequest record carries one (also for a prior flag, a missing judge, or input the hook couldn't parse). Calls from other agent CLIs (see below) also record the original `client_tool` name. When the LLM was asked about a delete or reset whose target it could name, `provenance` says whether session provenance was attached: `found` (this session made or used a target), `none` (nothing ties a target to it) or `unavailable` (no readable transcript). The log is created readable by you only (0600; an existing log with group or other bits is narrowed). It rotates to a single `.jsonl.1` generation at 20 MB, under a lock so the two hooks never rotate twice. With `"decision_log_full_input": true`, each input is kept up to 64 KB with obvious secrets (private key blocks, bearer and basic auth headers, URL passwords, common token shapes, `*_KEY`/`*_SECRET`/`*_TOKEN`/`*_PASSWORD` values and `--password`-style flags) replaced by `[REDACTED]`; such records add `redacted`, and `incomplete` when the input was redacted or cut. Redaction is best-effort, so the privacy note below still applies. Run `/smart-permissions:stats` to summarize it.
+Every decision from both hooks is appended as one JSON object per line to `~/.claude/hooks/smart-permissions-decisions.jsonl` (override with `decision_log_path`, disable with `"decision_log": false`). Each record captures the timestamp, the plugin version (`v`), hook, tool, input (truncated at 500 chars for an allow, 8000 for an ask or deny, so the calls that stopped you can be read in full; `input_len` is the full length and `truncated` says whether it was cut), decision, source (`rule` / `llm` / `llm-recheck` / `learner`, and with holds `llm-hold` for a held call and `hold-retry` for its retry, and `prompt-timeout` for a prompt you left unanswered, which the learner denied and parked; logs from older versions also hold `llm-cache`), reason, and timing. With holds on, a flag records `hold`: `held`, `cleared` or `asked` for a hold and its retry, or why a flag was not held (`not held: …`); a remote-exec ask records `remote-exec`. The agent's answer is never logged. Records from versions before auto-learning was removed may also carry a `learned` list. When the LLM decides, `rule_reason` records why the local rules didn't settle the call, so `jq -r .rule_reason` over the log shows which rule gaps drive LLM traffic. Every PermissionRequest record carries one (also for a prior flag, a missing judge, or input the hook couldn't parse). Calls from other agent CLIs (see below) also record the original `client_tool` name. When the LLM was asked about a delete or reset whose target it could name, `provenance` says whether session provenance was attached: `found` (this session made or used a target), `none` (nothing ties a target to it) or `unavailable` (no readable transcript). The log is created readable by you only (0600; an existing log with group or other bits is narrowed). It rotates to a single `.jsonl.1` generation at 20 MB, under a lock so the two hooks never rotate twice. With `"decision_log_full_input": true`, each input is kept up to 64 KB with obvious secrets (private key blocks, bearer and basic auth headers, URL passwords, common token shapes, `*_KEY`/`*_SECRET`/`*_TOKEN`/`*_PASSWORD` values and `--password`-style flags) replaced by `[REDACTED]`; such records add `redacted`, and `incomplete` when the input was redacted or cut. Redaction is best-effort, so the privacy note below still applies. Run `/smart-permissions:stats` to summarize it.
 
 > **Privacy:** the logged `input` can contain whatever appeared on a command line, path, or URL — including secrets. Treat the log as the same trust class as your shell history.
 
@@ -578,7 +611,7 @@ If you prefer not to use the plugin system:
              {
                "type": "command",
                "command": "python3 ~/.claude/hooks/smart-permissions/permission_learner.py",
-               "timeout": 45
+               "timeout": 3660
              }
            ]
          }
@@ -638,6 +671,11 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 - macOS, Linux, or Windows
 
 ## Changelog
+
+- **1.8.0 (2026-11-19) — unanswered prompts are parked; scripts are read.**
+  - A permission prompt you leave unanswered for `prompt_timeout_minutes` (default 10, `0` off) is denied with a message that tells Claude why it needed you, not to retry or work around it, to move on, and to list it for you in its final reply. Never an allow; never in `claude -p`; nothing happens if you answered first. Logged as `prompt-timeout`. See [Unanswered prompts](#unanswered-prompts-parked-not-a-freeze). The learner's hooks.json timeout is now 3660 s.
+  - A local shell script the call runs (`./x.sh`, `bash x.sh`, sourced, fed to a shell) is scanned for remote execution and cloud deletes: a remote exec inside it gets the strict remote policy on the script's text, and a cloud delete goes to the judge and is never held. Unreadable scripts and other languages keep the rules' answer. See [Local scripts](#remote-and-production-execution).
+  - A remote payload over 50 lines with no heredoc is now read whole instead of counting as unreadable.
 
 - **1.7.0 (2026-11-19) — the agent answers first; strict remote execution.**
   - Holds (on by default, `"holds": false` turns them off): a flag the agent can settle is a deny that reads as a question ("Held by smart-permissions …"); the agent answers with its evidence and retries the identical call, and one judge pass at the recheck effort, with the evidence gathered again, clears it or sends it to you with the hold reason in the hook's words and the agent's answer labelled as its claim. See [Holds](#holds-the-agent-answers-first). The judge's verdict gains `confident`, `resolver` and `question`.
