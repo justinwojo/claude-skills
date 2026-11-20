@@ -409,11 +409,12 @@ for project scripts.
   `SCRIPT_SCAN_MAX_FILES` = 12, `script_files(…, limit)`; scripts run inside `$(…)`, backticks or `<(…)`
   count as run, `_substitution_bodies`); returns `(remote, gap, destroy)` or None for no hit. `remote` is
   the first hit with a gap (so the reason names the script that has it), else the first hit; `destroy`
-  is the first delete, labelled with its program and verb only (no resource names from the script reach
-  the log, the flag store or a prompt). The gap, for a remote hit: the call writes the script first; the
+  is the first delete, labelled with its program and verb only (`az … delete`: no resource names or
+  option values from the script reach the log, the flag store or a prompt). The gap, for a remote hit: the call writes the script first; the
   judge is not shown all of it (`script_context`'s own read, repeated with its limits and order: past
-  the first three files, or past the 8 KB per-file and 16 KB total budgets); the call has a redirect or
-  a pipe outside heredocs (`_outside_heredocs`, the same rule as a direct remote command); else
+  the first three files, or past the 8 KB per-file and 16 KB total budgets; read only once a remote hit
+  needs it); the call has a redirect or a pipe outside heredocs (`_outside_heredocs`, the same rule as a
+  direct remote command), a here-string or a heredoc; else
   `remote_gap` on the script text. A docker endpoint the command names (`DOCKER_CONTEXT=… ./x.sh`,
   `_names_docker_endpoint`) applies to the script, and `remote_gap`/`remote_payload_gap` take it
   (`env_remote`). A
@@ -423,7 +424,8 @@ for project scripts.
   - PreToolUse: a remote hit becomes the call's `remote` when the command has none, and a script gap is
     the call's gap when the command has none (gap → explicit ask with no judge call; else the strict
     confident-only judge path). A destroy hit turns a rules allow into a judge call with rule reason
-    "Runs a local script that deletes …: judged", skips `_hold_retry` and `_hold_new` (a flag on it is
+    "Runs a local script that deletes …: judged" (appended to the rule reason when the rules already
+    asked, so the judge always hears of it), skips `_hold_retry` and `_hold_new` (a flag on it is
     an explicit ask), and is an explicit ask when the judge gives no answer (no judge, an error). `hold_resolver` sends both to the developer. The learner
     applies the remote hit and gap the same way (gap → developer, no judge).
 - **Script collector** (`script_files`, also the judge's evidence): `bash -e x.sh` (any shell option but
@@ -452,8 +454,11 @@ Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 - `ATTENDED`/`ENTRYPOINT` are observed, not documented. A future Claude Code that drops both would make
   `-p` runs wait (bounded by the timeout), not approve anything.
 - The script scan: shell scripts only (not `python3 x.py`, `make`, `npm run`), one level (a script that
-  calls another script is not followed), at most 12 files, not `xargs bash x.sh` or `find -exec ./x.sh`
-  (the collector does not see those runs), text patterns only
+  calls another script is not followed), at most 12 files (read-only mentions count toward them), not
+  `xargs bash x.sh`, `find -exec ./x.sh`, `bash -c 'bash x.sh'`, or a `$(bash x.sh)` after a `cd` (the
+  substitution is resolved from the hook's directory); the collector does not see those runs. The scan,
+  the judge's view and the judge-visibility check read the file separately, so a script rewritten
+  during the hook can differ between them, text patterns only
   (`$CLI delete` is missed), and `cloud_destroy`'s word match can send a read-only script to the judge
   (`kubectl get pods --context delete`). A remote script past about 50 lines hits `remote_payload_gap`'s
   50-round cap and is "it could not be read" (an explicit ask), unchanged so direct remote calls keep

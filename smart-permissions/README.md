@@ -270,8 +270,8 @@ runs, sources or feeds to a shell (up to 12 of them, 64 KB each, only regular
 files you own) is scanned for the remote-execution commands above and for deleting
 cloud, production or remote resources. A remote exec inside it gets the strict
 policy above, judged on the script's text (a script with a `$`, a pipe or a
-redirect, one the judge is not shown whole, a call with a redirect or a pipe,
-or one the call writes first comes to you without a judge call); a cloud delete
+redirect, one the judge is not shown whole, a call with a redirect, a pipe or
+a heredoc, or one the call writes first comes to you without a judge call); a cloud delete
 inside it goes to the judge instead of being allowed, comes to you when the
 judge gives no answer, and a flag on it is never held. A script that can't be
 read or is over 64 KB keeps the rules' answer, and so does a script in another

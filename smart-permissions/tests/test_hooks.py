@@ -7753,8 +7753,9 @@ def test_script_hazard_1_8_0():
     put('bin/rexec', '#!/bin/sh\nkubectl exec w -- ls\n')
     with open(os.path.join(work, 'wide.sh'), 'wb') as f:  # each byte re-encodes as three
         f.write(b'#!/bin/sh\n# ' + b'\xff' * 6000 + b'\necho hi\n')
-    tear = 'az group delete in teardown.sh'
-    fed = 'the call has a redirect or a pipe: input the script may pass on'
+    put('pyshebang.sh', '#!/usr/bin/env python3\nkubectl delete ns example\n')
+    tear = 'az … delete in teardown.sh'
+    fed = 'the call has a redirect, a pipe or a heredoc: input the script may pass on'
     for cmd, want in [
             ('bash teardown.sh', (None, None, tear)),
             ('./teardown.sh', (None, None, tear)),
@@ -7771,6 +7772,10 @@ def test_script_hazard_1_8_0():
             ('./peek.sh < input.txt', ('kubectl exec in peek.sh', fed, None)),
             ('./peek.sh | tee out.log', ('kubectl exec in peek.sh', fed, None)),
             ('bash -eo pipefail teardown.sh', (None, None, tear)),
+            ('bash -oe pipefail teardown.sh', (None, None, tear)),
+            ('./pyshebang.sh; bash pyshebang.sh', (None, None, 'kubectl delete in pyshebang.sh')),
+            ('./pyshebang.sh', None),
+            ('./peek.sh <<< "$X"', ('kubectl exec in peek.sh', fed, None)),
             ('cat < teardown.sh; bash teardown.sh', (None, None, tear)),
             ('printf "%s" "$(bash teardown.sh)"', (None, None, tear)),
             ('echo "$(./bin/rexec)"', ('kubectl exec in rexec', 'the judge is not shown all of the script', None)),
@@ -7830,6 +7835,10 @@ def test_script_hazard_1_8_0():
     check('destroy script: the judge saw the script and why it was asked',
           (len(sent), 'az group delete -n rg-example-dev' in prompt, 'Runs a local script that deletes' in prompt),
           (1, True, True))
+    reqs = os.path.join(cfg, 'reqs-ask.jsonl')
+    _run_cfg(PRETOOL, call('frobnicate --all; ./teardown.sh'), cp, llm={'safe': True}, requests_log=reqs)
+    check('destroy script after a rules ask: the judge is told about the delete',
+          'Runs a local script that deletes' in json.dumps(_requests(reqs)), True)
     check('destroy script: no judge → an explicit ask, never a silent exit',
           _run_cfg(PRETOOL, call('./teardown.sh'), cp, full=True), ('ask', True))
     check('destroy script: no resource name from the script in the log or the flag store',

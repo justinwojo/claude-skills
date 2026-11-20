@@ -2458,7 +2458,7 @@ def _script_operand(name, args):
         if name in _SHELL_RUNNERS:  # `bash -e x.sh`: only -c (`-ec`) is code
             if re.fullmatch(r"-\w*c\w*", a):
                 return None
-            if re.fullmatch(r"[-+]\w*[oO]", a):  # `-eo pipefail`: the option's value is next
+            if re.fullmatch(r"[-+][A-Za-z]*[oO][A-Za-z]*", a):  # `-eo pipefail`, `-oe pipefail`
                 i += 2
                 continue
         elif a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
@@ -2522,8 +2522,8 @@ def script_files(command, cwd, deadline=None, limit=SCRIPT_CONTEXT_MAX_FILES):
         if at is None:
             if len(found) < limit:
                 found.append((path, how))
-        elif not _runs_as_shell(found[at][1]) and _runs_as_shell(how):
-            found[at] = (path, how)  # `cat x.sh; bash x.sh`: what matters is the run
+        elif _runs_as_shell(how) and (not _runs_as_shell(found[at][1]) or found[at][1] == "run" != how):
+            found[at] = (path, how)  # `cat x.sh; bash x.sh`, `./x.sh; bash x.sh`: the shell's run
 
     for segment in segments:
         raw, stdin, _hazard = _parse_simple_command(segment)
@@ -4794,7 +4794,7 @@ def _script_hits(text, env_remote=None):
         words = destroy.split()
         at = next((k for k, w in enumerate(words) if k and any(
             _CLOUD_DESTROY_RE.fullmatch(part) for part in re.split(r"[:=]", w.lower()))), 0)
-        destroy = " ".join(words[:at + 1])
+        destroy = " ".join(words[:1] + (["…"] if at > 1 else []) + (words[at:at + 1] if at else []))
     return next(_remote_execs(text, env_remote), None), destroy
 
 
@@ -4843,7 +4843,8 @@ def script_hazard(command, cwd=None, deadline=None):
     cwd = cwd if cwd is not None else HOOK_CWD
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     written, written_names = _written_files(command, cwd)
-    fed = bool(_REMOTE_INPUT_RE.search(_outside_heredocs(command)))
+    # input the script may pass on: a redirect, a pipe, a here-string or a heredoc
+    fed = bool(_REMOTE_INPUT_RE.search(_outside_heredocs(command))) or "<<" in command
     env_remote = True if _names_docker_endpoint(command) else None
     # a script run inside `$(…)` is only "named in the command" to the collector
     inner = {}
@@ -4851,8 +4852,18 @@ def script_hazard(command, cwd=None, deadline=None):
         for path, how in script_files(body, cwd, deadline, SCRIPT_SCAN_MAX_FILES):
             if _runs_as_shell(how):
                 inner.setdefault(path, how)
-    budget = SCRIPT_CONTEXT_TOTAL_BYTES  # what script_context shows the judge, in the same order
     remote = gap = destroy = None
+    seen = []  # [bool]: whether script_context shows each of its files whole
+
+    def whole(index):
+        if not seen:  # script_context's own reads, its limits and order; only on a remote hit
+            budget = SCRIPT_CONTEXT_TOTAL_BYTES
+            for p, _ in files[:judged]:
+                shown, shown_note = _read_script(p, min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0)))
+                budget -= len(shown.encode("utf-8", "replace")) if shown else 0
+                seen.append(shown is not None and "TRUNCATED" not in shown_note)
+        return index < judged and seen[index]
+
     files = script_files(command, cwd, deadline, SCRIPT_SCAN_MAX_FILES)
     judged = min(len(files), SCRIPT_CONTEXT_MAX_FILES)  # the ones script_context reads
     files += [(path, how) for path, how in inner.items() if path not in {p for p, _ in files}]
@@ -4861,11 +4872,6 @@ def script_hazard(command, cwd=None, deadline=None):
             break
         how = how if _runs_as_shell(how) else inner.get(path, how)
         name = os.path.basename(path)
-        whole = False  # the judge is shown all of it: script_context's own read
-        if index < judged:
-            shown, shown_note = _read_script(path, min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0)))
-            budget -= len(shown.encode("utf-8", "replace")) if shown else 0
-            whole = shown is not None and "TRUNCATED" not in shown_note
         rewritten = path in written or name in written_names
         text, note = _read_script(path, SCRIPT_SCAN_MAX_BYTES)
         if "TRUNCATED" in note:  # over the scan cap: the rules' answer, as before
@@ -4884,10 +4890,10 @@ def script_hazard(command, cwd=None, deadline=None):
                 continue
             if rewritten:
                 why = "the call writes the script first"
-            elif not whole:
+            elif not whole(index):
                 why = "the judge is not shown all of the script"
             elif fed:
-                why = "the call has a redirect or a pipe: input the script may pass on"
+                why = "the call has a redirect, a pipe or a heredoc: input the script may pass on"
             else:
                 why = remote_gap(t, hit, env_remote)
             remote = f"{hit} in {name}" if why else remote or f"{hit} in {name}"
@@ -5131,9 +5137,10 @@ def _main():
         if script_gap and not gap:
             remote, gap = in_script, script_gap
         remote = remote or in_script
-        if destroy and decision == "allow":
-            decision, reason = "ask", (f"Runs a local script that deletes cloud, production or "
-                                       f"remote resources ({destroy}): judged")
+        if destroy and decision in ("allow", "ask"):
+            said = f"Runs a local script that deletes cloud, production or remote resources ({destroy})"
+            reason = f"{reason}; {said}" if decision == "ask" else f"{said}: judged"
+            decision = "ask"
         if gap:  # the developer's whatever the judge says: it never sees the payload
             shown = f"Remote or production execution ({remote}): {gap} — confirm it yourself"
             _ask_developer(tool, tool_input, shown, shown, start, "rule", None,
