@@ -129,9 +129,10 @@ def parked_message(reason, minutes):
 
 def _prompt_answered(input_data):
     """True when the acting agent's transcript already holds the result of
-    this call (the last tool_use with its name and input): the developer
-    answered, and Claude Code ignores a later hook decision. False when it
-    does not, or can't be read."""
+    this call (every tool_use with its name and input has one: the prompt
+    has no id to tell identical calls apart): the developer answered, and
+    Claude Code ignores a later hook decision. False when it does not, or
+    can't be read."""
     path = acting_transcript(input_data)
     name, call = input_data.get("tool_name"), input_data.get("tool_input")
     if not path or not isinstance(name, str):
@@ -144,7 +145,7 @@ def _prompt_answered(input_data):
             lines = f.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
     except (OSError, ValueError):
         return False
-    last, results = None, set()
+    calls, results = [], set()
     for line in lines:
         if '"tool_use"' not in line and '"tool_result"' not in line:
             continue
@@ -158,13 +159,13 @@ def _prompt_answered(input_data):
                 continue
             if block.get("type") == "tool_use" and block.get("name") == name \
                     and block.get("input") == call:
-                last = block.get("id")
+                calls.append(block.get("id"))
             elif block.get("type") == "tool_result":
                 results.add(block.get("tool_use_id"))
-    return last is not None and last in results
+    return bool(calls) and all(c in results for c in calls)
 
 
-def _developer_prompt(input_data, tool, tool_input, reason, start):
+def _developer_prompt(input_data, tool, tool_input, reason, start, rule_reason):
     """Leave the call to the developer's prompt (the ask is logged already).
     With a prompt timeout, in a session someone attends: wait out the rest
     of it in one sleep, then deny with parked_message, unless the developer
@@ -181,7 +182,7 @@ def _developer_prompt(input_data, tool, tool_input, reason, start):
     log_decision("permission_request", tool, tool_input, "deny", "prompt-timeout",
                  f"No answer to the prompt within {minutes:g} min; denied and parked for the "
                  f"developer ({_loggable_reason(reason)})",
-                 duration_ms=_elapsed_ms(start), hold="prompt-timeout")
+                 duration_ms=_elapsed_ms(start), rule_reason=rule_reason, hold="prompt-timeout")
     try:
         _emit_deny(parked_message(scrub_script_text(reason), minutes))
         sys.stdout.flush()
@@ -243,11 +244,12 @@ def _main():
 
     # A definite ask (C9 config write, empty/ambiguous), or nothing to consult:
     # without an LLM every call the rules could not settle goes to the human.
-    if verdict == "ask" or not llm_is_configured():
+    flagged = _flag_get(tool, tool_input) if verdict != "ask" else None
+    if verdict == "ask" or not llm_is_configured() and not flagged:
         shown = reason if verdict == "ask" else llm_not_configured_reason()
         log_decision("permission_request", tool, tool_input, "ask", "learner",
                      shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, shown, start)
+        _developer_prompt(input_data, tool, tool_input, shown, start, reason)
 
     # verdict == "consult": lean on the LLM, human as last resort.
     # PreToolUse already ran both LLM passes on this exact call and
@@ -256,22 +258,23 @@ def _main():
     # call flagged again, a developer-only or remote-exec ask): never overrule
     # that here. The prompt has no tool_use_id, so the store is keyed by the
     # call itself.
-    flagged = _flag_get(tool, tool_input)
     if flagged:
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
                      flagged, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, flagged, start)
+        _developer_prompt(input_data, tool, tool_input, flagged, start, reason)
     remote = remote_exec(tool_input.get("command", "")) if tool == "Bash" else None
     gap = remote and remote_gap(tool_input.get("command"), remote)
-    hidden = _quietly(script_hazard, tool_input.get("command", "")) \
-        if tool == "Bash" and not remote else None
-    if hidden and hidden[0] == "remote":  # in a local script the call runs
-        remote, gap = hidden[1], hidden[2]
+    # …or in a local shell script the call runs
+    in_script, script_gap, _destroy = (_quietly(script_hazard, tool_input.get("command", ""))
+                                       if tool == "Bash" else None) or (None, None, None)
+    if script_gap and not gap:
+        remote, gap = in_script, script_gap
+    remote = remote or in_script
     if gap:  # a payload the judge can't see: the developer's, no judge call
         shown = f"Remote or production execution ({remote}): {gap}"
         log_decision("permission_request", tool, tool_input, "ask", "rule",
                      shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, shown, start)
+        _developer_prompt(input_data, tool, tool_input, shown, start, reason)
     decision, llm_reason, info = llm_evaluate(
         tool, tool_input, timeout=15, context=build_llm_context(input_data),
         rule_reason=reason)
@@ -289,7 +292,7 @@ def _main():
     log_decision("permission_request", tool, tool_input, "ask", source,
                  llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
                  rule_reason=reason)
-    _developer_prompt(input_data, tool, tool_input, llm_reason, start)
+    _developer_prompt(input_data, tool, tool_input, llm_reason, start, reason)
 
 
 def classify_request(tool, tool_input):

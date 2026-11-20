@@ -7590,6 +7590,7 @@ def test_prompt_timeout_1_8_0():
           [('ask', 'learner'), ('deny', 'prompt-timeout')])
     check('parked: the timeout record says so', (recs[-1].get('hold'),
           recs[-1].get('reason', '').startswith('No answer to the prompt within')), ('prompt-timeout', True))
+    check('parked: the timeout record keeps the rule reason', bool(recs[-1].get('rule_reason')), True)
 
     # Off, unattended, -p: never waits.
     for title, initial, env in [
@@ -7653,6 +7654,15 @@ def test_prompt_timeout_1_8_0():
     check('explicit ask: the reason the developer saw',
           'Remote or production execution (kubectl exec)' in _learner_out(outs[-1]).get('message', ''), True)
     cfg, cp = _fresh_cfg()
+    gap_call = {'tool_name': 'Bash', 'tool_input': {'command': 'kubectl exec -i w -- bash < d.sh'}, 'cwd': work}
+    _run_cfg(PRETOOL, gap_call, cp, full=True)
+    outs = []
+    check('explicit ask, no judge: parked with the reason PreToolUse gave, not the judge setup',
+          (_run_cfg(LEARNER, gap_call, cp, extra_env=_attended(),
+                    patch=_wait_patch(0.05, os.path.join(cfg, 'sleeps')), outputs=outs),
+           'Remote or production execution (kubectl exec)' in _learner_out(outs[-1]).get('message', '')),
+          ('deny', True))
+    cfg, cp = _fresh_cfg()
     outs = []
     check('remote payload gap in the learner: parked',
           _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'kubectl exec -i w -- bash < d.sh'},
@@ -7682,6 +7692,9 @@ def test_prompt_timeout_1_8_0():
         {'type': 'tool_use', 'id': 'tu2', 'name': 'Bash', 'input': unknown['tool_input']}]}}
     write(use, result, other)  # an earlier identical call answered; this one is not
     check('only the latest identical call counts',
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+    write(other, use, result)  # a pending identical call: no telling which one this prompt is
+    check('an identical call still pending: parked',
           _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
     write(use)
     check('no result yet: parked',
@@ -7733,25 +7746,45 @@ def test_script_hazard_1_8_0():
     put('locked.sh', '#!/bin/sh\naz group delete -n rg-example-dev --yes\n', 0o000)
     put('huge.sh', '#!/bin/sh\n' + 'echo x\n' * 12000 + 'az group delete -n rg-example-dev --yes\n')
     put('longremote.sh', '#!/bin/sh\nkubectl exec -n prod web-1 -- ls /srv\n' + 'echo x\n' * 2000)
+    put('lib1.sh', '#!/bin/sh\n' + 'echo one\n' * 1200)
+    put('lib2.sh', '#!/bin/sh\n' + 'echo two\n' * 1200)
+    put('dock.sh', '#!/bin/sh\ndocker exec web-1 ls /srv\n')
+    put('early.sh', '#!/bin/sh\naz group delete -n rg-example-dev --yes\n' + 'echo x\n' * 12000)
+    tear = 'az group delete rg-example-dev in teardown.sh'
     for cmd, want in [
-            ('bash teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('sh ./peek.sh', ('remote', 'kubectl exec in peek.sh', None)),
-            ('./peekvar.sh', ('remote', 'kubectl exec in peekvar.sh',
-                              'part of it is read from a file or built when it runs')),
-            ('source teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('bash < peek.sh', ('remote', 'kubectl exec in peek.sh', None)),
-            ('env X=1 ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('timeout 60 ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('cd bin && cd .. && ./teardown.sh', ('destroy', 'az group delete rg-example-dev in teardown.sh', None)),
-            ('bash noshebang.sh', ('destroy', 'helm uninstall example-release in noshebang.sh', None)),
-            ('./envshebang', ('destroy', 'terraform destroy in envshebang', None)),
-            ('./longremote.sh', ('remote', 'kubectl exec in longremote.sh',
-                                 'the script is too long for the judge to see whole')),
+            ('bash teardown.sh', (None, None, tear)),
+            ('./teardown.sh', (None, None, tear)),
+            ('bash -e teardown.sh', (None, None, tear)),
+            ('bash -eu -o pipefail teardown.sh', (None, None, tear)),
+            ('bash -ec "echo hi" teardown.sh', None),
+            ('cat teardown.sh; bash teardown.sh', (None, None, tear)),
+            ("echo '# x' >> teardown.sh; ./teardown.sh", (None, None, tear)),
+            ('sh ./peek.sh', ('kubectl exec in peek.sh', None, None)),
+            ('./peekvar.sh', ('kubectl exec in peekvar.sh',
+                              'part of it is read from a file or built when it runs', None)),
+            ('source teardown.sh', (None, None, tear)),
+            ('bash < peek.sh', ('kubectl exec in peek.sh',
+                                'the call feeds the script input from a file or another command', None)),
+            ('./peek.sh < input.txt', ('kubectl exec in peek.sh',
+                                       'the call feeds the script input from a file or another command', None)),
+            ('./peek.sh | tee out.log', ('kubectl exec in peek.sh', None, None)),
+            ('./dock.sh', None),
+            ('DOCKER_CONTEXT=example-prod ./dock.sh', ('docker exec on a remote host in dock.sh', None, None)),
+            ('./peek.sh; ./teardown.sh', ('kubectl exec in peek.sh', None, tear)),
+            ('./lib1.sh; ./lib2.sh; ./peek.sh', ('kubectl exec in peek.sh',
+                                                 'the judge is not shown all of the script', None)),
+            ('env X=1 ./teardown.sh', (None, None, tear)),
+            ('timeout 60 ./teardown.sh', (None, None, tear)),
+            ('cd bin && cd .. && ./teardown.sh', (None, None, tear)),
+            ('bash noshebang.sh', (None, None, 'helm uninstall example-release in noshebang.sh')),
+            ('./envshebang', (None, None, 'terraform destroy in envshebang')),
+            ('./longremote.sh', ('kubectl exec in longremote.sh', 'the judge is not shown all of the script', None)),
             ("cat > new.sh <<'EOF'\nkubectl delete ns example\nEOF\nbash new.sh",
-             ('destroy', 'kubectl delete ns example in new.sh', None)),
+             (None, None, 'kubectl delete ns example in new.sh')),
             ('echo "kubectl exec w -- ls" > n2.sh; sh n2.sh',
-             ('remote', 'kubectl exec in n2.sh', 'the call writes the script first')),
+             ('kubectl exec in n2.sh', 'the call writes the script first', None)),
+            ('echo "# x" >> peek.sh; sh peek.sh',
+             ('kubectl exec in peek.sh', 'the call writes the script first', None)),
             ('./build.sh', None),
             ('python3 tool.py', None),
             ('./bin/tool', None),
@@ -7759,6 +7792,7 @@ def test_script_hazard_1_8_0():
             ('git add teardown.sh', None),
             ('./locked.sh', None),
             ('./huge.sh', None),
+            ('./early.sh', None),
             ("cat > n3.sh <<'EOF'\nnpm test\nEOF\n./n3.sh", None),
             ('ls', None),
     ]:
@@ -7769,7 +7803,8 @@ def test_script_hazard_1_8_0():
     # Ordinary project scripts stay rule allows, with no judge call.
     cfg, cp = _fresh_cfg()
     reqs = os.path.join(cfg, 'reqs.jsonl')
-    for cmd in ('./build.sh', 'bash build.sh', 'python3 tool.py', './locked.sh', './huge.sh', 'cat teardown.sh'):
+    for cmd in ('./build.sh', 'bash build.sh', 'bash -e build.sh', 'python3 tool.py', './locked.sh', './huge.sh',
+                './early.sh', 'cat teardown.sh', './dock.sh'):
         check(f'rules allow, no judge: {cmd}', _run_cfg(PRETOOL, call(cmd), cp, llm=sure, requests_log=reqs),
               'allow')
     check('…no judge call for any of them', _requests(reqs), [])
@@ -7784,8 +7819,8 @@ def test_script_hazard_1_8_0():
     check('destroy script: the judge saw the script and why it was asked',
           (len(sent), 'az group delete -n rg-example-dev' in prompt, 'Runs a local script that deletes' in prompt),
           (1, True, True))
-    check('destroy script: no judge → the prompt (falls through)',
-          _run_cfg(PRETOOL, call('./teardown.sh'), cp, full=True), ('ask', False))
+    check('destroy script: no judge → an explicit ask, never a silent exit',
+          _run_cfg(PRETOOL, call('./teardown.sh'), cp, full=True), ('ask', True))
     cfg, cp, tr = _hold_env()
     check('destroy script: flagged → never held, an explicit ask',
           _run_cfg(PRETOOL, _hcall('./teardown.sh', tr, cwd=work), cp, llm=[_HFLAG, _HFLAG], full=True),
@@ -7794,6 +7829,9 @@ def test_script_hazard_1_8_0():
           _last_pretool(cfg).get('hold', '').startswith('not held: it runs a local script that deletes'), True)
     check('hold_resolver: a sourced destroy script is the developer\'s',
           p.hold_resolver('Bash', {'command': f'. {work}/teardown.sh'}, dict(_HFLAG))[0], 'developer')
+    check('hold_resolver: a remote exec in a script is the developer\'s',
+          p.hold_resolver('Bash', {'command': f'sh {work}/peek.sh'}, dict(_HFLAG)),
+          ('developer', 'remote or production execution (kubectl exec in peek.sh)'))
 
     # A remote exec in the script: the strict policy.
     cfg, cp = _fresh_cfg()
@@ -7807,7 +7845,8 @@ def test_script_hazard_1_8_0():
     check('remote script, payload visible: confident → allow',
           _run_cfg(PRETOOL, call('sh ./peek.sh'), cp, llm=sure), 'allow')
     reqs = os.path.join(cfg, 'reqs2.jsonl')
-    for cmd in ('./peekvar.sh', './longremote.sh', 'echo "kubectl exec w -- ls" > n2.sh; sh n2.sh'):
+    for cmd in ('./peekvar.sh', './longremote.sh', 'echo "kubectl exec w -- ls" > n2.sh; sh n2.sh',
+                'kubectl exec w -- ls; ./peekvar.sh', './lib1.sh; ./lib2.sh; ./peek.sh'):
         check(f'remote script with a gap → explicit ask, no judge: {cmd[:30]}',
               _run_cfg(PRETOOL, call(cmd), cp, llm=sure, requests_log=reqs, full=True), ('ask', True))
     check('…and the judge never saw those payloads', _requests(reqs), [])
@@ -7820,14 +7859,6 @@ def test_script_hazard_1_8_0():
           _run_cfg(LEARNER, call('sh ./peek.sh'), cp, llm={'safe': True}), 'ask')
     check('learner: remote script, confident → allow',
           _run_cfg(LEARNER, call('sh ./peek.sh'), cp, llm=sure), 'allow')
-    # A payload over 50 lines with no heredoc is read whole (it used to be
-    # a gap: "it could not be read"); with a heredoc the cap still holds.
-    many = 'kubectl exec w -- ls\n' + 'echo x\n' * 60
-    check('remote payload gap: 60 plain lines are read', p.remote_payload_gap(many, 'kubectl exec'), None)
-    check('remote payload gap: 60 plain lines with a $ still ask',
-          bool(p.remote_payload_gap(many + 'echo $X\n', 'kubectl exec')), True)
-    check('remote payload gap: 60 lines with a heredoc → could not be read',
-          p.remote_payload_gap("cat <<'E'\nx\nE\n" + many, 'kubectl exec'), 'it could not be read')
 
 
 if __name__ == '__main__':

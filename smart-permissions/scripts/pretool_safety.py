@@ -2455,7 +2455,10 @@ def _script_operand(name, args):
         if a == "--":
             i += 1
             break
-        if a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
+        if name in _SHELL_RUNNERS:  # `bash -e x.sh`: only -c (`-ec`) is code
+            if re.fullmatch(r"-\w*c\w*", a):
+                return None
+        elif a in _SCRIPT_INLINE_OPTS or name.startswith("python") and re.fullmatch(r"-\w*[cm]\w*", a):
             return None
         if not a.startswith(("-", "+")) or a == "-":
             break
@@ -2505,18 +2508,23 @@ def script_files(command, cwd, deadline=None):
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
 
     def add(word, how, where, check=False):
-        if len(found) >= SCRIPT_CONTEXT_MAX_FILES or time.monotonic() > deadline:
+        if time.monotonic() > deadline:
             return
         path = _evidence_path(word, where) if word else None
         # never a credential file: its text would go to the judge's provider
-        if path and not _private_file(path) and (not check or _looks_like_script(path)) \
-                and path not in [p for p, _ in found]:
-            found.append((path, how))
+        if not path or _private_file(path) or check and not _looks_like_script(path):
+            return
+        at = next((i for i, (p, _) in enumerate(found) if p == path), None)
+        if at is None:
+            if len(found) < SCRIPT_CONTEXT_MAX_FILES:
+                found.append((path, how))
+        elif found[at][1].startswith("read by"):  # `cat x.sh; bash x.sh`: what matters is the run
+            found[at] = (path, how)
 
     for segment in segments:
         raw, stdin, _hazard = _parse_simple_command(segment)
         tokens = [_unquote_word(w) for w in raw]
-        if time.monotonic() > deadline or len(found) >= SCRIPT_CONTEXT_MAX_FILES:
+        if time.monotonic() > deadline:
             break  # no probe past the deadline
         if not tokens:
             continue
@@ -4525,6 +4533,13 @@ def remote_exec(command):
     return next(_remote_execs(command), None)
 
 
+def _names_docker_endpoint(command):
+    """True when `command` itself points docker or podman somewhere other than
+    the local engine: an endpoint variable assigned, or a remote `context use`."""
+    return bool(re.search(r"\b(?:DOCKER_(?:HOST|CONTEXT|CONFIG)|CONTAINER_(?:HOST|CONNECTION))=", command)) \
+        or any(c not in _DOCKER_LOCAL_CONTEXTS for c in re.findall(r"\bcontext\s+use\s+(\S+)", command))
+
+
 def _remote_execs(command, env_remote=None):
     """The remote_exec label of each simple command in `command` that is one.
     `env_remote`: whether docker/podman talk to a remote endpoint when no
@@ -4532,13 +4547,10 @@ def _remote_execs(command, env_remote=None):
     if not isinstance(command, str) or not command.strip():
         return
     if env_remote is None:  # the endpoint docker or podman talks to, when no option names one
-        env_remote = bool(re.search(
-            r"\b(?:DOCKER_(?:HOST|CONTEXT|CONFIG)|CONTAINER_(?:HOST|CONNECTION))=", command)) \
+        env_remote = _names_docker_endpoint(command) \
             or bool(re.match(r"(?:tcp|ssh|https?)://", os.environ.get("DOCKER_HOST", ""))) \
             or os.environ.get("DOCKER_CONTEXT", "") not in _DOCKER_LOCAL_CONTEXTS \
-            or bool(os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION")) \
-            or any(c not in _DOCKER_LOCAL_CONTEXTS
-                   for c in re.findall(r"\bcontext\s+use\s+(\S+)", command))
+            or bool(os.environ.get("CONTAINER_HOST") or os.environ.get("CONTAINER_CONNECTION"))
         if not env_remote and re.search(r"\b(?:docker|podman)\b", command):
             env_remote = _docker_current_context() not in _DOCKER_LOCAL_CONTEXTS
     command = _constant_text(command) or command  # `K=kubectl; "$K" exec …`
@@ -4658,11 +4670,12 @@ def hold_resolver(tool, tool_input, verdict):
         hit = _quietly(remote_exec, command)
         if hit:
             return "developer", f"remote or production execution ({hit})"
-        hit = _quietly(script_hazard, command)
-        if hit:
-            return "developer", (f"it runs a local script that deletes cloud, production or remote "
-                                 f"resources ({hit[1]})" if hit[0] == "destroy"
-                                 else f"remote or production execution ({hit[1]})")
+        in_script, _gap, destroy = _quietly(script_hazard, command) or (None, None, None)
+        if in_script:
+            return "developer", f"remote or production execution ({in_script})"
+        if destroy:
+            return "developer", (f"it runs a local script that deletes cloud, production or "
+                                 f"remote resources ({destroy})")
     if verdict.get("resolver") != "agent":
         return "developer", "the judge did not say the agent can settle it"
     return "agent", ""
@@ -4702,23 +4715,20 @@ def remote_payload_gap(command, label):
     # a heredoc's body is in the text the judge sees; quoting is not parsed (a
     # `bash -c '… < x'` hides a redirect in quotes), so a quoted `|` asks too
     outside, rest = [], text
-    if "<<" not in text:  # no heredoc: all of it is outside
-        outside = [text]
+    for _ in range(50):
+        head, bodies, rest, _missing = _heredoc_split(rest)
+        outside.append(head)
+        for body, _quoted in bodies:  # `bash <<EOF` running `kubectl exec … < x` here
+            # the call is remote already: docker in the body counts as remote,
+            # whatever endpoint the outer command gave it
+            if next(_remote_execs(body, True), None):
+                gap = remote_payload_gap(body, label)
+                if gap:
+                    return gap
+        if not rest:
+            break
     else:
-        for _ in range(50):
-            head, bodies, rest, _missing = _heredoc_split(rest)
-            outside.append(head)
-            for body, _quoted in bodies:  # `bash <<EOF` running `kubectl exec … < x` here
-                # the call is remote already: docker in the body counts as remote,
-                # whatever endpoint the outer command gave it
-                if next(_remote_execs(body, True), None):
-                    gap = remote_payload_gap(body, label)
-                    if gap:
-                        return gap
-            if not rest:
-                break
-        else:
-            return "it could not be read"
+        return "it could not be read"
     if _REMOTE_INPUT_RE.search("\n".join(outside)):
         return "its input comes from a file or another command"
     if _REMOTE_BUILT_RE.search(text) or _REMOTE_FILE_ARG_RE.search(text):
@@ -4766,53 +4776,72 @@ def _runs_as_shell(how, text=None):
     return prog in _SHELL_RUNNERS
 
 
-def _script_hits(text):
+def _script_hits(text, env_remote=None):
     """(remote exec label or None, cloud delete label or None) in shell `text`."""
-    return next(_remote_execs(text), None), cloud_destroy(text)
+    return next(_remote_execs(text, env_remote), None), cloud_destroy(text)
 
 
 def script_hazard(command, cwd=None, deadline=None):
     """What the local shell scripts Bash `command` runs, sources or feeds to
-    a shell (script_files) hold that the command text does not show:
-    ("remote", label, gap) for a remote exec (label as remote_exec, with the
-    script's name; gap as remote_gap, on the script's text: why the judge
-    can't see all it runs, or None), else ("destroy", label, None) for a
-    cloud delete (label as cloud_destroy), else None. A script the call
-    writes first is read from the text the call writes (heredoc bodies and
-    quoted words) and always has a gap. A script that can't be read gives
-    no hit. `cwd` defaults to the hook's."""
+    a shell (script_files) hold that the command text does not show, as
+    (remote, gap, destroy), or None for nothing:
+      remote  — the first remote exec in them (remote_exec's label and the
+                script's name), or None;
+      gap     — why the judge can't see all that a remote exec in them runs,
+                or None: the first one any remote hit has (the call writes
+                the script first, the judge is not shown it whole, the call
+                feeds it input, or remote_gap on its text);
+      destroy — the first cloud delete in them (cloud_destroy's label and
+                the script's name), or None.
+    Every script is scanned. One the call writes first is read both as the
+    file is now and as the text the call writes (heredoc bodies, quoted
+    words). A file that can't be read, or is over SCRIPT_SCAN_MAX_BYTES,
+    gives no hit. `cwd` defaults to the hook's."""
     if not isinstance(command, str) or not command.strip():
         return None
     cwd = cwd if cwd is not None else HOOK_CWD
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     written, written_names = _written_files(command, cwd)
-    destroy = None
+    outer = next(iter(_heredoc_split(command)[:1]), command)
+    env_remote = True if _names_docker_endpoint(command) else None
+    budget = SCRIPT_CONTEXT_TOTAL_BYTES  # what script_context will show the judge, in the same order
+    remote = gap = destroy = None
     for path, how in script_files(command, cwd, deadline):
-        name = os.path.basename(path)
-        if path in written or name in written_names:  # what runs is the text the call writes
-            if not _runs_as_shell(how):
-                continue
-            texts = [body for body, _ in _heredoc_bodies(command)]
-            texts += [w for words in _commands_words(command) for w in words if re.search(r"\s", w)]
-            for text in texts:
-                remote, hit = _script_hits(text)
-                if remote:
-                    return "remote", f"{remote} in {name}", "the call writes the script first"
-                destroy = destroy or hit and f"{hit} in {name}"
-            continue
         if time.monotonic() > deadline:
             break
+        name = os.path.basename(path)
         text, note = _read_script(path, SCRIPT_SCAN_MAX_BYTES)
-        if text is None or not _runs_as_shell(how, text):
+        size = len(text.encode("utf-8", "replace")) if text is not None else 0
+        if "TRUNCATED" in note:  # over the scan cap: the rules' answer, as before
+            text = None
+        shown = min(size, SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0))
+        budget -= shown
+        rewritten = path in written or name in written_names
+        at = outer.find(name)  # input the script may pass on: a redirect, or a pipe into it
+        fed = bool(re.search(r"(?<!<)<(?![<&(])", outer)
+                   or at > 0 and re.search(r"(?<!\|)\|(?!\|)", outer[:at]))
+        if not _runs_as_shell(how, None if rewritten else text) or text is None and not rewritten:
             continue
-        remote, hit = _script_hits(text)
-        if remote:
-            too_long = len(text.encode("utf-8", "replace")) > SCRIPT_CONTEXT_MAX_BYTES or "TRUNCATED" in note
-            gap = "the script is too long for the judge to see whole" if too_long \
-                else remote_gap(text, remote)
-            return "remote", f"{remote} in {name}", gap
-        destroy = destroy or hit and f"{hit} in {name}"
-    return ("destroy", destroy, None) if destroy else None
+        texts = [text] if text is not None else []
+        if rewritten:  # what runs is what the call writes
+            texts += [body for body, _ in _heredoc_bodies(command)]
+            texts += [w for words in _commands_words(command) for w in words if re.search(r"\s", w)]
+        for t in texts:
+            hit, gone = _script_hits(t, env_remote)
+            destroy = destroy or gone and f"{gone} in {name}"
+            if not hit:
+                continue
+            remote = remote or f"{hit} in {name}"
+            if rewritten:
+                why = "the call writes the script first"
+            elif shown < size:
+                why = "the judge is not shown all of the script"
+            elif fed:
+                why = "the call feeds the script input from a file or another command"
+            else:
+                why = remote_gap(t, hit)
+            gap = gap or why
+    return (remote, gap, destroy) if remote or destroy else None
 
 
 def _heredoc_bodies(text):
@@ -5041,17 +5070,19 @@ def _main():
 
     # Remote or production execution is judged strictly, even when a rule
     # (a user's safe_commands entry) would allow it; see remote_exec_verdict.
-    remote = None
+    remote = destroy = None
     if decision != "deny" and tool == "Bash":
         remote = _quietly(remote_exec, tool_input.get("command", ""))
         gap = remote and remote_gap(tool_input.get("command"), remote)
         # …or in a local shell script it runs, which the rules would allow
-        hidden = None if remote else _quietly(script_hazard, tool_input.get("command", ""))
-        if hidden and hidden[0] == "remote":
-            remote, gap = hidden[1], hidden[2]
-        elif hidden and decision == "allow":
+        in_script, script_gap, destroy = _quietly(script_hazard, tool_input.get("command", "")) \
+            or (None, None, None)
+        if script_gap and not gap:
+            remote, gap = in_script, script_gap
+        remote = remote or in_script
+        if destroy and decision == "allow":
             decision, reason = "ask", (f"Runs a local script that deletes cloud, production or "
-                                       f"remote resources ({hidden[1]}): judged")
+                                       f"remote resources ({destroy}): judged")
         if gap:  # the developer's whatever the judge says: it never sees the payload
             shown = f"Remote or production execution ({remote}): {gap} — confirm it yourself"
             _ask_developer(tool, tool_input, shown, shown, start, "rule", None,
@@ -5065,7 +5096,7 @@ def _main():
         rule_reason = reason
         context = build_llm_context(input_data)
         # The retry of a held call: judged once more with the agent's answer.
-        if HOLDS_ENABLED and not remote and _hold_retry(
+        if HOLDS_ENABLED and not remote and not destroy and _hold_retry(
                 input_data, tool, tool_input, context, rule_reason, start, wall_start):
             return
         decision, reason, info = llm_evaluate(
@@ -5088,6 +5119,13 @@ def _main():
                 return
             _ask_developer(tool, tool_input, reason, reason, start, source, llm_ms, rule_reason,
                            hold=None if not HOLDS_ENABLED else f"not held: {not_held}")
+            return
+        # A cloud delete in a script the rules allowed, with no judge answer:
+        # the developer's, never a silent exit to a native allow rule.
+        elif destroy and decision == "ask":
+            shown = f"Runs a local script that deletes cloud, production or remote resources " \
+                    f"({destroy}); the judge did not clear it ({reason}) — confirm it yourself"
+            _ask_developer(tool, tool_input, shown, shown, start, source, llm_ms, rule_reason)
             return
 
     # If still "ask" after both local rules and LLM, exit silently

@@ -392,29 +392,36 @@ for project scripts.
     PermissionRequest hook for a fall-through with `ATTENDED=0`, `ENTRYPOINT=sdk-cli`; an interactive
     session has `1` and `cli`. Without this a `-p` run would stall for the full timeout.
   - After the sleep: nothing if the parent process changed (Claude Code gone) or `_prompt_answered`
-    finds a `tool_result` for the last `tool_use` in the acting transcript with this call's name and
-    input (the developer answered; Claude Code ignores a late hook decision anyway, this keeps the log
+    finds a `tool_result` for every `tool_use` in the acting transcript tail with this call's name and
+    input (the prompt has no id, so one identical call still pending counts as unanswered; the developer
+    answered; Claude Code ignores a late hook decision anyway, this keeps the log
     true). A transcript it can't read counts as unanswered: the deny is harmless if ignored.
   - The message carries the reason the developer would have seen, through `scrub_script_text`; the log
-    record (`source: prompt-timeout`, `hold: prompt-timeout`, decision `deny`) keeps
-    `_loggable_reason(reason)`. It follows the call's `ask` record.
+    record (`source: prompt-timeout`, `hold: prompt-timeout`, decision `deny`, the `rule_reason`) keeps
+    `_loggable_reason(reason)`. It follows the call's `ask` record. With no judge, a PreToolUse flag
+    (an explicit ask) is the reason shown, not the judge-setup message.
   - Tests set `CLAUDE_CODE_SESSION_ATTENDED=0` for the whole suite; `_run_cfg(patch=…)` injects
     `_m.PROMPT_TIMEOUT_S` and a recording `_m._sleep`.
 - **Script hazard** (`script_hazard(command, cwd=None, deadline=None)`). For each file `script_files`
   finds that runs as shell code (`_runs_as_shell`: run by a shell runner, sourced, fed on stdin to a
   shell, or run directly with a shell `#!` or none), read up to `SCRIPT_SCAN_MAX_BYTES` (64 KB) with
-  `_read_script` and scanned with `_remote_execs` and `cloud_destroy`. Returns `("remote", label, gap)`
-  (first remote hit wins; gap: too long for the judge's 8 KB view, else `remote_gap` on the script text),
-  `("destroy", label, None)`, or None. A script the call writes first (`_written_files`, factored out of
-  `script_context`) is read from the command's heredoc bodies and quoted words, and a remote hit there
-  always has a gap. Unreadable files give no hit.
-  - PreToolUse: a remote hit becomes the call's `remote` (gap → explicit ask with no judge call; else the
-    strict confident-only judge path); a destroy hit turns a rules allow into a judge call with
-    rule reason "Runs a local script that deletes …: judged". `hold_resolver` sends both to the developer.
-    The learner applies the remote hit the same way (gap → developer, no judge).
-- **`remote_payload_gap`** reads a text with no `<<` whole instead of walking it 50 lines at a time, so a
-  long heredoc-free payload is no longer "it could not be read" (it is checked for `$`, pipes, redirects
-  like any other).
+  `_read_script` and scanned with `_remote_execs` and `cloud_destroy`. Every script is scanned; returns
+  `(remote, gap, destroy)` (each the first of its kind across the scripts, or None) or None for no hit.
+  The gap, for a remote hit: the call writes the script first; the judge is not shown all of it (the
+  8 KB per-file and 16 KB total budgets of `script_context`, in the same order); the call feeds it input
+  (a `<` redirect, or a pipe before its name); else `remote_gap` on the script text. A docker endpoint
+  the command names (`DOCKER_CONTEXT=… ./x.sh`, `_names_docker_endpoint`) applies to the script. A
+  script the call writes first (`_written_files`, factored out of `script_context`) is scanned both as
+  the file is now and as the command's heredoc bodies and quoted words. Unreadable files and files over
+  64 KB give no hit (the rules' answer, as before).
+  - PreToolUse: a remote hit becomes the call's `remote` when the command has none, and a script gap is
+    the call's gap when the command has none (gap → explicit ask with no judge call; else the strict
+    confident-only judge path). A destroy hit turns a rules allow into a judge call with rule reason
+    "Runs a local script that deletes …: judged", skips `_hold_retry`, and is an explicit ask when the
+    judge gives no answer (no judge, an error). `hold_resolver` sends both to the developer. The learner
+    applies the remote hit and gap the same way (gap → developer, no judge).
+- **Script collector** (`script_files`, also the judge's evidence): `bash -e x.sh` (any shell option but
+  `-c`) runs `x.sh`; a script read and then run (`cat x.sh; bash x.sh`) is labelled by the run.
 
 Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 
@@ -422,9 +429,10 @@ Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
 
 - `PROMPT_TIMEOUT_S`, `PROMPT_TIMEOUT_MAX_MINUTES`, `_prompt_timeout_s(value)` (pretool_safety).
 - `permission_learner.parked_message(reason, minutes)`, `_developer_prompt(input_data, tool, tool_input,
-  reason, start)`, `_unattended()`, `_prompt_answered(input_data)`, `_sleep` (the one wait; tests patch it).
+  reason, start, rule_reason)`, `_unattended()`, `_prompt_answered(input_data)`, `_sleep` (the one wait; tests patch it).
 - `script_hazard(command, cwd=None, deadline=None)`, `_runs_as_shell(how, text=None)`,
-  `_written_files(command, cwd)`, `_heredoc_bodies(text)`, `SCRIPT_SCAN_MAX_BYTES`.
+  `_written_files(command, cwd)`, `_heredoc_bodies(text)`, `_names_docker_endpoint(command)`,
+  `SCRIPT_SCAN_MAX_BYTES`.
 
 ## Open questions
 
@@ -437,7 +445,10 @@ Tests: `test_prompt_timeout_1_8_0`, `test_script_hazard_1_8_0`.
   `-p` runs wait (bounded by the timeout), not approve anything.
 - The script scan: shell scripts only (not `python3 x.py`, `make`, `npm run`), one level (a script that
   calls another script is not followed), at most `SCRIPT_CONTEXT_MAX_FILES` files, text patterns only
-  (`$CLI delete` is missed). `cat x.sh | bash` already asks (shell reading stdin) but is not scanned.
+  (`$CLI delete` is missed), and `cloud_destroy`'s word match can send a read-only script to the judge
+  (`kubectl get pods --context delete`). A remote script past about 50 lines hits `remote_payload_gap`'s
+  50-round cap and is "it could not be read" (an explicit ask), unchanged so direct remote calls keep
+  their policy. `cat x.sh | bash` already asks (shell reading stdin) but is not scanned.
   `llm_eval.py` does not apply it (its sandbox scripts are built after the rule verdict).
 - A remote exec in a script with any `$` is a gap, so nearly every real remote script comes to the
   developer; that is the 1.7.0 text rule applied to the script, by design.

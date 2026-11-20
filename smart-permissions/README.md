@@ -270,10 +270,11 @@ to a shell (the same files the judge is shown, up to 64 KB, only regular files
 you own) is scanned for the remote-execution commands above and for deleting
 cloud, production or remote resources. A remote exec inside it gets the strict
 policy above, judged on the script's text (a script with a `$`, a pipe or a
-redirect, one too long for the judge to see whole, or one the call writes
-first comes to you without a judge call); a cloud delete inside it goes to the
-judge instead of being allowed, and a flag on it is never held. A script that
-can't be read keeps the rules' answer, and so does a script in another
+redirect, one the judge is not shown whole, one the call feeds input to, or
+one the call writes first comes to you without a judge call); a cloud delete
+inside it goes to the judge instead of being allowed, comes to you when the
+judge gives no answer, and a flag on it is never held. A script that can't be
+read or is over 64 KB keeps the rules' answer, and so does a script in another
 language (`python3 x.py`) or one a script calls in turn. Ordinary project
 scripts are unaffected.
 
@@ -674,8 +675,8 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 - **1.8.0 (2026-11-19) — unanswered prompts are parked; scripts are read.**
   - A permission prompt you leave unanswered for `prompt_timeout_minutes` (default 10, `0` off) is denied with a message that tells Claude why it needed you, not to retry or work around it, to move on, and to list it for you in its final reply. Never an allow; never in `claude -p`; nothing happens if you answered first. Logged as `prompt-timeout`. See [Unanswered prompts](#unanswered-prompts-parked-not-a-freeze). The learner's hooks.json timeout is now 3660 s.
-  - A local shell script the call runs (`./x.sh`, `bash x.sh`, sourced, fed to a shell) is scanned for remote execution and cloud deletes: a remote exec inside it gets the strict remote policy on the script's text, and a cloud delete goes to the judge and is never held. Unreadable scripts and other languages keep the rules' answer. See [Local scripts](#remote-and-production-execution).
-  - A remote payload over 50 lines with no heredoc is now read whole instead of counting as unreadable.
+  - A local shell script the call runs (`./x.sh`, `bash x.sh`, sourced, fed to a shell) is scanned for remote execution and cloud deletes: a remote exec inside it gets the strict remote policy on the script's text, and a cloud delete goes to the judge (to you when the judge gives no answer) and is never held. Unreadable scripts, scripts over 64 KB and other languages keep the rules' answer. See [Local scripts](#remote-and-production-execution).
+  - The judge's script evidence now counts `bash -e x.sh` (and other shell options) as running `x.sh`, and a script read and then run (`cat x.sh; bash x.sh`) as run.
 
 - **1.7.0 (2026-11-19) — the agent answers first; strict remote execution.**
   - Holds (on by default, `"holds": false` turns them off): a flag the agent can settle is a deny that reads as a question ("Held by smart-permissions …"); the agent answers with its evidence and retries the identical call, and one judge pass at the recheck effort, with the evidence gathered again, clears it or sends it to you with the hold reason in the hook's words and the agent's answer labelled as its claim. See [Holds](#holds-the-agent-answers-first). The judge's verdict gains `confident`, `resolver` and `question`.
