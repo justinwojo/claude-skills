@@ -7943,21 +7943,15 @@ def test_remote_provenance_1_8_1():
     wt = 'C:\\Lab\\proj-wt\\s4'
     ps = (f"& {{ $main = 'C:\\Lab\\proj'; $wt = '{wt}'; git -C $main worktree remove --force $wt; "
           "if (Test-Path $wt) { Remove-Item -Recurse -Force $wt } }")
-    calls = p._remote_calls('mcp__bench__run', {'command': ps, 'timeout_s': 300})
+    key, paths = p._remote_targets('mcp__bench__run', {'command': ps, 'timeout_s': 300})
     check('remote: an MCP cleanup is keyed by its server, paths most specific first',
-          [(k, [n for _, n in ps_]) for k, ps_ in calls],
-          [('mcp__bench__', ['c:/lab/proj-wt/s4', 'c:/lab/proj'])])
+          (key, [n for _, n in paths]), ('mcp__bench__', ['c:/lab/proj-wt/s4', 'c:/lab/proj']))
     check('remote: an MCP command that deletes nothing → no lookup',
-          p._remote_calls('mcp__bench__run', {'command': f'dir {wt}'}), [])
+          p._remote_targets('mcp__bench__run', {'command': f'dir {wt}'}), None)
     check('remote: an MCP tool without a command → no lookup',
-          p._remote_calls('mcp__bench__read_file', {'path': wt}), [])
+          p._remote_targets('mcp__bench__read_file', {'path': wt}), None)
     ssh = "ssh -p 2222 dev@runner 'cd ~/Dev/repo && git worktree remove --force ~/scratch/lead-1'"
-    check('remote: ssh keyed by its words as written',
-          [(k, [n for _, n in ps_]) for k, ps_ in p._remote_calls('Bash', {'command': ssh})],
-          [('ssh -p 2222 dev@runner', ['~/scratch/lead-1', '~/Dev/repo'])])
-    check('remote: interactive ssh, or one that deletes nothing → no lookup',
-          (p._remote_calls('Bash', {'command': 'ssh runner'}),
-           p._remote_calls('Bash', {'command': 'ssh runner ls /srv/x'})), ([], []))
+    check('remote: ssh gets no history block', p._remote_targets('Bash', {'command': ssh}), None)
     check('paths: Windows case and slashes, trailing slash, roots and .. dropped',
           [n for _, n in p._remote_paths("C:\\Lab\\X\\ C:/lab/x/ / ~ C:\\ /srv/a/../b ~/k/ /srv/$v")],
           ['c:/lab/x', 'c:/lab/x', '~/k'])
@@ -7981,12 +7975,7 @@ def test_remote_provenance_1_8_1():
         _tool_use('o1', 'mcp__other__run', {'command': f'mkdir {wt}'}, 70),  # another server
         _tool_use('o2', 'mcp__bench__x__run', {'command': f'mkdir {wt}'}, 70),  # server bench__x
         _tool_use('o3', 'mcp__bench__run', {'command': 'mkdir C:\\Lab\\proj-wt\\s40'}, 70),  # s40 ≠ s4
-        _bash_use('b1', "ssh -p 2222 dev@runner 'git -C ~/Dev/repo worktree add ~/scratch/lead-1 origin/lead-1'", 80),
-        _bash_result('b1', 80),
-        _bash_use('b2', "ssh dev@runner 'mkdir ~/scratch/lead-1'", 75),  # other ssh words
-        _bash_result('b2', 75),
-        _bash_use('b3', "ssh -p 2222 dev@runner 'ls ~/scratch/lead-10'", 74),  # lead-10 ≠ lead-1
-        _bash_result('b3', 74),
+        _bash_use('b1', f'mkdir {wt}', 75), _bash_result('b1', 75),  # a local Bash call is not one
         _tool_use('now', 'mcp__bench__run', {'command': ps}, 0),  # the call under review
     ])
     payload = {'cwd': base, 'transcript_path': sess, 'tool_use_id': 'now',
@@ -8006,26 +7995,14 @@ def test_remote_provenance_1_8_1():
           and 'the MCP server bench (any of its mcp__bench__* tools)' in text, True)
     check('mcp: the subagent\'s worktree add and job cwd (case, slash) name it',
           '2 earlier calls name it or a path inside it' in s4
-          and 'the tool call returned ok, names it: run: $main' in s4 and 'worktree add --detach' in s4
-          and 'the tool call returned an error, names it: job_start: dotnet test' in s4, True)
-    check('mcp: another server, a server sharing the prefix, and s40 do not match',
+          and 'the tool call returned ok, names it, run: $main' in s4 and 'worktree add --detach' in s4
+          and 'the tool call returned an error, names it, job_start: dotnet test' in s4, True)
+    check('mcp: another server, a server sharing the prefix, s40 and a Bash call do not match',
           'mkdir' in s4, False)
     check('mcp: the call under review is not its own evidence', 'Test-Path' in text, False)
     check('mcp: no creation claim', 'created it' in text.lower() or 'created' in text.lower(), False)
     same, _ = remote(dict(payload, tool_use_id=None))
     check('mcp: without a tool_use_id the pending identical call is skipped', same, text)
-
-    sp = dict(payload, tool_name='Bash', tool_input={'command': ssh}, tool_use_id='x')
-    text, status = remote(sp)
-    check('ssh: found the same words\' worktree add; other words and lead-10 not',
-          (status, '1 earlier call names it' in text, 'worktree add ~/scratch/lead-1' in text,
-           'mkdir' in text, 'lead-10' in text), ('found', True, True, False, False))
-    check('ssh: header names the ssh words', '`ssh -p 2222 dev@runner`' in text, True)
-    text, status = remote(dict(sp, tool_input={'command': f"ssh -p 2222 dev@runner '{rmrf} /srv/never'"}))
-    check('ssh: nothing names it → none', (status, 'no earlier call of this session there names it' in text),
-          ('none', True))
-    text, status = remote(dict(sp, tool_input={'command': f"ssh bench '{rmrf} ~/scratch/lead-1'"}))
-    check('ssh: a different host does not match', status, 'none')
 
     # A long history: the first 2 and last 3 shown; a secret in one is redacted
     many = os.path.join(proj, 'sess-many.jsonl')
@@ -8063,25 +8040,16 @@ def test_remote_provenance_1_8_1():
               (True, 'found', '& { $'))
     system = req[0]['messages'][0]['content'] if req else ''
     check('prompt: remote wording present',
-          'On another machine (over ssh, or an MCP' in system and 'the resolver is "agent"' in system, True)
+          'On another machine (an MCP tool that' in system and 'the resolver is "agent"' in system, True)
     check('hold note: remote scratch worktree wording', 'is not such a remote resource' in p.LLM_HOLD_RETRY_NOTE,
           True)
 
     # ---- review fixes ----
-    # C2: an option cluster ending in a value letter takes the next word
-    check('C2: -vp 2222 keys the host too, so two hosts differ',
-          [k for k, _ in p._ssh_calls(f'ssh -vp 2222 runner-a {rmrf} /srv/x')]
-          + [k for k, _ in p._ssh_calls(f'ssh -Cp 2222 runner-b {rmrf} /srv/x')],
-          ['ssh -vp 2222 runner-a', 'ssh -Cp 2222 runner-b'])
-    check('C2: an attached value takes no word; no host → no key',
-          ([k for k, _ in p._ssh_calls(f'ssh -oUser=dev runner {rmrf} /srv/x')],
-           p._ssh_calls('ssh -p 2222'), p._ssh_calls('ssh -v -p 2222 -- -x ls')),
-          (['ssh -oUser=dev runner'], [], []))
     # C4: a structured cwd counts whole; only drive paths fold; a quoted path
     # cut at a space is left out
     pf = 'C:\\Program Files\\Build'
     check('C4: an MCP cwd with a space is one path',
-          [n for _, n in p._remote_calls('mcp__bench__run', {'command': 'git clean -fdx', 'cwd': pf})[0][1]],
+          [n for _, n in p._remote_targets('mcp__bench__run', {'command': 'git clean -fdx', 'cwd': pf})[1]],
           ['c:/program files/build'])
     check('C4: a POSIX path with a backslash is not folded', p._remote_norm('/srv/A\\b'), '/srv/A\\b')
     check('C4: a quoted path cut at a space is left out',
@@ -8094,6 +8062,37 @@ def test_remote_provenance_1_8_1():
     text, _ = remote(dict(payload, transcript_path=pft, tool_input=cmd_pf))
     check('C4: an earlier cwd matches whole: C:\\Program does not, the same folder in caps does',
           ('1 earlier call names it' in text, 'run: git status' in text, 'run: dir' in text), (True, True, False))
+    # C4 (round 2): a path is a whole word, bare or in one closed pair of quotes
+    check('C4: a quote inside a word, or a path cut at a space, names nothing',
+          [n for _, n in p._remote_paths('git --work-tree="/srv/a b" clean -fdx; ls --dir=/srv/c '
+                                         '"/srv/d" \'/srv/e\'; x"/srv/f" "/srv/g\' /srv/h')],
+          ['/srv/d', '/srv/e', '/srv/h'])
+    # C13: the structured credential names are the Bash redactor's
+    check('C13: credentials, client_key, pwd masked whole',
+          json.loads(p._decision_log_input('mcp__bench__x', {'credentials': {'u': 'a'}, 'client_key': 'k',
+                                                             'pwd': 'p', 'n': 1}, None, redact=True)),
+          {'credentials': '[REDACTED]', 'client_key': '[REDACTED]', 'pwd': '[REDACTED]', 'n': 1})
+    # C14: the word the scan limit cuts through is no path
+    pad = 'x' * (p.REMOTE_SCAN_CHARS - len(f' {rmrf} /srv/build'))
+    cutcmd = f'{pad} {rmrf} /srv/build-other /srv/z'
+    check('C14: a path cut at the scan limit names nothing',
+          ([n for _, n in p._remote_paths(cutcmd)], [n for _, n in p._remote_paths(cutcmd[:p.REMOTE_SCAN_CHARS])]),
+          ([], ['/srv/build']))
+    hist = os.path.join(proj, 'sess-c14.jsonl')
+    _transcript(hist, [_tool_use('h1', 'mcp__bench__run', {'command': 'x' * (p.REMOTE_SCAN_CHARS - len(' ls /srv/build')) + ' ls /srv/build-other'}, 20),
+                       _bash_result('h1', 20)])
+    text, status = remote(dict(payload, transcript_path=hist, tool_input={'command': f'{rmrf} /srv/build'}))
+    check('C14: an earlier call cut at the limit is no evidence', status, 'none')
+    # C15: a share (//) is not a rooted path
+    check('C15: // kept apart from /', (p._remote_norm('//fileserver/share/s'), p._remote_norm('/fileserver/share/s'),
+                                         p._remote_norm('//')), ('//fileserver/share/s', '/fileserver/share/s', None))
+    # C18: the tool name shows even when the snippet is clipped
+    longt = os.path.join(proj, 'sess-c18.jsonl')
+    _transcript(longt, [_tool_use('l1', 'mcp__bench__read_file', {'note_path': '/srv/' + 'n' * 400,
+                                                                    'path': '/srv/w/f.txt'}, 20), _bash_result('l1', 20)])
+    text, _ = remote(dict(payload, transcript_path=longt, tool_input={'command': f'{rmrf} /srv/w'}))
+    check('C18: a clipped snippet keeps its tool name', ('names a path inside it, read_file: …' in text,
+                                                          'f.txt' in text), (True, True))
     # C5: X-API-Key, any value type under a credential key, valid JSON
     red = p._decision_log_input('mcp__bench__fetch', {'headers': {'X-API-Key': ['k1', 'k2'], 'token': 7},
                                                      'q': 'Bearer abcdefghijkl'}, None, redact=True)
@@ -8117,15 +8116,30 @@ def test_remote_provenance_1_8_1():
     _transcript(os.path.join(proj, 'sess-c6', 'subagents', 'agent-z.jsonl'),  # another agent, since
                 [_tool_use('z1', 'mcp__bench__run', {'command': 'mkdir C:\\Lab\\w\\later'}, 1), _bash_result('z1', 1)])
     text, _ = remote(dict(payload, transcript_path=c6, tool_use_id=None, tool_input=reordered))
-    check('C6: the pending call is skipped by input; a later call is dropped',
-          ('mkdir C:\\Lab\\w\\a' in text, 'rm -' in text.split('\n', 1)[-1], 'later' in text), (True, False, False))
+    check('C6/C16: no id: the pending call is skipped by input, and no time cut-off',
+          ('mkdir C:\\Lab\\w\\a' in text, 'rm -' in text.split('\n', 1)[-1], 'later' in text), (True, False, True))
     text, _ = remote(dict(payload, transcript_path=c6, tool_use_id='r2', tool_input=reordered))
-    check('C6: with its id, a call after it is dropped too', ('w\\a' in text, 'later' in text), (True, False))
+    check('C6: with its id, a call after it is dropped', ('w\\a' in text, 'later' in text), (True, False))
+    # C16: the cut-off holds when the byte budget runs out before the next transcript
+    old = p.PROVENANCE_TOTAL_BYTES
+    try:
+        later = os.path.join(proj, 'sess-c16.jsonl')
+        os.makedirs(os.path.join(proj, 'sess-c16', 'subagents'))
+        _transcript(later, [_tool_use('y1', 'mcp__bench__run', {'command': 'mkdir C:\\Lab\\w\\after'}, 1),
+                            _bash_result('y1', 1),
+                            _tool_use('y2', 'mcp__bench__run', reordered, 5)])
+        _transcript(os.path.join(proj, 'sess-c16', 'subagents', 'agent-q.jsonl'), [])
+        p.PROVENANCE_TOTAL_BYTES = os.path.getsize(later)  # gone after the main transcript
+        text, _ = remote(dict(payload, transcript_path=later, tool_use_id='y2', tool_input=reordered))
+    finally:
+        p.PROVENANCE_TOTAL_BYTES = old
+    check('C16: budget out before the next transcript: a later call is still dropped',
+          ('after' in text, 'Only the newest part' in text), (False, True))
     # C9: a long command stays within the budget
     big = {'command': ('git status; echo ' + 'x' * 60 + ' ') * 400 + f'git reset reset --hard; {rmrf} /srv/w'}
     check('C9: the input is over 30 KB', len(big['command']) > 30000, True)
     t0 = time.monotonic()
-    p._remote_calls('mcp__bench__run', big)
+    p._remote_targets('mcp__bench__run', big)
     p._REMOTE_RESET_HINT_RE.search(('git reset ' * 3000)[:p.REMOTE_SCAN_CHARS])
     blocks, status = p.remote_provenance(dict(payload, tool_input=big), 'mcp__bench__run', big,
                                          time.monotonic() + 1.0)
