@@ -689,8 +689,9 @@ checkout or worktree made from a pushed branch or commit on a development, \
 build or test machine the session drives (over ssh or an MCP tool that runs \
 commands there) is not a remote resource in the developer-only sense: when \
 what is open is whether this session made it and whether it holds anything \
-found nowhere else, the agent can settle it from its own earlier calls and git \
-status there, so the resolver is "agent". A shared checkout, or one holding \
+found nowhere else, the agent can settle it from its own earlier calls and the \
+checkout's git state there (uncommitted changes, commits no remote holds, \
+ignored files), so the resolver is "agent". A shared checkout, or one holding \
 deliverables or unique work, stays the developer's call.
 
 Respond with ONLY valid JSON (no markdown fencing, no explanation):
@@ -808,9 +809,11 @@ def _decision_log_input(tool, tool_input, limit=DECISION_LOG_INPUT_CHARS, redact
 
     Bash → command, file tools → path, WebFetch → url, search tools →
     pattern, an MCP tool → its `command` (and `cwd`) when it has one, else
-    its input as compact JSON (`redact`: each value redacted, _redact_values);
-    else the tool name. Only tool inputs are ever logged (never API keys).
+    its input as compact JSON; else the tool name. `redact`: secrets taken
+    out (_redact_secrets; in JSON, each value, see _redact_values, so it
+    stays valid JSON). Only tool inputs are ever logged (never API keys).
     """
+    json_input = False
     if tool == "Bash":
         val = tool_input.get("command", "")
     elif tool in ("Write", "Edit", "NotebookEdit", "Read"):
@@ -827,12 +830,15 @@ def _decision_log_input(tool, tool_input, limit=DECISION_LOG_INPUT_CHARS, redact
             try:
                 val = json.dumps(_redact_values(tool_input) if redact else tool_input,
                                  separators=(",", ":"), ensure_ascii=False, default=str)
+                json_input = True
             except (TypeError, ValueError):
-                val = str(tool_input)
+                val = tool if redact else str(tool_input)
     else:
         val = tool
     if not isinstance(val, str):
         val = str(val)
+    if redact and not json_input:
+        val = _redact_secrets(val)[0]
     return val if limit is None else val[:limit]
 
 
@@ -857,14 +863,14 @@ _SECRET_PATTERNS = [
 ]
 
 
-_SECRET_KEY_RE = re.compile(r"(?i)authorization|passw(?:or)?d|secret|token|api_?key|cookie")
+_SECRET_KEY_RE = re.compile(r"(?i)authorization|passw(?:or)?d|secret|token|api[-_]?key|cookie")
 
 
 def _redact_values(value):
     """`value` (JSON-like) with each string in it passed through
     _redact_secrets, and a field named like a credential redacted whole."""
     if isinstance(value, dict):
-        return {k: "[REDACTED]" if isinstance(k, str) and _SECRET_KEY_RE.search(k) and v is not None
+        return {k: "[REDACTED]" if isinstance(k, str) and _SECRET_KEY_RE.search(k)
                 else _redact_values(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_redact_values(v) for v in value]
@@ -960,7 +966,7 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
         full = _decision_log_input(tool, tool_input, None)
         shown, redacted = full, False
         if DECISION_LOG_FULL_INPUT:  # before the cut, so a secret cut short is still found
-            shown = _redact_secrets(_decision_log_input(tool, tool_input, None, redact=True))[0]
+            shown = _decision_log_input(tool, tool_input, None, redact=True)
             redacted = shown != full
         logged = shown[:limit]
         record = {
@@ -2000,12 +2006,16 @@ def _transcript_matches(files, targets, current, skip_id, deadline,
     result" while it has none, "result unknown" when a line with its id
     can't be read). The call being judged is never a match: by
     its tool_use id when the hook input has one, else as a call with no result
-    yet whose command, as stored or as sent, is identical to it. For another
+    yet whose command, as stored or as sent, is identical to it (`current`,
+    or a test `current(tid, texts)`); nor is a call from its time or after
+    (another agent's, in its transcript). For another
     machine (remote_provenance), `inputs` and `named_paths` read its calls,
     a line must hold `mark`, and needles (lowercase) match without case.
     `budget`: [bytes left to read], shared between callers. Raises OSError
     when no transcript could be read."""
     fold = (lambda text: text.lower()) if mark else (lambda text: text)
+    is_current = current if callable(current) else (lambda tid, texts: current in texts)
+    now = None  # when the call being judged was made, once seen
     matches = {i: [] for i in range(len(targets))}
     needles = set().union(*(t["needles"] for t in targets))
     budget, cut, failed = budget or [PROVENANCE_TOTAL_BYTES], False, 0
@@ -2045,6 +2055,7 @@ def _transcript_matches(files, targets, current, skip_id, deadline,
             ts = _ts_seconds(record.get("timestamp") or "")
             for tid, texts in inputs(record):
                 if tid and tid == skip_id:
+                    now = ts
                     continue
                 named = [(t, named_paths(t, needles)) for t in texts
                          if any(needle in fold(t) for needle in needles)]
@@ -2058,13 +2069,16 @@ def _transcript_matches(files, targets, current, skip_id, deadline,
                     matches[i].append(m)
                     pending.setdefault(tid, (texts, []))[1].append(m)
         # The call under review is in the transcript before it has a result.
-        for texts, ms in pending.values():
-            if current in texts and not skip_id:
+        for tid, (texts, ms) in pending.items():
+            if not skip_id and is_current(tid, texts):
                 drop = {id(m) for m in ms}
                 for i in matches:
                     matches[i] = [m for m in matches[i] if id(m) not in drop]
+                now = max(filter(None, (now, ms[0]["ts"])), default=None)
     if files and failed == len(files):
         raise OSError("no transcript could be read")
+    if now:
+        matches = {i: [m for m in ms if not (m["ts"] and m["ts"] >= now)] for i, ms in matches.items()}
     return matches, cut
 
 
@@ -2173,14 +2187,18 @@ _PROVENANCE_HEAD = (
 # that name a path the command names, and reads them itself.
 
 # Whether remote text may delete or reset something: only whether to look.
+# Its spans are bounded, so a long command can't make it backtrack for long.
 _REMOTE_RESET_HINT_RE = re.compile(
-    r"(?i)(?<![\w.-])rm\s+(?:[^\s;|&]+\s+)*?-(?:[a-z]*r|-recursive)"
-    r"|(?<![\w.-])(?:remove-item|ri|rd|rmdir|del|erase)(?:\s[^;|&\n]*?)?\s(?:-r|/s\b)"
-    r"|(?<![\w.-])git\s[^;|&\n]*?(?:\bworktree\s+remove\b|\breset\s[^;|&\n]*?--hard\b"
-    r"|\bclean(?:\s[^;|&\n]*?)?\s-[a-z]*f|\bcheckout(?:\s[^;|&\n]*?)?\s--(?![\w-])|\brestore\b)")
+    r"(?i)(?<![\w.-])rm\s+(?:[^\s;|&]{1,200}\s+){0,20}?-(?:[a-z]*r|-recursive)"
+    r"|(?<![\w.-])(?:remove-item|ri|rd|rmdir|del|erase)(?:\s[^;|&\n]{0,200}?)?\s(?:-r|/s\b)"
+    r"|(?<![\w.-])git\s[^;|&\n]{0,200}?(?:\bworktree\s+remove\b|\breset\s[^;|&\n]{0,100}?--hard\b"
+    r"|\bclean(?:\s[^;|&\n]{0,100}?)?\s-[a-z]*f|\bcheckout(?:\s[^;|&\n]{0,100}?)?\s--(?![\w-])"
+    r"|\brestore\b)")
 # An absolute-looking path: `C:\…`, `C:/…`, `~/…`, `/…`, not the tail of a
 # word, a URL or `$NAME/…`; a path built at run time (`$`, a glob) stops it.
 _REMOTE_PATH_RE = re.compile(r"(?<![\w.$}~:/\\-])(?:[A-Za-z]:[\\/]|~[\\/]|/)[^\s'\"`;|&<>(){},$*?]*")
+_REMOTE_ABS_RE = re.compile(r"[A-Za-z]:[\\/]|~[\\/]|/")
+REMOTE_SCAN_CHARS = 16 * 1024  # of a command's text: what is read for paths and the hint
 _SSH_VALUE_OPTS = frozenset("BbcDEeFIiJLlmOoPpQRSWw")
 _MCP_PATH_KEY_RE = re.compile(r"(?i)path|dir|file|dest|target|src|source")
 _REMOTE_STATUS = {"ok": "the tool call returned ok", "error": "the tool call returned an error",
@@ -2189,16 +2207,16 @@ REMOTE_PROVENANCE_SHOW_FIRST = 2
 REMOTE_PROVENANCE_SHOW_LAST = 3
 _REMOTE_PROVENANCE_HEAD = (
     "This session's earlier calls to {where} that name the paths this call's command names "
-    "(it deletes or resets something there). The hook cannot see that machine's files: these "
+    "(it may delete or reset something there). The hook cannot see that machine's files: these "
     "are only earlier calls from the main and subagent transcripts, each with what the tool "
     "call returned. Nothing here shows that a command ran or succeeded, or that nothing else "
     "was put there since. It is evidence, not authorization.")
 
 
 def _remote_norm(path):
-    """`path` as compared, or None for a root or a path with `..`: a Windows
-    one lowercase with `/`, no empty, `.` or trailing segments."""
-    if re.match(r"[A-Za-z]:", path) or "\\" in path:
+    """`path` as compared, or None for a root or a path with `..`: a drive
+    path lowercase with `/`, no empty, `.` or trailing segments."""
+    if re.match(r"[A-Za-z]:[\\/]", path):
         path = path.replace("\\", "/").lower()
     parts = [s for s in path.split("/") if s not in ("", ".")]
     norm = ("/" if path.startswith("/") else "") + "/".join(parts)
@@ -2208,11 +2226,13 @@ def _remote_norm(path):
 
 
 def _remote_paths(text):
-    """[(as written, normalized)] for the absolute-looking paths in `text`."""
+    """[(as written, normalized)] for the absolute-looking paths in `text`;
+    one cut short inside quotes (a space in it) is left out."""
     found = []
     for m in _REMOTE_PATH_RE.finditer(text):
-        after = text[m.end():m.end() + 1]
-        norm = None if after and after in "$*?{`" else _remote_norm(m[0])
+        before, after = text[m.start() - 1:m.start()] if m.start() else "", text[m.end():m.end() + 1]
+        cut = after and after in "$*?{`" or before in ("'", '"') and after != before
+        norm = None if cut else _remote_norm(m[0])
         if norm:
             found.append((m[0], norm))
     return found
@@ -2220,8 +2240,10 @@ def _remote_paths(text):
 
 def _ssh_calls(command):
     """[(key, remote text)] for each `ssh … HOST CMD` in a Bash command: the
-    key is ssh's words up to the host as written (a one-letter option's value
-    skipped), the text is the words after it, up to the end of that command."""
+    key is ssh's words up to the host as written (an option cluster ending
+    in a letter that takes a value takes the next word too), the text is the
+    words after it, up to the end of that command. No key when the host
+    can't be told."""
     calls = []
     for m in re.finditer(r"(?:^|[;&|(\s])(ssh\s)", command):
         try:
@@ -2232,73 +2254,109 @@ def _ssh_calls(command):
             continue
         i = 1
         while i < len(words) and words[i].startswith("-"):
-            i += 2 if len(words[i]) == 2 and words[i][1] in _SSH_VALUE_OPTS else 1
+            letter = next((j for j, c in enumerate(words[i][1:], 1) if c in _SSH_VALUE_OPTS), None)
+            i += 2 if letter == len(words[i]) - 1 else 1
         rest = list(itertools.takewhile(lambda w: not re.fullmatch(r"[;&|()]+", w), words[i + 1:]))
-        if i < len(words) and rest and not re.fullmatch(r"[;&|()]+", words[i]):
+        if i < len(words) and rest and not re.fullmatch(r"[;&|()]+|-.*", words[i]):
             calls.append((" ".join(words[:i + 1]), " ".join(rest)))
     return calls
 
 
-def _mcp_text(tool_input):
-    """The parts of an MCP call's input that can name a path: its command,
-    cwd and path-like fields."""
+def _mcp_fields(tool_input):
+    """[(name, value)] of an MCP input's cwd and path-like string fields."""
     if not isinstance(tool_input, dict):
-        return ""
-    return "\n".join(v if k == "command" else f"{k}: {v}" for k, v in tool_input.items()
-                     if isinstance(v, str) and isinstance(k, str)
-                     and (k in ("command", "cwd") or _MCP_PATH_KEY_RE.search(k)))
+        return []
+    return [(k, v) for k, v in tool_input.items() if isinstance(k, str) and isinstance(v, str) and v
+            and k != "command" and (k == "cwd" or _MCP_PATH_KEY_RE.search(k))]
+
+
+def _mcp_named(tool_input, fields=None):
+    """The paths an MCP input names: those in its command's text, and each
+    absolute path field whole (`fields`, default all of _mcp_fields)."""
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    named = {n for _, n in _remote_paths(command[:REMOTE_SCAN_CHARS])} if isinstance(command, str) else set()
+    for _, v in _mcp_fields(tool_input) if fields is None else fields:
+        norm = _REMOTE_ABS_RE.match(v) and _remote_norm(v)
+        if norm:
+            named.add(norm)
+    return named
 
 
 def _remote_calls(tool, tool_input):
-    """[(key, text of this call as _remote_inputs reads it, [(path, norm)])]
-    for a call that runs a command on another machine that may delete or
-    reset something: an MCP tool with a string `command` (key: its
-    `mcp__<server>__`), or Bash with `ssh` (key: see _ssh_calls). Up to
-    PROVENANCE_MAX_TARGETS paths, the most specific first."""
+    """[(key, [(path, norm)])] for a call that runs a command on another
+    machine that may delete or reset something: an MCP tool with a string
+    `command` (key: its `mcp__<server>__`; its cwd counts whole), or Bash
+    with `ssh` (key: see _ssh_calls). Up to PROVENANCE_MAX_TARGETS paths,
+    the most specific first."""
     command = tool_input.get("command")
     if not isinstance(command, str):
         return []
+    command = command[:REMOTE_SCAN_CHARS]
     if tool.startswith("mcp__") and tool.count("__") >= 2:
         if not _REMOTE_RESET_HINT_RE.search(command):
             return []
-        cwd = tool_input.get("cwd") if isinstance(tool_input.get("cwd"), str) else ""
-        calls = [(tool.rsplit("__", 1)[0] + "__", _mcp_text(tool_input), command + "\n" + cwd)]
+        cwd = tool_input.get("cwd")
+        written = _remote_paths(command)
+        if isinstance(cwd, str) and _REMOTE_ABS_RE.match(cwd) and _remote_norm(cwd):
+            written.append((cwd, _remote_norm(cwd)))
+        calls = [(tool.rsplit("__", 1)[0] + "__", written)]
     elif tool == "Bash" and "ssh" in command:
         calls, seen = [], set()
         for key, text in _ssh_calls(command):
             if key not in seen and _REMOTE_RESET_HINT_RE.search(text):
                 seen.add(key)
-                calls.append((key, text, text))
+                calls.append((key, _remote_paths(text)))
     else:
         return []
     out = []
-    for key, current, text in calls[:2]:
-        paths = dict((norm, raw) for raw, norm in reversed(_remote_paths(text)))
+    for key, written in calls[:2]:
+        paths = dict((norm, raw) for raw, norm in reversed(written))
         ranked = sorted(paths, key=lambda n: (-n.count("/"), -len(n)))[:PROVENANCE_MAX_TARGETS]
         if ranked:
-            out.append((key, current, [(paths[n], n) for n in ranked]))
+            out.append((key, [(paths[n], n) for n in ranked]))
     return out
 
 
-def _remote_inputs(key):
-    """For _transcript_matches: (tool_use id, [texts]) of each earlier call
-    in a record to the same MCP server (any of its tools) or ssh words."""
+def _remote_reader(key, tool, tool_input):
+    """_transcript_matches' readers for the earlier calls to the same MCP
+    server (any of its tools, shown with the tool's own name) or with the
+    same ssh words: their texts, the paths they name, and whether a pending
+    one is this call (the same input)."""
+    named, calls = {}, {}
+
     def inputs(record):
         if key.startswith("ssh"):
             for tid, texts in _bash_inputs(record):
-                remote = list(dict.fromkeys(t for c in texts for k, t in _ssh_calls(c) if k == key))
+                remote = list(dict.fromkeys(t for c in texts for k, t in _ssh_calls(c[:REMOTE_SCAN_CHARS])
+                                            if k == key))
                 if remote:
+                    calls[tid] = texts
                     yield tid, remote
             return
         message = record.get("message") if record.get("type") == "assistant" else None
         content = message.get("content") if isinstance(message, dict) else None
         for block in content if isinstance(content, list) else []:
             name = block.get("name") if isinstance(block, dict) and block.get("type") == "tool_use" else None
-            if isinstance(name, str) and name.startswith(key) and "__" not in name[len(key):]:
-                text = _mcp_text(block.get("input"))
-                if text:
-                    yield block.get("id"), [text]
-    return inputs
+            if not (isinstance(name, str) and name.startswith(key) and "__" not in name[len(key):]):
+                continue
+            inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+            fields = _mcp_fields(inp)
+            command = inp.get("command") if isinstance(inp.get("command"), str) else ""
+            text = f"{name[len(key):]}: {command}" + (
+                f"  ({'; '.join(f'{k}: {v}' for k, v in fields)})" if fields else "")
+            named[text] = _mcp_named(inp, fields)
+            calls[block.get("id")] = (name, inp)
+            yield block.get("id"), [text]
+
+    def named_paths(text, _needles):
+        return named[text] if text in named else {n for _, n in _remote_paths(text)}
+
+    def current(tid, _texts):
+        if key.startswith("ssh"):
+            return tool_input.get("command") in calls.get(tid, ())
+        return calls.get(tid) == (tool, tool_input)
+
+    return {"inputs": inputs, "named_paths": named_paths, "current": current}
 
 
 def remote_provenance(input_data, tool, tool_input, deadline, budget=None):
@@ -2308,9 +2366,13 @@ def remote_provenance(input_data, tool, tool_input, deadline, budget=None):
     there that name it or a path inside it, with what each tool call
     returned. ([], None) when it is no such call; never raises."""
     try:
+        if time.monotonic() > deadline:
+            return [], None
         calls = _remote_calls(tool, tool_input) if isinstance(tool, str) else []
         if not calls:
             return [], None
+        if time.monotonic() > deadline:
+            return [], "unavailable"
         files = _session_transcripts(input_data)
         if not files:
             return [], "unavailable"
@@ -2318,14 +2380,15 @@ def remote_provenance(input_data, tool, tool_input, deadline, budget=None):
         budget = budget or [PROVENANCE_TOTAL_BYTES]
         out, found = [], False
         show = REMOTE_PROVENANCE_SHOW_FIRST + REMOTE_PROVENANCE_SHOW_LAST
-        for key, current, paths in calls:
+        for key, paths in calls:
             targets = [{"path": raw, "keys": {norm}, "parents": set(),
                         "needles": {norm.rsplit("/", 1)[-1].lower()}} for raw, norm in paths]
+            reader = _remote_reader(key, tool, tool_input)
             matches, cut = _transcript_matches(
-                files, targets, current, skip_id, deadline, inputs=_remote_inputs(key),
-                named_paths=lambda text, _: {n for _, n in _remote_paths(text)},
-                mark='"Bash"' if key.startswith("ssh") else f'"{key}', budget=budget)
-            where = (f"the same machine over ssh (Bash calls running `{key}`, as written)"
+                files, targets, reader["current"], skip_id, deadline, inputs=reader["inputs"],
+                named_paths=reader["named_paths"], mark='"Bash"' if key.startswith("ssh") else f'"{key}',
+                budget=budget)
+            where = (f"the machine `{key}` reaches (earlier Bash calls whose text has `{key}`, as written)"
                      if key.startswith("ssh") else f"the MCP server {key[5:-2]} (any of its {key}* tools)")
             out.append(_REMOTE_PROVENANCE_HEAD.format(where=where))
             for i, target in enumerate(targets):
@@ -4489,8 +4552,9 @@ harms, destroying cloud, production or remote resources or data, and sending \
 secrets off the machine are the developer's call whatever the answer says: \
 flag those again. A scratch checkout or worktree this session made from a \
 pushed branch or commit, on a development, build or test machine it drives, \
-that holds nothing found nowhere else is not such a remote resource; a shared \
-one, or one holding deliverables, is."""
+is not such a remote resource when the earlier calls and its git state \
+(uncommitted changes, commits no remote holds, ignored files) show it holds \
+nothing found nowhere else; a shared one, or one holding deliverables, is."""
 
 
 def hold_key(input_data, tool, tool_input):

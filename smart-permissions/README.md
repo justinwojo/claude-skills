@@ -123,14 +123,14 @@ upload needs explicit authorization.
   and last three of this session's earlier calls to the same MCP server (any of
   its tools: their `command`, `cwd` and path fields) or with the same ssh words
   as written (`ssh -p 2222 dev@runner`) that name the path or one inside it,
-  each with what the tool call returned and its redacted text. Windows paths
-  compare without case or slash direction. The hook doesn't parse the remote
+  each with what the tool call returned and its redacted text (an MCP call
+  with its tool's name). A `cwd` or path field counts whole; drive paths
+  (`C:\…`) compare without case or slash direction. The hook doesn't parse the remote
   shell and never says a command ran or created anything: the judge reads the
   calls. A scratch checkout or worktree made from a pushed branch or commit
-  that holds nothing unique is a flag the agent can settle, so through an MCP
-  tool it is held for the agent rather than put to you (an ssh call keeps the
-  strict remote-execution policy: never held, allowed only when the judge is
-  confident); a shared checkout or one holding deliverables stays yours.
+  that holds nothing unique is a flag the agent can settle from those calls
+  and the checkout's git state, so it is held for the agent rather than put to
+  you; a shared checkout or one holding deliverables stays yours.
   Provenance never allows anything by rule. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
   a hint about what to check.
@@ -692,7 +692,7 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 - **1.8.1 (2026-11-23) — provenance for cleanups on another machine.**
   - An MCP tool's `command`, or an `ssh` call, that looks like it deletes or resets something on another machine gets this session's earlier calls to the same MCP server (any of its tools) or with the same ssh words that name an absolute path the command names, or one inside it: the first two and last three, each with what the tool call returned and its redacted text. The hook doesn't parse the remote shell and never says a command ran or created anything; the judge reads the calls. Logged as `provenance` like a local target. See [How the LLM judges a call](#how-the-llm-judges-a-call).
-  - The judge is told that nothing in those calls proves a command ran, that uncommitted work there that exists nowhere else is still a reason to flag, and that a scratch checkout or worktree made from a pushed branch or commit that holds nothing unique is the agent's to settle: through an MCP tool such a flag is held for the agent (ssh stays under the strict remote-execution policy). A shared checkout or one holding deliverables stays yours.
+  - The judge is told that nothing in those calls proves a command ran, that uncommitted work there that exists nowhere else is still a reason to flag, and that a scratch checkout or worktree made from a pushed branch or commit that holds nothing unique is the agent's to settle from those calls and the checkout's git state (uncommitted changes, unpushed commits, ignored files): such a flag is held for the agent. A shared checkout or one holding deliverables stays yours.
   - Decision log: an MCP tool's input is logged (its `command` and `cwd`, or else its whole input as compact JSON), not only its name. With `decision_log_full_input`, each JSON value is redacted, and a field named like a credential is masked whole.
   - Provenance snippets, local ones too, are redacted like the log, and a session whose transcripts can't be read at all gives `unavailable`.
 
