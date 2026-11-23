@@ -8067,6 +8067,33 @@ def test_remote_provenance_1_8_1():
           [n for _, n in p._remote_paths('git --work-tree="/srv/a b" clean -fdx; ls --dir=/srv/c '
                                          '"/srv/d" \'/srv/e\'; x"/srv/f" "/srv/g\' /srv/h')],
           ['/srv/d', '/srv/e', '/srv/h'])
+    # C21: whole words of plain characters only; a quoted span with whitespace names nothing
+    check('C21: a comma, a glob, or a path inside a spaced quote names nothing',
+          [n for _, n in p._remote_paths(f"{rmrf} /srv/build,old /srv/[ab] '/srv/my /scratch/build data' "
+                                         "/srv/ok; 'C:\\Lab\\w';")], ['/srv/ok', 'c:/lab/w'])
+    hist21 = os.path.join(proj, 'sess-c21.jsonl')
+    _transcript(hist21, [_tool_use('w1', 'mcp__bench__run', {'command': 'ls /srv/build,old'}, 20),
+                         _bash_result('w1', 20),
+                         _tool_use('w2', 'mcp__bench__run', {'command': "ls '/srv/my /scratch/build data'"}, 15),
+                         _bash_result('w2', 15)])
+    text, status = remote(dict(payload, transcript_path=hist21,
+                               tool_input={'command': f'{rmrf} /srv/build /scratch/build'}))
+    check('C21: such words in earlier calls are no evidence', status, 'none')
+    # C22: a long word costs little
+    longw = {'command': f'{rmrf} /srv/' + 'a' * 40000}
+    t0 = time.monotonic()
+    p._remote_paths(longw['command'])
+    p._remote_targets('mcp__bench__run', longw)
+    check('C22: a 40 KB word is read in under 0.1 s', time.monotonic() - t0 < 0.1, True)
+    # C20: an earlier call is shown field by field redacted, as the log
+    c20 = os.path.join(proj, 'sess-c20.jsonl')
+    _transcript(c20, [_tool_use('f1', 'mcp__bench__copy_file', {'source': '/srv/w/a.txt', 'dest': '/srv/v',
+                                                                 'source_cookie': 'sess=hunter2cookie'}, 20),
+                      _bash_result('f1', 20)])
+    text, status = remote(dict(payload, transcript_path=c20, tool_input={'command': f'{rmrf} /srv/w'}))
+    check('C20: a credential field of an earlier call is masked in the judge block',
+          (status, 'copy_file:' in text, 'hunter2cookie' in text, 'source_cookie: [REDACTED]' in text),
+          ('found', True, False, True))
     # C13: the structured credential names are the Bash redactor's
     check('C13: credentials, client_key, pwd masked whole',
           json.loads(p._decision_log_input('mcp__bench__x', {'credentials': {'u': 'a'}, 'client_key': 'k',

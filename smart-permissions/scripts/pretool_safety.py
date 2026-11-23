@@ -2004,7 +2004,7 @@ def _tail_lines(path, limit):
 
 
 def _transcript_matches(files, targets, current, skip_id, deadline,
-                        inputs=_bash_inputs, named_paths=_named_paths, mark=None, budget=None):
+                        inputs=_bash_inputs, named_paths=_named_paths, mark=None):
     """({target index: [match]}, whether some transcript wasn't read whole).
     A match is a dict: ts, snippet, relation, status ("ok", "error", "no
     result" while it has none, "result unknown" when a line with its id
@@ -2015,28 +2015,27 @@ def _transcript_matches(files, targets, current, skip_id, deadline,
     after (another agent's, in its transcript) isn't either. For another
     machine (remote_provenance), `inputs` and `named_paths` read its calls,
     a line must hold `mark`, and needles (lowercase) match without case.
-    `budget`: [bytes left to read], shared between callers. Raises OSError
-    when no transcript could be read."""
+    Raises OSError when no transcript could be read."""
     fold = (lambda text: text.lower()) if mark else (lambda text: text)
     is_current = current if callable(current) else (lambda tid, texts: current in texts)
     now = None  # when the call being judged was made, once its record is seen
     matches = {i: [] for i in range(len(targets))}
     needles = set().union(*(t["needles"] for t in targets))
-    budget, cut, failed = budget or [PROVENANCE_TOTAL_BYTES], False, 0
+    budget, cut, failed = PROVENANCE_TOTAL_BYTES, False, 0
 
     def earlier(cut):
         return {i: [m for m in ms if not (now and m["ts"] and m["ts"] >= now)]
                 for i, ms in matches.items()}, cut
 
     for path in files:
-        if budget[0] <= 0 or time.monotonic() > deadline:
+        if budget <= 0 or time.monotonic() > deadline:
             return earlier(True)
         try:
-            lines, size, partial = _tail_lines(path, min(PROVENANCE_TAIL_BYTES, budget[0]))
+            lines, size, partial = _tail_lines(path, min(PROVENANCE_TAIL_BYTES, budget))
         except OSError:
             failed += 1
             continue
-        budget[0] -= size
+        budget -= size
         cut = cut or partial
         pending = {}  # tool_use id → (its command texts, its matches), until its result
         for n, line in enumerate(lines):
@@ -2102,7 +2101,7 @@ def _result_status(line, tid):
     return None
 
 
-def session_provenance(input_data, targets, cwd, deadline, budget=None):
+def session_provenance(input_data, targets, cwd, deadline):
     """(blocks for the LLM, LLM_CONTEXT_PROVENANCE value) for the targets of
     a delete or reset: when this session's transcript starts, when each
     target folder was created, and the earliest and latest of this session's
@@ -2131,7 +2130,7 @@ def session_provenance(input_data, targets, cwd, deadline, budget=None):
         skip_id = input_data.get("tool_use_id") if isinstance(input_data.get("tool_use_id"), str) else None
         current = (input_data.get("tool_input") or {}).get("command") \
             if isinstance(input_data.get("tool_input"), dict) else None
-        matches, cut = _transcript_matches(files, chosen, current, skip_id, deadline, budget=budget)
+        matches, cut = _transcript_matches(files, chosen, current, skip_id, deadline)
         found = False
         out = [_PROVENANCE_HEAD]
         if start:
@@ -2200,11 +2199,10 @@ _REMOTE_RESET_HINT_RE = re.compile(
     r"|(?<![\w.-])git\s[^;|&\n]{0,200}?(?:\bworktree\s+remove\b|\breset\s[^;|&\n]{0,100}?--hard\b"
     r"|\bclean(?:\s[^;|&\n]{0,100}?)?\s-[a-z]*f|\bcheckout(?:\s[^;|&\n]{0,100}?)?\s--(?![\w-])"
     r"|\brestore\b)")
-# A word of command text (split at whitespace and ; | & ( ) { } < > ,), and
-# an absolute-looking path: `C:\…`, `C:/…`, `~/…`, `/…`, `//…`, nothing in it
-# built at run time.
-_REMOTE_WORD_RE = re.compile(r"[^\s;|&(){}<>,]+")
-_REMOTE_ABS_RE = re.compile(r"(?:[A-Za-z]:[\\/]|~[\\/]|/)[^$*?`'\"]*\Z")
+# A path, whole: `/…`, `//…`, `~/…`, `C:\…`, `C:/…`, plain characters only
+# (no glob, `$`, `=`, comma or bracket); a structured field's may hold spaces.
+_REMOTE_PATH_RE = re.compile(r"(?:/|~/)[\w.~+@/-]+|[A-Za-z]:[\\/][\w.~+@\\/-]*", re.A)
+_REMOTE_FIELD_RE = re.compile(r"(?:/|~/)[\w.~+@/ -]+|[A-Za-z]:[\\/][\w.~+@\\/ -]*", re.A)
 REMOTE_SCAN_CHARS = 16 * 1024  # of a command's text: what is read for paths and the hint
 _MCP_PATH_KEY_RE = re.compile(r"(?i)path|dir|file|dest|target|src|source")
 _REMOTE_STATUS = {"ok": "the tool call returned ok", "error": "the tool call returned an error",
@@ -2233,17 +2231,28 @@ def _remote_norm(path):
 
 
 def _remote_paths(text):
-    """[(as written, normalized)] for the words of `text` (its first
-    REMOTE_SCAN_CHARS, less the word the cut runs through) that are an
-    absolute path whole, bare or in one closed pair of quotes. A word with
-    any other quote in it (`--dir="a b"`, a path cut at a space) names none."""
+    """[(as written, normalized)] for the whitespace-separated words of
+    `text` that are a path whole (_REMOTE_PATH_RE), bare or in one pair of
+    quotes, a `;` after it allowed. A quoted span holding whitespace names
+    nothing, nor does the last word of a text cut at REMOTE_SCAN_CHARS."""
     if len(text) > REMOTE_SCAN_CHARS:
-        text = re.sub(r"[^\s;|&(){}<>,]*\Z", "", text[:REMOTE_SCAN_CHARS])
+        text = text[:REMOTE_SCAN_CHARS].rsplit(None, 1)[0] if text[:REMOTE_SCAN_CHARS].split() else ""
+    kept, i = [], 0
+    while True:  # quotes paired left to right, as a shell reads them
+        at = min((j for j in (text.find("'", i), text.find('"', i)) if j >= 0), default=-1)
+        end = text.find(text[at], at + 1) if at >= 0 else -1
+        if end < 0:
+            kept.append(text[i:])
+            break
+        span = text[at:end + 1]
+        kept += [text[i:at], " " if any(c.isspace() for c in span) else span]
+        i = end + 1
     found = []
-    for word in _REMOTE_WORD_RE.findall(text):
-        if word[0] in "'\"" and len(word) > 2 and word[-1] == word[0]:
+    for word in "".join(kept).split():
+        word = word[:-1] if word.endswith(";") else word
+        if len(word) > 2 and word[0] in "'\"" and word[-1] == word[0]:
             word = word[1:-1]
-        norm = _REMOTE_ABS_RE.match(word) and _remote_norm(word)
+        norm = _REMOTE_PATH_RE.fullmatch(word) and _remote_norm(word)
         if norm:
             found.append((word, norm))
     return found
@@ -2262,7 +2271,7 @@ def _mcp_named(tool_input, fields):
     its command's text, and each absolute path field (`fields`) whole."""
     command = tool_input.get("command")
     named = _remote_paths(command) if isinstance(command, str) else []
-    return named + [(v, _remote_norm(v)) for _, v in fields if _REMOTE_ABS_RE.match(v) and _remote_norm(v)]
+    return named + [(v, _remote_norm(v)) for _, v in fields if _REMOTE_FIELD_RE.fullmatch(v) and _remote_norm(v)]
 
 
 def _remote_targets(tool, tool_input):
@@ -2295,10 +2304,11 @@ def _remote_reader(key, tool, tool_input):
             if not (isinstance(name, str) and name.startswith(key) and "__" not in name[len(key):]):
                 continue
             inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-            fields = _mcp_fields(inp)
-            command = inp.get("command") if isinstance(inp.get("command"), str) else ""
-            text = command + (f"  ({'; '.join(f'{k}: {v}' for k, v in fields)})" if fields else "")
-            named[text] = {n for _, n in _mcp_named(inp, fields)}
+            shown = _redact_values(inp)  # shown to the judge: field by field, as the log
+            command = shown.get("command") if isinstance(shown.get("command"), str) else ""
+            text = command + "".join(f"  ({'; '.join(f'{k}: {v}' for k, v in fields)})"
+                                     for fields in [_mcp_fields(shown)] if fields)
+            named[text] = {n for _, n in _mcp_named(inp, _mcp_fields(inp))}
             calls[block.get("id")] = (name, inp)
             yield block.get("id"), [text]
 
@@ -2306,7 +2316,7 @@ def _remote_reader(key, tool, tool_input):
             "current": lambda tid, _texts: calls.get(tid) == (tool, tool_input), "calls": calls}
 
 
-def remote_provenance(input_data, tool, tool_input, deadline, budget=None):
+def remote_provenance(input_data, tool, tool_input, deadline):
     """(blocks for the LLM, LLM_CONTEXT_PROVENANCE value) for an MCP call
     that may delete or reset something on another machine (_remote_targets):
     per path its command names, the first and last of this session's earlier
@@ -2328,7 +2338,7 @@ def remote_provenance(input_data, tool, tool_input, deadline, budget=None):
         reader = _remote_reader(key, tool, tool_input)
         matches, cut = _transcript_matches(
             files, targets, reader["current"], skip_id, deadline, inputs=reader["inputs"],
-            named_paths=reader["named_paths"], mark=f'"{key}', budget=budget)
+            named_paths=reader["named_paths"], mark=f'"{key}')
         out, found = [_REMOTE_PROVENANCE_HEAD.format(server=key[5:-2], key=key)], False
         show = REMOTE_PROVENANCE_SHOW_FIRST + REMOTE_PROVENANCE_SHOW_LAST
         for i, target in enumerate(targets):
@@ -3221,18 +3231,14 @@ def build_llm_context(input_data):
         if isinstance(tool_input.get(k), str)]
     temp = _quietly(temp_privacy_context, temp_paths) if temp_paths else ""
     parts.extend([temp] if temp else [])
-    # Provenance first, in its own slice and byte budget, shared by a delete
-    # here and one on another machine: slow git probes must not starve it.
-    provenance_deadline = min(context_deadline, time.monotonic() + PROVENANCE_BUDGET_S)
-    provenance_budget = [PROVENANCE_TOTAL_BYTES]
-    remote, remote_status = remote_provenance(input_data, tool, tool_input, provenance_deadline,
-                                              provenance_budget)
     if targets or absolute and isinstance(command, str) \
             and (_GIT_DISCARD_HINT_RE.search(command) or _GIT_REMOTE_HINT_RE.search(command)):
+        now = time.monotonic()
         deadline = context_deadline
+        # Provenance first, in its own slice: slow git probes must not starve it.
         if targets:
             provenance, LLM_CONTEXT_PROVENANCE = session_provenance(
-                input_data, targets, cwd, provenance_deadline, provenance_budget)
+                input_data, targets, cwd, min(deadline, now + PROVENANCE_BUDGET_S))
         covered = set()
         if absolute and _GIT_DISCARD_HINT_RE.search(command):
             parts.extend(git_discard_context(command, cwd, deadline))
@@ -3243,11 +3249,10 @@ def build_llm_context(input_data):
             parts.extend(_quietly(stash_context, command, cwd, input_data, deadline) or [])
         if targets:
             parts.extend(loss_context(targets, covered, deadline))
+    if isinstance(tool, str) and tool.startswith("mcp__"):  # a cleanup on another machine
+        provenance, LLM_CONTEXT_PROVENANCE = remote_provenance(
+            input_data, tool, tool_input, min(context_deadline, time.monotonic() + PROVENANCE_BUDGET_S))
     parts.extend(provenance)
-    parts.extend(remote)
-    if remote_status:
-        LLM_CONTEXT_PROVENANCE = min(filter(None, (LLM_CONTEXT_PROVENANCE, remote_status)),
-                                     key=("found", "none", "unavailable").index)
     agent = input_data.get("agent_transcript_path")
     if isinstance(agent, str) and agent != input_data.get("transcript_path"):
         brief = subagent_brief(agent)

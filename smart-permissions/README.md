@@ -119,7 +119,7 @@ upload needs explicit authorization.
   looks like a delete or reset (`rm -r`, `Remove-Item -Recurse`, `rd /s`,
   `git worktree remove`, `git reset --hard`, `git clean -f`, `git checkout --`,
   `git restore`) can't be looked at from here. For the absolute paths its
-  command names (whole words, bare or in one pair of quotes) and its `cwd`,
+  command names (whole words of plain path characters, bare or in one pair of quotes) and its `cwd`,
   four at most, the judge gets the first two and last three of this session's
   earlier calls to the same MCP server (any of its tools: their `command`,
   `cwd` and path fields) that name the path or one inside it, each with the
