@@ -193,8 +193,13 @@ what it matches now, up to four entries, else by its folder): the git checkouts
 the delete would take with it and what they hold that exists nowhere else, and
 this session's own earlier Bash commands that name the target, with the
 folder's creation time against the session's start (see the README's "How the
-LLM judges a call"). That evidence only informs the judge: no target is
-allowed by rule because this session made it.
+LLM judges a call"). A cleanup run on another machine (an MCP tool's
+`command`, or `ssh … HOST '…'`) gets only this session's earlier calls to the
+same MCP server or with the same ssh words that name an absolute path its
+command names, each with what the tool call returned. The remote shell is not
+parsed, nothing there is read, and the block never says a command ran or
+created anything. That evidence only informs the judge: no target is allowed
+by rule because this session made it.
 
 ## Known limits
 

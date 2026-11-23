@@ -7888,6 +7888,199 @@ def test_script_hazard_1_8_0():
           _run_cfg(LEARNER, call('sh ./peek.sh'), cp, llm=sure), 'allow')
 
 
+def _tool_use(tid, name, inp, minutes):
+    """An assistant record holding one tool_use of any tool."""
+    rec = _bash_use(tid, '', minutes)
+    rec['message']['content'][0].update(name=name, input=inp)
+    return rec
+
+
+def test_remote_provenance_1_8_1():
+    print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    import pretool_safety as p
+    rmrf = d('cm0gLXJm')
+    base = os.path.realpath(tempfile.mkdtemp(prefix='sp-remote-'))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+
+    # ---- 1. an MCP tool's input is logged, not just its name ----
+    check('log: MCP command and cwd', p._decision_log_input(
+        'mcp__bench__run', {'command': 'dir', 'cwd': 'C:\\Lab', 'timeout_s': 30}, None), 'dir  (cwd: C:\\Lab)')
+    check('log: MCP input without a command → compact JSON',
+          p._decision_log_input('mcp__bench__read_file', {'path': 'C:\\Lab\\a.txt', 'n': 1}, None),
+          '{"path":"C:\\\\Lab\\\\a.txt","n":1}')
+    check('log: MCP tool with no input → its name', p._decision_log_input('mcp__bench__health', {}, None),
+          'mcp__bench__health')
+    check('log: MCP input cut like a command', len(p._decision_log_input(
+        'mcp__bench__run', {'command': 'x' * 900})), 500)
+    check('log: a credential-named field is masked whatever its value',
+          p._redact_values({'Authorization': ['Basic Zm9vOmJhcg=='], 'token': {'v': 1}, 'n': 'ok'}),
+          {'Authorization': '[REDACTED]', 'token': '[REDACTED]', 'n': 'ok'})
+    for script, hook in ((PRETOOL, 'pretool'), (LEARNER, 'permission_request')):
+        cfg, cp = _fresh_cfg()
+        _run_cfg(script, {'tool_name': 'mcp__bench__run', 'tool_input': {'command': 'echo ' + 'y' * 9000}}, cp)
+        rec = [r for r in _decision_records(cfg) if r.get('hook') == hook][-1:]
+        check(f'{hook}: an asked MCP call logs its command, capped at 8000',
+              (rec[0].get('input', '')[:7], len(rec[0].get('input', '')), rec[0].get('input_len'),
+               rec[0].get('truncated')) if rec else None, ('echo yy', 8000, 9005, True))
+    cfg, cp = _fresh_cfg({'decision_log_full_input': True})
+    _run_cfg(PRETOOL, {'tool_name': 'mcp__bench__run',
+                       'tool_input': {'command': 'API_TOKEN=s3cr3tvalue ./deploy.ps1', 'cwd': 'C:\\Lab'}}, cp)
+    rec = _decision_records(cfg)[-1:]
+    check('log: full capture redacts an MCP command',
+          (('s3cr3tvalue' in rec[0]['input'], '(cwd: C:\\Lab)' in rec[0]['input'], rec[0].get('redacted'))
+           if rec else None), (False, True, True))
+    cfg, cp = _fresh_cfg({'decision_log_full_input': True})
+    raw = {'url': 'https://example.com/x', 'headers': {'Authorization': 'Basic Zm9vOmJhcg=='}}
+    _run_cfg(PRETOOL, {'tool_name': 'mcp__bench__fetch', 'tool_input': raw}, cp)
+    rec = _decision_records(cfg)[-1:]
+    check('log: full capture masks a JSON credential field, flags it, input_len before redaction',
+          (('Zm9vOmJhcg' in rec[0]['input'], rec[0].get('redacted'), rec[0].get('incomplete'),
+            rec[0].get('input_len')) if rec else None),
+          (False, True, True, len(json.dumps(raw, separators=(',', ':')))))
+
+    # ---- 2. which calls run a command elsewhere, and what they name ----
+    wt = 'C:\\Lab\\proj-wt\\s4'
+    ps = (f"& {{ $main = 'C:\\Lab\\proj'; $wt = '{wt}'; git -C $main worktree remove --force $wt; "
+          "if (Test-Path $wt) { Remove-Item -Recurse -Force $wt } }")
+    calls = p._remote_calls('mcp__bench__run', {'command': ps, 'timeout_s': 300})
+    check('remote: an MCP cleanup is keyed by its server, paths most specific first',
+          [(k, [n for _, n in ps_]) for k, _, ps_ in calls],
+          [('mcp__bench__', ['c:/lab/proj-wt/s4', 'c:/lab/proj'])])
+    check('remote: an MCP command that deletes nothing → no lookup',
+          p._remote_calls('mcp__bench__run', {'command': f'dir {wt}'}), [])
+    check('remote: an MCP tool without a command → no lookup',
+          p._remote_calls('mcp__bench__read_file', {'path': wt}), [])
+    ssh = "ssh -p 2222 dev@runner 'cd ~/Dev/repo && git worktree remove --force ~/scratch/lead-1'"
+    check('remote: ssh keyed by its words as written',
+          [(k, [n for _, n in ps_]) for k, _, ps_ in p._remote_calls('Bash', {'command': ssh})],
+          [('ssh -p 2222 dev@runner', ['~/scratch/lead-1', '~/Dev/repo'])])
+    check('remote: interactive ssh, or one that deletes nothing → no lookup',
+          (p._remote_calls('Bash', {'command': 'ssh runner'}),
+           p._remote_calls('Bash', {'command': 'ssh runner ls /srv/x'})), ([], []))
+    check('paths: Windows case and slashes, trailing slash, roots and .. dropped',
+          [n for _, n in p._remote_paths("C:\\Lab\\X\\ C:/lab/x/ / ~ C:\\ /srv/a/../b ~/k/ /srv/$v")],
+          ['c:/lab/x', 'c:/lab/x', '~/k'])
+    check('paths: a URL is not a path', p._remote_paths('git clone https://example.com/a/b /srv/b'),
+          [('/srv/b', '/srv/b')])
+
+    # ---- 3. this session's earlier calls there, main and subagent ----
+    proj = os.path.join(base, 'claude-projects', '-slug')
+    sess = os.path.join(proj, 'sess-1.jsonl')
+    agent = os.path.join(proj, 'sess-1', 'subagents', 'agent-a1.jsonl')
+    os.makedirs(os.path.dirname(agent))
+    add = f"$main = 'C:\\Lab\\proj'; git -C $main fetch origin s4; git -C $main worktree add --detach '{wt}' FETCH_HEAD"
+    _transcript(agent, [  # the subagent made the worktree
+        _tool_use('m1', 'mcp__bench__run', {'command': add, 'timeout_s': 300}, 90), _bash_result('m1', 90),
+        _tool_use('m2', 'mcp__bench__job_start', {'command': 'dotnet test', 'cwd': 'c:/lab/PROJ-WT/S4/'}, 60),
+        _bash_result('m2', 60, error=True),
+    ])
+    _transcript(sess, [
+        {'type': 'user', 'isMeta': True, 'timestamp': _iso_ago(120), 'sessionId': 'sess-1',
+         'message': {'role': 'user', 'content': 'start'}},
+        _tool_use('o1', 'mcp__other__run', {'command': f'mkdir {wt}'}, 70),  # another server
+        _tool_use('o2', 'mcp__bench__x__run', {'command': f'mkdir {wt}'}, 70),  # server bench__x
+        _tool_use('o3', 'mcp__bench__run', {'command': 'mkdir C:\\Lab\\proj-wt\\s40'}, 70),  # s40 ≠ s4
+        _bash_use('b1', "ssh -p 2222 dev@runner 'git -C ~/Dev/repo worktree add ~/scratch/lead-1 origin/lead-1'", 80),
+        _bash_result('b1', 80),
+        _bash_use('b2', "ssh dev@runner 'mkdir ~/scratch/lead-1'", 75),  # other ssh words
+        _bash_result('b2', 75),
+        _bash_use('b3', "ssh -p 2222 dev@runner 'ls ~/scratch/lead-10'", 74),  # lead-10 ≠ lead-1
+        _bash_result('b3', 74),
+        _tool_use('now', 'mcp__bench__run', {'command': ps}, 0),  # the call under review
+    ])
+    payload = {'cwd': base, 'transcript_path': sess, 'tool_use_id': 'now',
+               'tool_name': 'mcp__bench__run', 'tool_input': {'command': ps}}
+
+    def remote(data=payload):
+        blocks, status = p.remote_provenance(data, data['tool_name'], data['tool_input'],
+                                             time.monotonic() + 5)
+        return '\n'.join(blocks), status
+
+    text, status = remote()
+    s4 = text.split(wt + ':', 1)[-1].split('\nC:\\Lab\\proj:', 1)[0]
+    check('mcp: found', status, 'found')
+    check('mcp: header says evidence, not authorization, and nothing ran for sure',
+          'evidence, not authorization' in text and "cannot see that machine's files" in text
+          and 'Nothing here shows that a command ran or succeeded' in text
+          and 'the MCP server bench (any of its mcp__bench__* tools)' in text, True)
+    check('mcp: the subagent\'s worktree add and job cwd (case, slash) name it',
+          '2 earlier calls name it or a path inside it' in s4
+          and 'the tool call returned ok, names it: $main' in s4 and 'worktree add --detach' in s4
+          and 'the tool call returned an error, names it: dotnet test' in s4, True)
+    check('mcp: another server, a server sharing the prefix, and s40 do not match',
+          'mkdir' in s4, False)
+    check('mcp: the call under review is not its own evidence', 'Test-Path' in text, False)
+    check('mcp: no creation claim', 'created it' in text.lower() or 'created' in text.lower(), False)
+    same, _ = remote(dict(payload, tool_use_id=None))
+    check('mcp: without a tool_use_id the pending identical call is skipped', same, text)
+
+    sp = dict(payload, tool_name='Bash', tool_input={'command': ssh}, tool_use_id='x')
+    text, status = remote(sp)
+    check('ssh: found the same words\' worktree add; other words and lead-10 not',
+          (status, '1 earlier call names it' in text, 'worktree add ~/scratch/lead-1' in text,
+           'mkdir' in text, 'lead-10' in text), ('found', True, True, False, False))
+    check('ssh: header names the ssh words', '`ssh -p 2222 dev@runner`' in text, True)
+    text, status = remote(dict(sp, tool_input={'command': f"ssh -p 2222 dev@runner '{rmrf} /srv/never'"}))
+    check('ssh: nothing names it → none', (status, 'no earlier call of this session there names it' in text),
+          ('none', True))
+    text, status = remote(dict(sp, tool_input={'command': f"ssh bench '{rmrf} ~/scratch/lead-1'"}))
+    check('ssh: a different host does not match', status, 'none')
+
+    # A long history: the first 2 and last 3 shown; a secret in one is redacted
+    many = os.path.join(proj, 'sess-many.jsonl')
+    _transcript(many, [_tool_use(f'k{i}', 'mcp__bench__run',
+                                 {'command': f'API_TOKEN=tok{i}secret run C:\\Lab\\w\\t{i}'}, 50 - i)
+                       for i in range(8)])
+    text, _ = remote(dict(payload, transcript_path=many, tool_input={'command': f'{rmrf} C:/Lab/w'}))
+    check('mcp: 8 calls name a path inside it; first 2, last 3', (
+        '8 earlier calls name it or a path inside it; the first and last' in text, '[…3 more…]' in text,
+        'names a path inside it' in text, 'secret' in text), (True, True, True, False))
+
+    # Unreadable transcripts, and none at all → unavailable
+    if hasattr(os, 'geteuid') and os.geteuid() != 0:
+        locked = os.path.join(proj, 'locked.jsonl')
+        shutil.copy(sess, locked)
+        os.chmod(locked, 0)
+        try:
+            check('unreadable transcript → unavailable, no block',
+                  remote(dict(payload, transcript_path=locked)), ('', 'unavailable'))
+        finally:
+            os.chmod(locked, 0o600)
+    check('no transcript → unavailable', remote(dict(payload, transcript_path=None)), ('', 'unavailable'))
+
+    # ---- 4. end to end: the judge sees the block; the log records found ----
+    for script, hook in ((PRETOOL, 'pretool'), (LEARNER, 'permission_request')):
+        cfg, cp = _fresh_cfg()
+        reqs = os.path.join(cfg, 'reqs.jsonl')
+        _run_cfg(script, dict(payload, tool_use_id='later'), cp, llm={'safe': True}, requests_log=reqs)
+        req = _requests(reqs)
+        user = req[0]['messages'][1]['content'] if req else ''
+        rec = [r for r in _decision_records(cfg) if r.get('hook') == hook][-1:]
+        check(f'{hook}: the judge sees the remote block; log input and provenance',
+              ("This session's earlier calls to the MCP server bench" in user,
+               rec[0].get('provenance') if rec else None, (rec[0].get('input') or '')[:5] if rec else None),
+              (True, 'found', '& { $'))
+    system = req[0]['messages'][0]['content'] if req else ''
+    check('prompt: remote wording present',
+          'On another machine (over ssh, or an MCP' in system and 'the resolver is "agent"' in system, True)
+    check('hold note: remote scratch worktree wording', 'is not such a remote resource' in p.LLM_HOLD_RETRY_NOTE,
+          True)
+
+    # ---- 5. local Bash provenance is unchanged by any of this ----
+    local = os.path.join(base, 'scratch')
+    os.makedirs(local)
+    lt = os.path.join(proj, 'sess-local.jsonl')
+    _transcript(lt, [_bash_use('l1', f'mkdir -p {local}/a', 30), _bash_result('l1', 30)])
+    data = {'cwd': base, 'transcript_path': lt, 'tool_name': 'Bash', 'tool_input': {'command': f'{rmrf} {local}'}}
+    check('local: Bash delete has no remote lookup',
+          p.remote_provenance(data, 'Bash', data['tool_input'], time.monotonic() + 5), ([], None))
+    blocks, status = p.session_provenance(data, p.destructive_targets(f'{rmrf} {local}', base), base,
+                                          time.monotonic() + 5)
+    check('local: provenance as before', (status, 'ok, names a path inside it: mkdir' in '\n'.join(blocks)),
+          ('found', True))
+
+
 if __name__ == '__main__':
     # no docker config or endpoint of this machine's (a remote current context) in the results
     for name in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'CONTAINER_HOST', 'CONTAINER_CONNECTION'):
@@ -8025,6 +8218,7 @@ if __name__ == '__main__':
     test_review_fixes_1_7_0()
     test_prompt_timeout_1_8_0()
     test_script_hazard_1_8_0()
+    test_remote_provenance_1_8_1()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
