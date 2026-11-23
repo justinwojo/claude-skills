@@ -8063,14 +8063,36 @@ def test_remote_provenance_1_8_1():
     check('C4: an earlier cwd matches whole: C:\\Program does not, the same folder in caps does',
           ('1 earlier call names it' in text, 'run: git status' in text, 'run: dir' in text), (True, True, False))
     # C4 (round 2): a path is a whole word, bare or in one closed pair of quotes
-    check('C4: a quote inside a word, or a path cut at a space, names nothing',
+    check('C4: a quote inside a word, a path cut at a space, or a quote left open names nothing',
           [n for _, n in p._remote_paths('git --work-tree="/srv/a b" clean -fdx; ls --dir=/srv/c '
                                          '"/srv/d" \'/srv/e\'; x"/srv/f" "/srv/g\' /srv/h')],
-          ['/srv/d', '/srv/e', '/srv/h'])
+          ['/srv/d', '/srv/e'])
     # C21: whole words of plain characters only; a quoted span with whitespace names nothing
     check('C21: a comma, a glob, or a path inside a spaced quote names nothing',
           [n for _, n in p._remote_paths(f"{rmrf} /srv/build,old /srv/[ab] '/srv/my /scratch/build data' "
                                          "/srv/ok; 'C:\\Lab\\w';")], ['/srv/ok', 'c:/lab/w'])
+    # C23: a spaced quote spoils its word; an open quote hides the rest
+    check("C23: /srv/build' old' names nothing; an open quote hides what follows",
+          ([n for _, n in p._remote_paths(f"{rmrf} /srv/build' old' /srv/ok")],
+           [n for _, n in p._remote_paths(f"{rmrf} /srv/ok 'never closed /srv/hidden")]),
+          (['/srv/ok'], ['/srv/ok']))
+    capped = f"{rmrf} /srv/ok '" + 'x' * p.REMOTE_SCAN_CHARS + "' /srv/after"
+    check('C23: a quote opened before the scan cap hides the paths after it',
+          [n for _, n in p._remote_paths(capped)], ['/srv/ok'])
+    # C24: one pass over the quotes
+    quoted = "ls " + "'/srv/q a' " * 1500 + '"/srv/r" ' * 1500
+    t0 = time.monotonic()
+    for _ in range(20):
+        p._remote_paths(quoted[:p.REMOTE_SCAN_CHARS])
+    check('C24: 20 reads of 16 KB of quoted words in under 0.2 s', time.monotonic() - t0 < 0.2, True)
+    slow = os.path.join(proj, 'sess-c24.jsonl')
+    heavy = {'command': '/srv/build ' + "'a b' \"c\" " * 300}
+    _transcript(slow, [_tool_use(f'q{i}', 'mcp__bench__run', heavy, 30) for i in range(600)])
+    t0 = time.monotonic()
+    _, status = p.remote_provenance(dict(payload, transcript_path=slow, tool_input={'command': f'{rmrf} /srv/build'}),
+                                    'mcp__bench__run', {'command': f'{rmrf} /srv/build'}, time.monotonic() + 0.1)
+    check('C24: heavy quoted records stop within a few ms of the deadline',
+          (status, time.monotonic() - t0 < 0.15), ('found', True))
     hist21 = os.path.join(proj, 'sess-c21.jsonl')
     _transcript(hist21, [_tool_use('w1', 'mcp__bench__run', {'command': 'ls /srv/build,old'}, 20),
                          _bash_result('w1', 20),

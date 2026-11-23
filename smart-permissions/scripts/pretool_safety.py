@@ -2038,8 +2038,8 @@ def _transcript_matches(files, targets, current, skip_id, deadline,
         budget -= size
         cut = cut or partial
         pending = {}  # tool_use id → (its command texts, its matches), until its result
-        for n, line in enumerate(lines):
-            if n % 2048 == 0 and time.monotonic() > deadline:
+        for line in lines:  # a long record can take a millisecond: the clock, every line
+            if time.monotonic() > deadline:
                 cut = True
                 break
             # A result record holds one result, its id ahead of the output
@@ -2204,6 +2204,7 @@ _REMOTE_RESET_HINT_RE = re.compile(
 _REMOTE_PATH_RE = re.compile(r"(?:/|~/)[\w.~+@/-]+|[A-Za-z]:[\\/][\w.~+@\\/-]*", re.A)
 _REMOTE_FIELD_RE = re.compile(r"(?:/|~/)[\w.~+@/ -]+|[A-Za-z]:[\\/][\w.~+@\\/ -]*", re.A)
 REMOTE_SCAN_CHARS = 16 * 1024  # of a command's text: what is read for paths and the hint
+_SPACE_RE = re.compile(r"\s")
 _MCP_PATH_KEY_RE = re.compile(r"(?i)path|dir|file|dest|target|src|source")
 _REMOTE_STATUS = {"ok": "the tool call returned ok", "error": "the tool call returned an error",
                   "no result": "no result yet", "result unknown": "its result could not be read"}
@@ -2233,20 +2234,20 @@ def _remote_norm(path):
 def _remote_paths(text):
     """[(as written, normalized)] for the whitespace-separated words of
     `text` that are a path whole (_REMOTE_PATH_RE), bare or in one pair of
-    quotes, a `;` after it allowed. A quoted span holding whitespace names
-    nothing, nor does the last word of a text cut at REMOTE_SCAN_CHARS."""
+    quotes, a `;` after it allowed. A quoted span holding whitespace makes
+    its word name nothing; so does a quote left open, for the rest of the
+    text, and the last word of a text cut at REMOTE_SCAN_CHARS."""
     if len(text) > REMOTE_SCAN_CHARS:
         text = text[:REMOTE_SCAN_CHARS].rsplit(None, 1)[0] if text[:REMOTE_SCAN_CHARS].split() else ""
-    kept, i = [], 0
-    while True:  # quotes paired left to right, as a shell reads them
-        at = min((j for j in (text.find("'", i), text.find('"', i)) if j >= 0), default=-1)
-        end = text.find(text[at], at + 1) if at >= 0 else -1
-        if end < 0:
-            kept.append(text[i:])
-            break
-        span = text[at:end + 1]
-        kept += [text[i:at], " " if any(c.isspace() for c in span) else span]
-        i = end + 1
+    kept, last, quote, at = [], 0, None, 0
+    for m in re.finditer(r"['\"]", text):  # quotes paired left to right, as a shell reads them
+        if quote is None:
+            quote, at = m[0], m.start()
+        elif m[0] == quote:
+            span = text[at:m.end()]
+            kept += [text[last:at], "\x00" if _SPACE_RE.search(span) else span]
+            last, quote = m.end(), None
+    kept.append(text[last:at] if quote else text[last:])
     found = []
     for word in "".join(kept).split():
         word = word[:-1] if word.endswith(";") else word
