@@ -56,8 +56,19 @@ def d(s):
     return base64.b64decode(s).decode()
 
 
-def run_hook(script, payload, env_overrides=None):
-    """Run a hook script with the given payload, return parsed output."""
+def _exit_failure(r, expected_rc=0):
+    """None when a hook run exited with `expected_rc`, else a string no check
+    expects. A hook that crashed at startup (an import error, a traceback)
+    prints nothing, and empty stdout must not read as a silent-exit ask."""
+    if r.returncode == expected_rc:
+        return None
+    tail = (r.stderr.strip().splitlines() or [''])[-1]
+    return f'hook exited {r.returncode}: {tail[:200]}'
+
+
+def run_hook(script, payload, env_overrides=None, expected_rc=0):
+    """Run a hook script with the given payload, return parsed output.
+    An exit status other than `expected_rc` returns a failure string."""
     env = os.environ.copy()
     # Disable LLM fallback in tests so we get pure local rule decisions
     env.pop('SAFETY_HOOK_API_KEY', None)
@@ -86,6 +97,9 @@ def run_hook(script, payload, env_overrides=None):
         capture_output=True, text=True,
         env=env,
     )
+    bad = _exit_failure(r, expected_rc)
+    if bad:
+        return bad
     if r.stdout.strip():
         out = json.loads(r.stdout)
         hook = out.get('hookSpecificOutput', {})
@@ -111,6 +125,21 @@ def check(name, actual, expected):
         msg = f'  FAIL  {name}: expected {expected!r}, got {actual!r}'
         print(msg)
         errors.append(msg)
+
+
+def test_harness_exit_status():
+    """The runners report a crash, never an ask: a hook that dies before it
+    prints (here: a script that is not there) used to read as a silent exit."""
+    print('\n--- Harness: a crashed hook is not an ask ---')
+    missing = os.path.join(SCRIPT_DIR, 'no_such_hook.py')
+    got = run_hook(missing, {'tool_name': 'Read', 'tool_input': {}})
+    check('run_hook: a crash is reported', got.startswith('hook exited 2'), True)
+    check('run_hook: the expected exit status is accepted',
+          run_hook(missing, {'tool_name': 'Read', 'tool_input': {}}, expected_rc=2), 'ask')
+    _, cp = _fresh_cfg()
+    check('_run_cfg: a crash is reported',
+          _run_cfg(PRETOOL, {'tool_name': 'Read', 'tool_input': {}}, cp, patch='raise SystemExit(3)')
+          .startswith('hook exited 3'), True)
 
 
 # =====================================================================
@@ -758,6 +787,9 @@ if result:
                 input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': cmd}}),
                 capture_output=True, text=True, env=env,
             )
+            bad = _exit_failure(r)
+            if bad:
+                return bad
             if r.stdout.strip():
                 out = json.loads(r.stdout)
                 hook = out.get('hookSpecificOutput', {})
@@ -1359,6 +1391,9 @@ def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
     out = r.stdout.strip()
     if outputs is not None:
         outputs.append(json.loads(out) if out else None)
+    bad = _exit_failure(r)
+    if bad:
+        return (bad, bool(out)) if full else bad
     decision = 'ask'
     if out:
         hook = json.loads(out).get('hookSpecificOutput', {})
@@ -2520,6 +2555,9 @@ def test_unguarded_delete_steer():
         r = subprocess.run([sys.executable, script], capture_output=True, text=True, env=e,
                            input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': cmd},
                                              'cwd': os.path.join(home, 'Dev')}))
+        bad = _exit_failure(r)
+        if bad:
+            return bad, None
         if not r.stdout.strip():
             return 'ask', None
         out = json.loads(r.stdout)['hookSpecificOutput']
@@ -3401,6 +3439,9 @@ def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None
     r = subprocess.run([sys.executable, '-c', wrapper], input=json.dumps(payload),
                        capture_output=True, text=True, env=env)
     out = r.stdout.strip()
+    bad = _exit_failure(r)
+    if bad:
+        return (bad, None) if full else bad
     hook = json.loads(out).get('hookSpecificOutput', {}) if out else {}
     decision = hook.get('permissionDecision', 'ask')
     return (decision, hook.get('permissionDecisionReason')) if full else decision
@@ -7164,13 +7205,23 @@ def test_phase2_remote_exec():
     atexit.register(shutil.rmtree, dcfg, ignore_errors=True)
     old = os.environ.get('DOCKER_CONFIG')
     os.environ['DOCKER_CONFIG'] = dcfg
+    # Whether a deep config parses depends on the interpreter, not the hook:
+    # 3.9-3.13 raise RecursionError at this depth, 3.14 guards the C stack
+    # instead and parses it. Unparseable reads as '?', parsed with no context as ''.
+    deep = '{"x": ' + '[' * 100000 + ']' * 100000 + '}'
+    try:
+        json.loads(deep)
+        deep_want = ''
+    except RecursionError:
+        deep_want = '?'
     try:
         for title, text, want in [('no config', None, ''),
                                   ('currentContext', '{"currentContext": "prod"}', 'prod'),
                                   ('docker matches keys without case', '{"CurrentContext": "prod"}', 'prod'),
                                   ('two spellings', '{"currentContext": "default", "CURRENTCONTEXT": "prod"}', '?'),
                                   ('not JSON', '{', '?'),
-                                  ('too deep', '{"x": ' + '[' * 100000 + ']' * 100000 + '}', '?')]:
+                                  ('too deep', deep, deep_want),
+                                  ('not JSON, last', '{', '?')]:
             path = os.path.join(dcfg, 'config.json')
             if text is None:
                 if os.path.exists(path):
@@ -8219,6 +8270,8 @@ if __name__ == '__main__':
     print('Smart Permissions Hook Test Suite')
     print('=' * 50)
 
+    test_harness_exit_status()
+
     test_pretool_readonly_tools()
     test_pretool_internal_tools()
     test_pretool_safe_bash()
@@ -8351,6 +8404,7 @@ if __name__ == '__main__':
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
+    print('(The hook-contract suite is separate: python3 tests/test_contract.py)')
 
     if errors:
         print('\nFailures:')

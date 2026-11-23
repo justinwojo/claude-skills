@@ -651,6 +651,12 @@ python3 tests/test_hooks.py
 
 Covers all decision paths: safe commands, dangerous patterns, risky patterns, file paths, web domains, MCP tools, compound commands, the no-LLM prompt path, and edge cases. Dangerous test payloads are base64-encoded so they don't trigger live safety hooks.
 
+```bash
+python3 tests/test_contract.py            # about 15 s
+```
+
+The hook-contract suite runs both hooks exactly as `hooks/hooks.json` invokes them, each in a sandbox with its own `HOME` and a local fake judge, and checks what they do as seen from outside: exit status, output or silence, stderr, every judge request and the evidence in it, the decision-log records in order, and the flag and hold files, including PreToolUse → PermissionRequest and hold → retry sequences. It compares all of that with the snapshot in `tests/contract_golden.json` (`--update` rewrites it; review the diff), so a restructuring can be shown to change nothing observable. `-k <text>` runs the matching cases; `SP_CONTRACT_PYTHON=/path/to/python3` runs the hooks on another interpreter.
+
 `python3 tests/llm_eval.py --runs 5 --include-unreached` runs the labelled cases in `tests/llm_eval_cases.json` through the real LLM judge with your `SAFETY_HOOK_*` settings and reports recall, false flags and latency. It makes real API calls, so it isn't part of the test suite; without a key it prints SKIP. `--rules` shows the rule verdicts only.
 
 ### LLM environment variables
