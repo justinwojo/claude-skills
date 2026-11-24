@@ -6,6 +6,8 @@ config   config loading and merging, derived constants, state file paths
 judge    the judge's settings, prompt texts and HTTP client
 log      decision-log input, redaction and append; the unknown-command log
 holds    the holds store
+state    the per-call state of one hook invocation
+payload  normalizing a hook payload (other agent CLIs' tool names and keys)
 util     small stateless helpers
 
 core imports the others and re-exports their names; they never import core.
