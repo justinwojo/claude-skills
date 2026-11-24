@@ -260,6 +260,53 @@ def _manual_install_checks(dest, pkg, env):
     check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
 
 
+_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds')
+
+
+def test_package_modules():
+    """The modules core is built on import nothing from core or the learner
+    (only config, which imports nothing from the package), and core
+    re-exports every name they hold as the same object, so `core.X` keeps
+    reaching the code that moved."""
+    print('\n--- Package modules ---')
+    import ast
+    pkg = os.path.join(SCRIPT_DIR, 'smart_permissions')
+    with open(os.path.join(pkg, '__init__.py')) as f:
+        init = ast.parse(f.read())
+    check('the package __init__ imports nothing',
+          [type(n).__name__ for n in init.body if isinstance(n, (ast.Import, ast.ImportFrom))], [])
+    for name in _LEAF_MODULES:
+        with open(os.path.join(pkg, name + '.py')) as f:
+            tree = ast.parse(f.read())
+        rel = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level}
+        allowed = set() if name == 'config' else {'config'}
+        check(f'{name}.py imports from the package only {sorted(allowed) or "nothing"}',
+              sorted(rel - allowed), [])
+    _, cp = _fresh_cfg()
+    env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
+    env['SMART_PERMISSIONS_CONFIG'] = cp
+    probe = (
+        'import sys, json, types, importlib\nsys.path.insert(0, %r)\n'
+        'from smart_permissions import core\n'
+        'out = {}\n'
+        'for name in %r:\n'
+        '    m = importlib.import_module("smart_permissions." + name)\n'
+        '    names = [k for k, v in vars(m).items()\n'
+        '             if not k.startswith("__") and not isinstance(v, types.ModuleType)]\n'
+        '    out[name] = [len(names), [k for k in names if getattr(core, k, out) is not getattr(m, k)]]\n'
+        'print(json.dumps(out))\n'
+    ) % (SCRIPT_DIR, _LEAF_MODULES)
+    r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
+    try:
+        got = json.loads(r.stdout)
+    except ValueError:
+        got = {'error': r.stderr.strip()[-300:]}
+    for name in _LEAF_MODULES:
+        count, missing = got.get(name, [0, ['(module not loaded)']])
+        check(f'core re-exports all {name}.py names as the same objects ({count})',
+              (count > 0, missing), (True, []))
+
+
 # =====================================================================
 #  PreToolUse Tests
 # =====================================================================
@@ -8395,6 +8442,7 @@ if __name__ == '__main__':
 
     test_harness_exit_status()
     test_entry_shims()
+    test_package_modules()
 
     test_pretool_readonly_tools()
     test_pretool_internal_tools()
