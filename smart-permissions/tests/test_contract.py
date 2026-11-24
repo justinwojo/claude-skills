@@ -719,6 +719,32 @@ def p_judge_script_word_may_split(c):
     return [s]
 
 
+@case
+def p_rule_allow_quoted_heredoc_dollar(c):
+    # 1.8.3: the shell expands nothing in a heredoc with a quoted delimiter,
+    # so a `$` or backtick in the Python there is Python's own text; with an
+    # unquoted delimiter the body still goes to the judge
+    sb = Sandbox()
+    body = "\nprint('cost: $5, `x`, $(date)')\nEOF"
+    s1 = run(sb, 'pretool', sb.bash("python3 - <<'EOF'" + body), judge=[SAFE])
+    expect(c, 1, s1, out='allow', judge=0, events=[('pretool', 'allow', 'rule')])
+    s2 = run(sb, 'pretool', sb.bash('python3 - <<EOF' + body), judge=[SAFE])
+    expect(c, 2, s2, out='allow', judge=1, events=[('pretool', 'allow', 'llm')])
+    return [s1, s2]
+
+
+@case
+def p_judge_quoted_heredoc_reads_config(c):
+    # 1.8.3: Python in a quoted heredoc that only reads a config file is no
+    # config write when its text holds a `$` (it was C9's explicit ask)
+    sb = Sandbox()
+    cfg = os.path.join(sb.claude, 'settings.json')
+    s = run(sb, 'pretool', sb.bash(f"python3 - <<'EOF' > out.txt\nimport json\n"
+                                   f"print(json.load(open('{cfg}')), '$5')\nEOF"), judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')])
+    return [s]
+
+
 # ---- PreToolUse: asks — silent exit vs explicit developer prompt --------
 
 @case

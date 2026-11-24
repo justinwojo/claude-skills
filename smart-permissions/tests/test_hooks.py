@@ -8384,6 +8384,28 @@ def test_script_word_and_quoted_heredoc_1_8_3():
                for w in ('$S/fit.py', '"$S/fit.py"')]
         check(f'1.8.3 script word: same verdict as the quoted word: {template!r}', got[0], got[1])
 
+    # 2. A heredoc with a quoted delimiter: the shell expands nothing, so a
+    # `$` or backtick in the body is Python's own text
+    allows = ["python3 - <<'EOF'\nimport re\nprint(re.sub(r'\\$\\w+', 'X', 'a $b `c`'))\nEOF",
+              'python3 - <<"EOF"\nprint("cost: $5")\nEOF', 'python3 - <<\\EOF\nprint("`x` $(date)")\nEOF',
+              "python3 - <<'EOF' | tail -1\nprint('${x:-y}')\nEOF"]
+    asks = ['python3 - <<EOF\nprint("cost: $(date)")\nEOF', 'python3 - <<EOF\nprint("$HOME")\nEOF',
+            'python3 - <<EOF\nprint("`date`")\nEOF', "python3 - <<'EOF'\nimport os\nprint('$x')\nEOF",
+            "python3 - <<'EOF'\nopen('out-$5.txt', 'w').write('`x`')\nEOF"]
+    _phase3_check('1.8.3 quoted heredoc', [], asks, allows)
+    sys.path.insert(0, SCRIPT_DIR)
+    from smart_permissions import core as p
+    check('1.8.3 _py_parse: shell text refused unless literal',
+          (p._py_parse("print('$(id)')") is None, p._py_parse("print('$(id)')", literal=True) is not None),
+          (True, True))
+    # Python that only reads a config file is no config write (C9) with a
+    # `$` in its text, when the heredoc's delimiter is quoted
+    conf = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+    read = f"import json\nprint(json.load(open('{conf}')), '$5')\nEOF"
+    res = _both_hooks([f"python3 - <<'EOF' > out.txt\n{read}", f'python3 - <<EOF > out.txt\n{read}'])
+    check('1.8.3 quoted heredoc reading a config file: not C9', res[0][1] == _C9, False)
+    check('1.8.3 unquoted heredoc reading a config file: still C9', res[1][1], _C9)
+
 
 def test_remote_provenance_1_8_1():
     print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')

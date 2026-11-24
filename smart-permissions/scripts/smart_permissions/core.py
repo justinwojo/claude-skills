@@ -1150,14 +1150,18 @@ def _mentions_hijack_env(text):
     return bool(_PY_HIJACK_ENV_RE.search(re.sub(r"[\"'\\]", "", text)))
 
 
-def _py_parse(code):
+def _py_parse(code, literal=False):
     """The AST of `code`, or None. Shell expansion changes the code: a plain
     `$var` / `${var}` becomes a placeholder (data inside a string literal,
-    rejected as code); `$(…)`, backticks and other `$` forms give None."""
+    rejected as code); `$(…)`, backticks and other `$` forms give None.
+    With `literal`, the shell passes `code` on as written (the body of a
+    heredoc with a quoted delimiter, a `-c` word it expands nothing in), so
+    a `$` or backtick in it is Python's own text."""
     import ast
-    code = _PY_SHELL_VAR_RE.sub(_PY_SHELL_VAR_PLACEHOLDER, code)
-    if "$" in code or "`" in code:
-        return None
+    if not literal:
+        code = _PY_SHELL_VAR_RE.sub(_PY_SHELL_VAR_PLACEHOLDER, code)
+        if "$" in code or "`" in code:
+            return None
     import warnings
     try:
         with warnings.catch_warnings():
@@ -1253,7 +1257,7 @@ def _python_read_ok(path):
         _sensitive_read("Read", {"file_path": c}) or is_always_ask_write_path(c) for c in paths)
 
 
-def _safe_python_code(code):
+def _safe_python_code(code, literal=False):
     """True if `code` parses and only transforms data: imports from the
     allowlist, calls only to allowed builtins, names the code binds itself,
     methods of values it made, and reads (open with no write mode) of
@@ -1261,9 +1265,9 @@ def _safe_python_code(code):
     time (`open(sys.argv[1])`, `open(f)`, an f-string) stays with the judge,
     and so does every write. Ordinary str.replace (two or three plain
     positional arguments, not on a module) is allowed; `replace` anywhere
-    else may be os.replace or Path.replace."""
+    else may be os.replace or Path.replace. `literal`: see _py_parse."""
     import ast
-    tree = _py_parse(code)
+    tree = _py_parse(code, literal)
     if tree is None:
         return False
     bound = _py_bound_names(tree)
@@ -2492,16 +2496,17 @@ _PY_TREE_WRITES = frozenset({"rename", "renames", "replace", "copy", "copy_into"
                              "move_into"})
 
 
-def _python_writes_no_config(code):
+def _python_writes_no_config(code, literal=False):
     """True when Python `code` provably writes no permission-config file:
     it imports only modules whose writes can be seen here (_PY_SEEN_MODULES),
     runs no other code (exec, eval, getattr, dunders, …), and every write it
     makes (open in a write mode, an os/shutil write, a Path write method)
     targets a literal path that is no config file, links resolved, from
     each folder the command may be in. Reads of config files are fine. A
-    write whose target is built at run time counts as a config write."""
+    write whose target is built at run time counts as a config write.
+    `literal`: see _py_parse."""
     import ast
-    tree = _py_parse(code)
+    tree = _py_parse(code, literal)
     if tree is None:
         return False
     modules = {}  # bound name → module, for imports and from-imports of a module
@@ -2800,7 +2805,7 @@ def _writes_config(cmd, relieve=True, in_script=False):
     named = _references_always_ask_path(cmd)
     if named:
         found = _python_code_of(cmd) if relieve else None
-        if found is not None and _python_writes_no_config(found[0]):
+        if found is not None and _python_writes_no_config(found[0], literal=True):  # code shown literally
             cmd = found[1]
             named = _references_always_ask_path(cmd)
         elif _PYTHON_BASENAME_RE.match(os.path.basename(
@@ -7439,7 +7444,7 @@ def _python_heredoc_ok(part, command):
     code = bodies[0][0]
     if _comment_lines_dropped(code) != _comment_lines_dropped(found[0]):
         return False  # not the same heredoc
-    return _safe_python_code(code)
+    return _safe_python_code(code, literal=True)  # a quoted delimiter: the shell expands nothing
 
 
 def _nested_verdict(text, depth, log_unknowns):

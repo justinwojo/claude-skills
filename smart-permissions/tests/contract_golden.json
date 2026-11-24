@@ -1900,6 +1900,63 @@
     ]
    }
   ],
+  "p_judge_quoted_heredoc_reads_config": [
+   {
+    "files": {
+     "changed": [],
+     "created": [
+      "hooks/smart-permissions-decisions.jsonl",
+      "smart-permissions-config.json"
+     ],
+     "removed": []
+    },
+    "flags": null,
+    "holds": null,
+    "hook": "pretool",
+    "judge": [
+     {
+      "auth": "bearer",
+      "effort": null,
+      "format": "openai",
+      "model": "mock-model",
+      "path": "/v1/chat/completions",
+      "roles": [
+       "system",
+       "user"
+      ],
+      "schema_sent": true,
+      "system_sha256": "f4a73589b83fa293",
+      "unexpected": false,
+      "user": "Working directory: <SB>/home/Dev/app\nDeveloper's recent messages (oldest first):\n--- message 1 ---\nWrap up the benchmark in this project.\n\nTool: Bash\nParameters:\n{\n  \"command\": \"python3 - <<'EOF' > out.txt\\nimport json\\nprint(json.load(open('<SB>/home/.claude/settings.json')), '$5')\\nEOF\"\n}\n\nLocal rules sent this call to you because: Interpreter reads its code from a heredoc or here-string: python3"
+     }
+    ],
+    "judge_unused_responses": 0,
+    "log": [
+     {
+      "decision": "allow",
+      "hook": "pretool",
+      "input": "python3 - <<'EOF' > out.txt\nimport json\nprint(json.load(open('<SB>/home/.claude/settings.json')), '$5')\nEOF",
+      "input_len": "=len(input)",
+      "llm_ms": "<ms>",
+      "reason": "LLM approved",
+      "rule_reason": "Interpreter reads its code from a heredoc or here-string: python3",
+      "source": "llm",
+      "tool": "Bash",
+      "truncated": false,
+      "v": "<version>"
+     }
+    ],
+    "rc": 0,
+    "stderr": [],
+    "stdout": {
+     "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "allow"
+     }
+    },
+    "unknown_log": []
+   }
+  ],
   "p_judge_refusal": [
    {
     "files": {
@@ -2592,6 +2649,103 @@
      }
     },
     "unknown_log": []
+   }
+  ],
+  "p_rule_allow_quoted_heredoc_dollar": [
+   {
+    "files": {
+     "changed": [],
+     "created": [
+      "hooks/smart-permissions-decisions.jsonl",
+      "smart-permissions-config.json"
+     ],
+     "removed": []
+    },
+    "flags": null,
+    "holds": null,
+    "hook": "pretool",
+    "judge": [],
+    "judge_unused_responses": 1,
+    "log": [
+     {
+      "decision": "allow",
+      "hook": "pretool",
+      "input": "python3 - <<'EOF'\nprint('cost: $5, `x`, $(date)')\nEOF",
+      "input_len": "=len(input)",
+      "reason": "All commands in safe list",
+      "source": "rule",
+      "tool": "Bash",
+      "truncated": false,
+      "v": "<version>"
+     }
+    ],
+    "rc": 0,
+    "stderr": [],
+    "stdout": {
+     "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "allow"
+     }
+    },
+    "unknown_log": []
+   },
+   {
+    "files": {
+     "changed": [
+      "hooks/smart-permissions-decisions.jsonl"
+     ],
+     "created": [
+      "hooks/unknown-permissions.log"
+     ],
+     "removed": []
+    },
+    "flags": null,
+    "holds": null,
+    "hook": "pretool",
+    "judge": [
+     {
+      "auth": "bearer",
+      "effort": null,
+      "format": "openai",
+      "model": "mock-model",
+      "path": "/v1/chat/completions",
+      "roles": [
+       "system",
+       "user"
+      ],
+      "schema_sent": true,
+      "system_sha256": "f4a73589b83fa293",
+      "unexpected": false,
+      "user": "Working directory: <SB>/home/Dev/app\nDeveloper's recent messages (oldest first):\n--- message 1 ---\nWrap up the benchmark in this project.\n\nTool: Bash\nParameters:\n{\n  \"command\": \"python3 - <<EOF\\nprint('cost: $5, `x`, $(date)')\\nEOF\"\n}\n\nLocal rules sent this call to you because: In command substitution: Unknown command(s): x (logged)"
+     }
+    ],
+    "judge_unused_responses": 0,
+    "log": [
+     {
+      "decision": "allow",
+      "hook": "pretool",
+      "input": "python3 - <<EOF\nprint('cost: $5, `x`, $(date)')\nEOF",
+      "input_len": "=len(input)",
+      "llm_ms": "<ms>",
+      "reason": "LLM approved",
+      "rule_reason": "In command substitution: Unknown command(s): x (logged)",
+      "source": "llm",
+      "tool": "Bash",
+      "truncated": false,
+      "v": "<version>"
+     }
+    ],
+    "rc": 0,
+    "stderr": [],
+    "stdout": {
+     "hookSpecificOutput": {
+      "hookEventName": "PreToolUse",
+      "permissionDecision": "allow"
+     }
+    },
+    "unknown_log": [
+     "command   x"
+    ]
    }
   ],
   "p_rule_allow_read": [
