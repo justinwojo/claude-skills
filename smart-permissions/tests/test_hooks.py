@@ -195,33 +195,50 @@ def test_entry_shims():
         os.chmod(dest, 0o755)
         os.chmod(pkg, 0o755)
 
-    # A missing or broken package: PreToolUse blocks the call and says why (exit 2,
-    # as for a missing script); the learner exits 1 with no decision, so the
-    # native dialog shows. A SystemExit from main passes through the shim.
+    # A missing, broken or foreign package: PreToolUse blocks the call and says
+    # why (exit 2, as for a missing script); the learner exits 1 with no
+    # decision, so the native dialog shows. A SystemExit from main passes
+    # through both shims.
     broken = os.path.join(base, 'broken')
     os.makedirs(broken)
     for n in (PRETOOL, LEARNER):
         shutil.copy(n, broken)
+    with open(os.path.join(SCRIPT_DIR, 'smart_permissions', 'learner.py')) as f:
+        real_learner = f.read()
+    exits = 'import sys\ndef main():\n    print("{}")\n    sys.exit(0)\n'
     read = json.dumps({'tool_name': 'Read', 'tool_input': {'file_path': '/etc/hosts'}})
-    for label, core_src in (('missing package', None), ('package that does not import', 'x = (\n'),
-                            ('main that exits', 'import sys\ndef main():\n    print("{}")\n    sys.exit(0)\n')):
+    for label, core_src, learner_src, extra in (
+            ('missing package', None, None, {}),
+            # a package elsewhere on the import path is not this install's
+            ('only a package elsewhere on PYTHONPATH', None, None, {'PYTHONPATH': os.path.abspath(SCRIPT_DIR)}),
+            ('package that does not import', 'x = (\n', real_learner, {}),
+            ('main that exits', exits, 'from . import core\n' + exits, {})):
         if core_src is not None:
             pkg_dir = os.path.join(broken, 'smart_permissions')
             os.makedirs(pkg_dir, exist_ok=True)
             open(os.path.join(pkg_dir, '__init__.py'), 'w').close()
-            with open(os.path.join(pkg_dir, 'core.py'), 'w') as f:
-                f.write(core_src)
+            for name, src in (('core.py', core_src), ('learner.py', learner_src)):
+                with open(os.path.join(pkg_dir, name), 'w') as f:
+                    f.write(src)
             shutil.rmtree(os.path.join(pkg_dir, '__pycache__'), ignore_errors=True)
-        r = subprocess.run([sys.executable, os.path.join(broken, 'pretool_safety.py')], input=read,
-                           capture_output=True, text=True, env=env)
+        run_env = dict(env, **extra)
+        pre = subprocess.run([sys.executable, os.path.join(broken, 'pretool_safety.py')], input=read,
+                             capture_output=True, text=True, env=run_env)
+        lrn = subprocess.run([sys.executable, os.path.join(broken, 'permission_learner.py')], input=read,
+                             capture_output=True, text=True, env=run_env)
         if label == 'main that exits':
-            check(f'pretool shim, {label}: its exit and output pass through', (r.returncode, r.stdout.strip()), (0, '{}'))
+            check(f'pretool shim, {label}: its exit and output pass through',
+                  (pre.returncode, pre.stdout.strip()), (0, '{}'))
+            check(f'learner shim, {label}: its exit and output pass through',
+                  (lrn.returncode, lrn.stdout.strip()), (0, '{}'))
             continue
         check(f'pretool shim, {label}: blocks the call (exit 2) and says why',
-              (r.returncode, r.stdout, r.stderr.startswith('smart-permissions could not start')), (2, '', True))
-        r = subprocess.run([sys.executable, os.path.join(broken, 'permission_learner.py')], input=read,
-                           capture_output=True, text=True, env=env)
-        check(f'learner shim, {label}: exit 1, no decision', (r.returncode, r.stdout), (1, ''))
+              (pre.returncode, pre.stdout, pre.stderr.startswith('smart-permissions could not start')), (2, '', True))
+        check(f'learner shim, {label}: exit 1, no decision', (lrn.returncode, lrn.stdout), (1, ''))
+        if label == 'package that does not import':
+            check(f'learner shim, {label}: the broken core was reached', 'SyntaxError' in lrn.stderr, True)
+        if label == 'only a package elsewhere on PYTHONPATH':
+            check(f'learner shim, {label}: says where it came from', 'was loaded from' in lrn.stderr, True)
 
     # The marketplace entry declares the same hooks as hooks/hooks.json (both load)
     with open(os.path.join(SCRIPT_DIR, '..', 'hooks', 'hooks.json')) as f:
