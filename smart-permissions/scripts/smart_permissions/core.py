@@ -37,14 +37,10 @@ import builtins
 import shlex
 import shutil
 import time
-import threading
-import hashlib
 import glob
 import collections
-import functools
 import itertools
 from fnmatch import fnmatch, translate
-from datetime import datetime
 import urllib.parse
 from urllib.parse import urlparse
 # urllib.request (and with it http.client, email, ssl, socket: about 14 ms) is
