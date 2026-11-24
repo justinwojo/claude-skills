@@ -1571,6 +1571,46 @@ def _fresh_cfg(initial=None):
     return d, cp
 
 
+def _plain_home():
+    """A HOME folder for a child, with no "__" anywhere in its path, whatever
+    the suite's own HOME and TMPDIR are called. Checks that write HOME
+    paths into Python code need it: the checker refuses any literal that
+    holds "__"."""
+    for root in (tempfile.gettempdir(), '/tmp'):
+        root = os.path.realpath(root)
+        if '__' in root:
+            continue
+        while True:
+            home = tempfile.mkdtemp(prefix='sp-home-', dir=root)
+            if '__' not in home:
+                break
+            os.rmdir(home)
+        atexit.register(shutil.rmtree, home, ignore_errors=True)
+        os.makedirs(os.path.join(home, '.claude', 'hooks'))
+        return home
+    raise RuntimeError('no temp folder without "__" in its path')
+
+
+def _in_home(home, cwd, items):
+    """Core's answers for [(kind, command)] in a child whose HOME is `home`,
+    the call's folder `cwd`: 'ev' the Bash verdict, 'w'
+    bash_writes_to_config_path, 'hr' human_required_reason."""
+    code = ('import sys, json\nsys.path.insert(0, %r)\nfrom smart_permissions import core as p\n'
+            'cwd, items = json.loads(sys.stdin.read())\nout = []\n'
+            'with p.using_state(p.CallState(cwd=cwd)):\n'
+            '    for kind, cmd in items:\n'
+            '        out.append(p.evaluate_bash(cmd, log_unknowns=False)[0] if kind == "ev" else\n'
+            '                   p.bash_writes_to_config_path(cmd) if kind == "w" else\n'
+            '                   p.human_required_reason("Bash", {"command": cmd}))\n'
+            'print(json.dumps(out))\n') % SCRIPT_DIR
+    r = subprocess.run([sys.executable, '-c', code], input=json.dumps([cwd, items]), capture_output=True,
+                       text=True, env=dict(os.environ, HOME=home))
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return [r.stderr.strip()[-200:]] * len(items)
+
+
 def _read_json(path, default):
     try:
         with open(path) as f:
@@ -6548,8 +6588,6 @@ def test_phase1b_fewer_judge_calls():
         for cmd, want in [
                 ("S=/tmp/work; python3 -c \"import json; print(json.load(open('$S/a.json')))\"", 'allow'),
                 ("S=/tmp/work && python3 -c \"import json\nprint(open('$S/a.json').read())  # x\"", 'allow'),
-                ("python3 -c \"print(open('$HOME/work/a.json').read())\"", 'allow'),
-                ("python3 -c \"print(open('$HOME/.ssh/id_rsa').read())\"", 'ask'),
                 ("S=/Users/u/.aws; python3 -c \"print(open('$S/credentials').read())\"", 'ask'),
                 ("python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
                 ("test -d x && S=/tmp/w; python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
@@ -6619,12 +6657,18 @@ def test_phase1b_fewer_judge_calls():
               ev('export PATH=/tmp/b:$PATH; cd /tmp && PY=/usr/bin/python3; $PY -I x.py'), 'ask')
 
         # ---- g. a config write needs a write ----
-        log = os.path.join(os.path.expanduser('~'), '.claude', 'hooks', 'sp-test-decisions.jsonl')
-        settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+        # These commands carry HOME paths in their Python code, which the
+        # checker refuses when a literal holds "__": under a HOME named that
+        # way every read would count as a write. So they run in a child whose
+        # HOME is a folder made here, with no "__" in its path.
+        home = _plain_home()
+        log = os.path.join(home, '.claude', 'hooks', 'sp-test-decisions.jsonl')
+        settings = os.path.join(home, '.claude', 'settings.json')
         link = os.path.join(base, 'out.txt')
         os.symlink(settings, link)
-        w = p.bash_writes_to_config_path
-        for name, cmd, want in [
+        home_reads = [("python3 -c \"print(open('$HOME/work/a.json').read())\"", 'allow'),
+                      ("python3 -c \"print(open('$HOME/.ssh/id_rsa').read())\"", 'ask')]
+        writes = [
                 ('a heredoc read, output elsewhere',
                  f"python3 - <<'E' > {base}/o.txt\nn = 0\nfor l in open('{log}'):\n    n += len(l) > 3\nprint(n)\nE",
                  False),
@@ -6692,13 +6736,18 @@ def test_phase1b_fewer_judge_calls():
                 ('os re-exported by os.path',
                  f"python3 - <<'E'\nfrom os.path import os as o\no.replace('/tmp/a', '{settings}')\nE", True),
                 ('dict.copy is no write', f"python3 - <<'E' > /tmp/o.txt\nd = {{}}\ne = d.copy()\nprint(open('{log}').read())\nE",
-                 False)]:
-            check(f'C9 {name}', w(cmd), want)
+                 False)]
         # A read of a config file is no C9 write, but the judge sees it (not allowed by rule)
-        for cmd in [f"python3 - <<'E' > {base}/o.txt\nprint(len(open('{log}').read()))\nE",
-                    f"python3 -c \"print(open('{settings}').read()[:9])\""]:
-            check(f'config read goes to the judge: {cmd[:40]!r}',
-                  (ev(cmd), p.human_required_reason('Bash', {'command': cmd})), ('ask', None))
+        config_reads = [f"python3 - <<'E' > {base}/o.txt\nprint(len(open('{log}').read()))\nE",
+                        f"python3 -c \"print(open('{settings}').read()[:9])\""]
+        got = iter(_in_home(home, base, [('ev', c) for c, _ in home_reads] + [('w', c) for _, c, _ in writes]
+                            + [(k, c) for c in config_reads for k in ('ev', 'hr')]))
+        for cmd, want in home_reads:
+            check(f'inline read with a shell name: {cmd[:50]!r}', next(got), want)
+        for name, cmd, want in writes:
+            check(f'C9 {name}', next(got), want)
+        for cmd in config_reads:
+            check(f'config read goes to the judge: {cmd[:40]!r}', (next(got), next(got)), ('ask', None))
 
         # ---- e. every log record carries the version, the input length and a truncated flag ----
         mk = os.path.join(SCRIPT_DIR, '..', '..', '.claude-plugin', 'marketplace.json')
