@@ -1,14 +1,19 @@
-"""Decision-log building blocks: the unknown-command log, the loggable input
-of a call (what each tool's record shows, truncated), secret redaction for
-full-input capture, and the owner-only append with locked single-generation
-rotation. log_decision itself, and _loggable_reason, stay in core for now: they
-read state the current call leaves in core's globals."""
+"""The decision log and the unknown-command log: the loggable input of a call
+(what each tool's record shows, truncated), secret redaction for full-input
+capture, the owner-only append with locked single-generation rotation, and
+log_decision, which writes one record from what the hook call's state holds
+(passed in; this module keeps no per-call state). A test that turns the log
+off or points it elsewhere rebinds the DECISION_LOG_* names here."""
 import json
 import os
 import re
 from datetime import datetime
 
-from .config import DECISION_LOG_INPUT_CHARS, UNKNOWN_LOG
+from .config import (
+    DECISION_LOG_ENABLED, DECISION_LOG_FLAGGED_INPUT_CHARS, DECISION_LOG_FULL_INPUT,
+    DECISION_LOG_FULL_INPUT_CHARS, DECISION_LOG_INPUT_CHARS, DECISION_LOG_MAX_BYTES, DECISION_LOG_PATH,
+    HOOK_VERSION, UNKNOWN_LOG,
+)
 
 
 def log_unknown(kind, name):
@@ -150,3 +155,86 @@ def _append_log_line(path, line, max_bytes):
         os.write(fd, line.encode("utf-8", "replace"))
     finally:
         os.close(fd)
+
+
+def _loggable_reason(reason, script_texts):
+    """`reason` for the decision log. When the judge was shown script
+    contents (`script_texts`, see CallState), its own words may echo them, so
+    only its category numbers are kept: script text never reaches the log."""
+    if not (script_texts and isinstance(reason, str) and reason.startswith("LLM")) \
+            or reason == "LLM approved":
+        return reason
+    cats = sorted(set(re.findall(r"category ([1-9])(?!\d)", reason)))  # the prompt's 1-9, not free text
+    return ("LLM verdict; its words are not logged, as it was shown script contents"
+            + (f" (category {', '.join(cats)})" if cats else ""))
+
+
+def log_decision(hook, tool, tool_input, decision, source, reason,
+                 duration_ms=None, llm_ms=None, rule_reason=None, hold=None, *, state):
+    """Append one JSONL record describing a permission decision.
+
+    Best-effort: never raises, never blocks the hook (blanket guard like
+    log_unknown). The `input` field holds the tool input truncated to 500
+    chars for an allow and 8000 for an ask or deny — it may embed secrets,
+    so the log is the same trust class as shell history (see README privacy
+    note). Rotates at 20 MB to a single `.1` generation. `source` is one of
+    rule|llm|llm-recheck|llm-hold|hold-retry|learner|prompt-timeout (older logs also hold
+    llm-cache, from the cache since removed). `provenance`
+    (found|none|unavailable) is there when the judge was asked about a delete
+    or reset it could name, here or on another machine (remote_provenance). `hold` says what a hold did: held, cleared,
+    asked (flagged again), no-answer, retry-busy, or why a flag was not held;
+    prompt-timeout on the learner's deny of a prompt nobody answered.
+    `state` is the hook call's (see CallState): its client tool name, the
+    provenance and the script texts the judge was shown.
+    """
+    if not DECISION_LOG_ENABLED:
+        return
+    try:
+        limit = DECISION_LOG_FLAGGED_INPUT_CHARS if decision in ("ask", "deny") else DECISION_LOG_INPUT_CHARS
+        if DECISION_LOG_FULL_INPUT:
+            limit = DECISION_LOG_FULL_INPUT_CHARS
+        full = _decision_log_input(tool, tool_input, None)
+        shown, redacted = full, False
+        if DECISION_LOG_FULL_INPUT:  # before the cut, so a secret cut short is still found
+            shown = _decision_log_input(tool, tool_input, None, redact=True)
+            redacted = shown != full
+        logged = shown[:limit]
+        record = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "v": HOOK_VERSION,
+            "hook": hook,
+            "tool": tool,
+            "input": logged,
+            "input_len": len(full),
+            "truncated": len(shown) > limit,
+            "decision": decision,
+            "source": source,
+            "reason": _loggable_reason(reason, state.script_texts),
+        }
+        if DECISION_LOG_FULL_INPUT:
+            record["redacted"] = redacted
+            record["incomplete"] = redacted or record["truncated"]
+            if isinstance(record["reason"], str):
+                record["reason"] = _redact_secrets(record["reason"])[0]
+            if isinstance(rule_reason, str):
+                rule_reason = _redact_secrets(rule_reason)[0]
+        if duration_ms is not None:
+            record["duration_ms"] = duration_ms
+        if llm_ms is not None:
+            record["llm_ms"] = llm_ms
+        # Why the rules punted to the LLM — the LLM's own reason replaces it.
+        # The learner keeps it on every record (its reason may be the same).
+        if rule_reason and (rule_reason != reason or hook == "permission_request"):
+            record["rule_reason"] = rule_reason
+        if state.client_tool:
+            record["client_tool"] = state.client_tool
+        if hold:
+            record["hold"] = hold
+        # Whether the judge saw session provenance for a delete or reset
+        # (see build_llm_context), so its effect on verdicts can be measured.
+        if state.provenance:
+            record["provenance"] = state.provenance
+        os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
+        _append_log_line(DECISION_LOG_PATH, json.dumps(record) + "\n", DECISION_LOG_MAX_BYTES)
+    except Exception:
+        pass  # Never block on logging failures

@@ -6639,22 +6639,23 @@ def test_phase1b_fewer_judge_calls():
               (True, False, False, False, True, True, False))
         check('full capture: a clean input is complete',
               (r2['input'], r2['redacted'], r2['incomplete']), ('ls -la', False, False))
-        saved_cap = p.DECISION_LOG_FULL_INPUT_CHARS
-        saved = (p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH)
+        from smart_permissions import log as plog  # the module whose code reads them
+        saved_cap = plog.DECISION_LOG_FULL_INPUT_CHARS
+        saved = (plog.DECISION_LOG_ENABLED, plog.DECISION_LOG_FULL_INPUT, plog.DECISION_LOG_PATH)
         try:
-            p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT = True, True
-            p.DECISION_LOG_PATH = os.path.join(base, 'cap.jsonl')
-            p.DECISION_LOG_FULL_INPUT_CHARS = 40
+            plog.DECISION_LOG_ENABLED, plog.DECISION_LOG_FULL_INPUT = True, True
+            plog.DECISION_LOG_PATH = os.path.join(base, 'cap.jsonl')
+            plog.DECISION_LOG_FULL_INPUT_CHARS = 40
             p.log_decision('pretool', 'Bash', {'command': 'x' * 30 + ' --password "hunter22long"'}, 'ask', 'rule', 'r',
                            state=p.CallState())
-            with open(p.DECISION_LOG_PATH) as f:
+            with open(plog.DECISION_LOG_PATH) as f:
                 r3 = json.loads(f.read().splitlines()[-1])
             check('full capture: capped, a secret cut at the cap still redacted',
                   (len(r3['input']), 'hunter' in r3['input'], r3['truncated'], r3['incomplete']),
                   (40, False, True, True))
         finally:
-            p.DECISION_LOG_FULL_INPUT_CHARS = saved_cap
-            p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH = saved
+            plog.DECISION_LOG_FULL_INPUT_CHARS = saved_cap
+            plog.DECISION_LOG_ENABLED, plog.DECISION_LOG_FULL_INPUT, plog.DECISION_LOG_PATH = saved
         red, hit = p._redact_secrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- and '
                                      'https://user:pw123@git.example/x and ghp_' + 'a' * 30)
         check('redaction: key block, URL password, token', ('MIIabc' in red, 'pw123' in red, 'ghp_' in red, hit),

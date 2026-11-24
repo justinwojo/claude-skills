@@ -139,9 +139,11 @@ def apply_variant(p, base, name):
 def import_hook():
     sys.path.insert(0, os.path.abspath(SCRIPTS))
     from smart_permissions import core as p
-    # Never touch the owner's logs from an eval run.
+    from smart_permissions import log
+    # Never touch the owner's logs from an eval run (log_decision reads the
+    # log module's setting; core's own name is no longer read by it).
     p.log_unknown = lambda *a, **k: None
-    p.DECISION_LOG_ENABLED = False
+    p.DECISION_LOG_ENABLED = log.DECISION_LOG_ENABLED = False
     return p
 
 
