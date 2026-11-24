@@ -6,14 +6,17 @@ call: that is the only place a hook sets it, and leaving the block restores
 the one before. The hook's own flow passes the state explicitly (to
 build_llm_context, log_decision, the hold steps and the judge's scrubbing).
 The rule engine, whose readers sit many calls deep under evaluate_bash, reads
-it with current_state(). Outside a hook (a test, the eval harness) the active
-state is an idle one that knows no directory, unless the caller builds its
-own and activates it.
+it with current_state(). The active state is per thread, so scopes in
+different threads (the eval harness's workers) never see each other's.
+Outside a hook (a test, the eval harness) a thread's active state is its own
+idle one that knows no directory, unless the caller builds its own and
+activates it.
 
 Nothing cached may read it: a memoized reader's answer depends on its
 arguments and the loaded config only (test_package_modules checks that no
 @_memo function in core reaches current_state)."""
 import contextlib
+import threading
 
 
 class CallState:
@@ -49,20 +52,27 @@ class CallState:
         self.reading_words = False
 
 
-_active = CallState()  # idle: no hook call is being decided
+class _Active(threading.local):
+    """Each thread's active state: its own idle one (no hook call is being
+    decided) until a using_state block sets another."""
+
+    def __init__(self):
+        self.state = CallState()
+
+
+_active = _Active()
 
 
 def current_state():
     """The state of the call being decided (an idle one outside a hook)."""
-    return _active
+    return _active.state
 
 
 @contextlib.contextmanager
 def using_state(state):
-    """Make `state` the active one for the block; the previous one after it."""
-    global _active
-    saved, _active = _active, state
+    """Make `state` this thread's active one for the block; the previous one after it."""
+    saved, _active.state = _active.state, state
     try:
         yield state
     finally:
-        _active = saved
+        _active.state = saved

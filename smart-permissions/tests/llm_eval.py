@@ -141,15 +141,26 @@ def import_hook():
     from smart_permissions import core as p
     from smart_permissions import log
     # Never touch the owner's logs from an eval run (log_decision reads the
-    # log module's setting; core's own name is no longer read by it).
+    # log module's setting).
     p.log_unknown = lambda *a, **k: None
-    p.DECISION_LOG_ENABLED = log.DECISION_LOG_ENABLED = False
+    log.DECISION_LOG_ENABLED = False
     return p
 
 
-def case_state(p, case, cwd=None):
-    """The hook call's state for a case: its working directory, no scratchpad."""
-    return p.CallState(*p.session_dirs({"cwd": cwd or case["cwd"]}))
+def case_state(p, case):
+    """The hook call's state for a case: its working directory, no scratchpad.
+    main() keeps one per case (case["state"]) from the rule pass on, so what
+    the rules recorded (top_command) reaches the context and the hold step."""
+    return p.CallState(*p.session_dirs({"cwd": case["cwd"]}))
+
+
+def state_copy(p, state):
+    """A copy of a case's state, for a step that may change it (a retry's
+    context, a worker thread's hold step) while others read the original."""
+    copy = p.CallState(state.cwd, state.scratchpad, state.client_tool)
+    copy.top_command, copy.provenance = state.top_command, state.provenance
+    copy.script_texts = list(state.script_texts)
+    return copy
 
 
 def rule_verdict(p, case):
@@ -248,7 +259,9 @@ def build_sandbox_context(p, case, tmpdir):
                                 "timestamp": _iso(now - 600), "sessionId": session,
                                 "message": {"role": "user", "content": box["brief"].replace("{root}", real)}}) + "\n")
         payload["agent_transcript_path"] = agent
-    state = case_state(p, case, to_real(case["cwd"]))
+    # The case's own state, in the replica's folder while the evidence is read
+    state = case["state"]
+    display_cwd, state.cwd = state.cwd, p.session_dirs({"cwd": to_real(case["cwd"])})[0]
     # Hermetic: the runner's own gh login is no part of the case.
     real_probe = p._probe
     p._probe = lambda argv, *a, **k: None if argv[0] == "gh" else real_probe(argv, *a, **k)
@@ -257,6 +270,7 @@ def build_sandbox_context(p, case, tmpdir):
             context = p.build_llm_context(payload, state)
     finally:
         p._probe = real_probe
+        state.cwd = display_cwd
     case["provenance"], case["script_texts"] = state.provenance, state.script_texts
     context = context.replace(real, display)
     # A snippet cut mid-path leaves a piece of the temp path at its ellipsis.
@@ -290,7 +304,7 @@ def _build_context(p, case, tmpdir):
     payload = {"cwd": case["cwd"], "transcript_path": transcript}
     if case.get("mcp_context"):  # the tool's name picks the notes; no probes run for MCP calls
         payload.update(tool_name=case["tool"], tool_input=case["input"])
-    state = case_state(p, case)
+    state = case["state"]
     with p.using_state(state):
         context = p.build_llm_context(payload, state)
     case["provenance"], case["script_texts"] = state.provenance, state.script_texts
@@ -341,8 +355,10 @@ def outcome_of(p, case, decision, info):
         _, _, developer = p.remote_exec_verdict(decision, "", info, case["remote"])
         return "developer" if developer else "allow"
     if info.get("flagged"):
-        return "hold" if p.HOLDS_ENABLED and p.hold_resolver_info(case["tool"], case["input"], info)[0] == "agent" \
-            else "developer"
+        # In the case's state, as in the hook (its own copy: runs share the case)
+        with p.using_state(state_copy(p, case["state"])):
+            resolver = p.hold_resolver_info(case["tool"], case["input"], info)[0]
+        return "hold" if p.HOLDS_ENABLED and resolver == "agent" else "developer"
     return "allow" if decision == "allow" else "fallthrough"
 
 
@@ -565,7 +581,8 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="sp-llm-eval-")
     atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
     for c in cases:
-        with p.using_state(case_state(p, c)):  # the rules' view of the case, as in the hook
+        c["state"] = case_state(p, c)
+        with p.using_state(c["state"]):  # the rules' view of the case, as in the hook
             c["rule_decision"], c["rule_reason"], c["reaches_llm"] = rule_verdict(p, c)
             c["remote"] = p.remote_exec(c["input"].get("command", "")) if c["tool"] == "Bash" else None
             gap = c["remote"] and p.remote_gap(c["input"].get("command"), c["remote"])
@@ -577,7 +594,7 @@ def main():
         for v in c["sequence"]:
             if v.get("retry_setup"):
                 # the retry sees the evidence again, after the payload changed
-                changed = dict(c, id=f"{c['id']}-{v['name']}",
+                changed = dict(c, id=f"{c['id']}-{v['name']}", state=state_copy(p, c["state"]),
                                sandbox=dict(c["sandbox"], setup=c["sandbox"].get("setup", []) + v["retry_setup"]))
                 v["context"] = build_context(p, changed, tmpdir)
                 v["script_texts"] = changed.get("script_texts", [])

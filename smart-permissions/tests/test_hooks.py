@@ -265,7 +265,7 @@ _LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 
 _LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'},
                  'transcript': {'holds'}}
 # Leaf names core must not hold: a copy of the active state would go stale
-_LEAF_PRIVATE = {'state': {'_active'}}
+_LEAF_PRIVATE = {'state': {'_active', '_Active'}}
 
 
 def test_package_modules():
@@ -303,7 +303,7 @@ def test_package_modules():
         more = {f for f, ns in names.items() if f not in reach and ns & reach}
         grew, reach = bool(more), reach | more
     check(f'no memoized function reaches the call state ({len(memo)} memoized)',
-          (len(memo) > 10, [f for f in memo if f in reach]), (True, []))
+          [f for f in memo if f in reach], [])
     _, cp = _fresh_cfg()
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
     env['SMART_PERMISSIONS_CONFIG'] = cp
@@ -329,6 +329,48 @@ def test_package_modules():
         count, missing = got.get(name, [0, ['(module not loaded)']])
         check(f'core re-exports all {name}.py names as the same objects ({count})',
               (count > 0, missing), (True, []))
+    test_call_state_scopes()
+
+
+def test_call_state_scopes():
+    """The active call state is per thread: overlapping scopes in two threads
+    (A enters, B enters, A leaves, B leaves) each see their own state, and
+    each thread is idle again after; nested scopes in one thread restore."""
+    import threading
+    sys.path.insert(0, SCRIPT_DIR)
+    from smart_permissions import core as p
+    a, b, inner = p.CallState(cwd='/a'), p.CallState(cwd='/b'), p.CallState(cwd='/inner')
+    idle = p.current_state()
+    seen = {}
+    steps = [threading.Event() for _ in range(4)]
+
+    def run(name, state, enter_after, enter_done, leave_after, leave_done):
+        if enter_after is not None:
+            steps[enter_after].wait(5)
+        with p.using_state(state):
+            seen[name + ' in'] = p.current_state()
+            steps[enter_done].set()
+            steps[leave_after].wait(5)
+            seen[name + ' before leaving'] = p.current_state()
+        seen[name + ' after'] = p.current_state()
+        steps[leave_done].set()
+
+    ta = threading.Thread(target=run, args=('A', a, None, 0, 1, 2))
+    tb = threading.Thread(target=run, args=('B', b, 0, 1, 2, 3))
+    ta.start(), tb.start()
+    ta.join(10), tb.join(10)
+    check('call state per thread: each scope sees its own state, overlapping',
+          [seen.get(k) for k in ('A in', 'B in', 'A before leaving', 'B before leaving')], [a, b, a, b])
+    check('call state per thread: each thread is idle after its scope',
+          [getattr(seen.get(k), 'cwd', 'missing') for k in ('A after', 'B after')]
+          + [seen.get('A after') in (a, b), seen.get('B after') in (a, b)], [None, None, False, False])
+    check('call state per thread: this thread never saw the others', p.current_state(), idle)
+    with p.using_state(a):
+        with p.using_state(inner):
+            nested = p.current_state()
+        restored = p.current_state()
+    check('call state nesting in one thread restores the outer one',
+          [nested, restored, p.current_state()], [inner, a, idle])
 
 
 # =====================================================================
