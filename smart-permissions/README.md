@@ -703,6 +703,11 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 ## Changelog
 
+- **1.8.3 (2026-11-24) — bug fixes: script words and quoted heredocs.**
+  - `S=/abs/dir; python3 $S/x.py` (the script word unquoted, `S` set once to a literal earlier in the same command) is the script file `"$S/x.py"` is, when the value can't split, glob or expand further. It went to the judge as code "read from a pipe". The script's own checks apply as before. Any other script word built at run time (one that may split, glob or name stdin) goes to the judge as before, under a reason that says so instead of "a pipe" or "a stream".
+  - Python in a heredoc with a quoted delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`) is read as written: the shell expands nothing there, so a `$` or backtick in it is Python's own text, and no longer stops the read-only check or the config-write check. Unquoted delimiters are read as before.
+  - Tests: the prompt-timeout tests give the learner a timeout well above its start-up time, so a slow start no longer leaves no wait to record.
+
 - **1.8.2 (2026-11-23) — the hook code is a package.**
   - The code of both hooks moved, unchanged, into `scripts/smart_permissions/` (`core.py` and `learner.py`). `scripts/pretool_safety.py` and `scripts/permission_learner.py` are now short entry scripts that import it, so Python runs it from cached bytecode instead of compiling 13,000 lines on every tool call: about half the per-call startup time. `urllib.request` is loaded only when the judge is called.
   - Manual setup: the hooks find `config/` beside the scripts, where the instructions put it. Before, they looked one folder up and every call failed closed. Copy the `smart_permissions` folder too, before the entry scripts (see [Manual setup](#manual-setup)).

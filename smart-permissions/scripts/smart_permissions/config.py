@@ -22,7 +22,7 @@ if (not os.path.isfile(os.path.join(PLUGIN_ROOT, "config", "defaults.json"))
         and os.path.isfile(os.path.join(SCRIPT_DIR, "config", "defaults.json"))):
     PLUGIN_ROOT = SCRIPT_DIR
 # The plugin version (.claude-plugin/marketplace.json), on every log record
-HOOK_VERSION = "1.8.2"
+HOOK_VERSION = "1.8.3"
 HOME_DIR = os.path.expanduser("~")
 
 DEFAULTS_PATH = os.environ.get(
