@@ -19,8 +19,9 @@ SAFETY_HOOK_API_KEY, SAFETY_HOOK_REASONING_EFFORT, ... With no key the
 eval prints SKIP and exits 0. Rule verdicts use the same config files as
 the hook (SMART_PERMISSIONS_CONFIG / ~/.claude/smart-permissions-config.json).
 
-Variants monkeypatch the module in this process only (prompt, recheck
-note, model, efforts); scripts/smart_permissions/core.py is never edited.
+Variants monkeypatch the modules in this process only (prompt, recheck
+note, model, efforts, in smart_permissions.core and .judge); the files
+are never edited.
 
 Usage:
     python3 tests/llm_eval.py                     # baseline, 3 runs per case
@@ -120,10 +121,15 @@ _PATCHED = ("LLM_MODEL", "LLM_REASONING_EFFORT", "LLM_RECHECK_REASONING_EFFORT",
 
 
 def apply_variant(p, base, name):
-    for attr in _PATCHED:
-        setattr(p, attr, base[attr])
-    for attr, value in VARIANTS[name].items():
-        setattr(p, attr, value)
+    # core re-exports the judge's settings, and code in both modules reads them
+    # (the request builder reads judge's own LLM_MODEL and LLM_SAFETY_PROMPT,
+    # the two passes read core's efforts and recheck note): set each in both.
+    from smart_permissions import judge
+    for mod in (p, judge):
+        for attr in _PATCHED:
+            setattr(mod, attr, base[attr])
+        for attr, value in VARIANTS[name].items():
+            setattr(mod, attr, value)
 
 
 # ============================================================

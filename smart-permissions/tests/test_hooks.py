@@ -2084,13 +2084,15 @@ def test_llm_wall_clock_deadline():
 
         calls.clear()
         # budget >= 20 retries; shrink the real sleep by patching _llm_post_once's
-        # first deadline via a small budget wrapper.
-        orig_once = pretool._llm_post_once
-        pretool._llm_post_once = lambda req, s: orig_once(req, min(s, 0.3))
+        # first deadline via a small budget wrapper, rebound in judge: the module
+        # whose _llm_post_with_deadline reads it.
+        from smart_permissions import judge
+        orig_once = judge._llm_post_once
+        judge._llm_post_once = lambda req, s: orig_once(req, min(s, 0.3))
         try:
             result = pretool._llm_post_with_deadline(None, 24)
         finally:
-            pretool._llm_post_once = orig_once
+            judge._llm_post_once = orig_once
         check('hung first attempt → retry succeeds', result, {'v': 'ok'})
         check('retry made exactly two attempts', len(calls), 2)
     finally:
