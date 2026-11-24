@@ -696,6 +696,29 @@ def p_rule_deny_sensitive_write(c):
     return [s]
 
 
+@case
+def p_rule_allow_constant_script_word(c):
+    # 1.8.3: `$S/fit.py` unquoted, S set once to a literal in the same
+    # command, is the script file `"$S/fit.py"` is (it went to the judge as
+    # code read from a pipe)
+    sb = Sandbox()
+    s = run(sb, 'pretool', sb.bash(f'S={sb.tmp}; python3 -I $S/fit.py "$S/out.csv"'), judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=0, events=[('pretool', 'allow', 'rule')])
+    return [s]
+
+
+@case
+def p_judge_script_word_may_split(c):
+    # 1.8.3: a script word that may split (no constant) still goes to the
+    # judge, under a reason that says so rather than "a pipe"
+    sb = Sandbox()
+    s = run(sb, 'pretool', sb.bash('python3 -I $S/fit.py'), judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has='Interpreter runs a script whose path is built at run time',
+           judge_lacks='reads its code from a pipe')
+    return [s]
+
+
 # ---- PreToolUse: asks — silent exit vs explicit developer prompt --------
 
 @case

@@ -7220,10 +7220,25 @@ def _stream_path(word, raw):
         if not path.startswith("/"):  # `cd /dev; python3 stdin`
             return True
         return bool(re.match(r"/(?:dev|proc)(?:/|$)", os.path.normpath(path), re.I))
-    return not re.fullmatch(r'"\$(?:\{\w+\}|\w+)(?:/[\w.+-]+)*/[\w+-][\w.+-]*\.[A-Za-z0-9]+"', raw)
+    return not re.fullmatch(r'"%s"' % _SCALAR_SCRIPT_WORD, raw)
 
 
 _FILE_NAME_TAIL = r"(?:^|/)[\w+-][\w.+-]*\.[A-Za-z0-9]+$"
+# One scalar read, then a literal file name: `$S/fit.py`, `${S}/sub/fit.py`
+_SCALAR_SCRIPT_WORD = r"\$(?:\{(\w+)\}|(\w+))(?:/[\w.+-]+)*/[\w+-][\w.+-]*\.[A-Za-z0-9]+"
+
+
+def _as_quoted_script_word(raw, command):
+    """`raw` double-quoted when it is an unquoted `$S/fit.py` whose name
+    `command` binds to one literal value (_command_constants) that can't
+    split, glob or expand further, so it reads as `"$S/fit.py"` does;
+    `raw` as it is otherwise."""
+    m = command is not None and re.fullmatch(_SCALAR_SCRIPT_WORD, raw)
+    if not m:
+        return raw
+    value = _command_constants(command).get(m.group(1) or m.group(2))
+    # (the constants proof allows only these characters; checked again here)
+    return f'"{raw}"' if value and re.fullmatch(r"[\w./@%+,:-]+", value) else raw
 
 
 def _stays_one_word(raw):
@@ -7297,8 +7312,14 @@ def _interpreter_stdin_verdict(part, command=None):
             j += 1
         else:
             return ask
-    if j < len(args) and args[j] != "-" and not _stream_path(args[j], raws[j]):
-        return None  # a script file; stdin is its data
+    if j < len(args) and args[j] != "-":
+        if not _stream_path(args[j], _as_quoted_script_word(raws[j], command)):
+            return None  # a script file; stdin is its data
+        if _built_word(raws[j]) and not args[j].startswith(("<(", ">(")):
+            # a script named by a word the shell builds: it may split into
+            # others (`-` among them) or name a stream
+            return ("ask", f"Interpreter runs a script whose path is built at run time "
+                           f"(it may split into other words or name stdin): {name}")
     if python and plain and command is not None and (j == len(args) or args[j] == "-") \
             and stdin and stdin[0] == "heredoc" and _python_heredoc_ok(part, command):
         return None  # the code is read here and only transforms data

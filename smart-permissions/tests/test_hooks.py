@@ -8345,6 +8345,46 @@ def _tool_use(tid, name, inp, minutes):
     return rec
 
 
+def test_script_word_and_quoted_heredoc_1_8_3():
+    print('\n--- 1.8.3: an unquoted constant script word; quoted heredocs read literally ---')
+    rf = d('cm0gLXJmIA==')
+    # 1. `S=/lit; python3 $S/x.py`: one script file, as `"$S/x.py"` is
+    allows = ['S=/tmp/sp; python3 -I $S/fit.py "$S/out.csv"', 'S=/tmp/sp; python3 ${S}/sub/fit.py',
+              'S=/tmp/sp; python3 -u -B $S/fit.py -- --flag', 'S=/tmp/sp; node $S/build.js',
+              'S=/tmp/sp; echo x | python3 $S/fit.py', 'S=~/Dev/proj; python3 $S/fit.py | tail -3',
+              "S='/tmp/sp'; timeout 60 python3 $S/fit.py", 'S=/tmp/sp\npython3 $S/fit.py']
+    # … only when the word can't split, glob or expand: today's ask, and its
+    # reason no longer says the code comes from a pipe
+    asks = ['python3 $S/fit.py', "S='a b'; python3 $S/fit.py", 'S=/tmp/*; python3 $S/fit.py',
+            'S=/tmp/a; S=/tmp/b; python3 $S/fit.py', 'for S in /a /b; do python3 $S/fit.py; done',
+            'S=/tmp/sp; IFS=/; python3 $S/fit.py', 'S=/tmp/sp; python3 $S/fit.py <<< data',
+            'export S=/tmp/sp; python3 $S/fit.py', 'S=/tmp/sp; python3 $S$T/fit.py',
+            'S=/tmp/sp; python3 $S/*.py', "A='- x'; python3 $A/fit.py <<< 'import os'",
+            'S=/tmp/sp; f() { python3 $S/fit.py; }; f', 'P=/tmp/sp/fit.py; python3 $P a.json',
+            'echo x | python3 "$X"']
+    _phase3_check('1.8.3 script word', [], asks, allows)
+    res = _both_hooks(asks + ["echo 'import os' | python3", "echo 'import os' | python3 -",
+                              "echo 'import os' | python3 /dev/stdin"])
+    for cmd, r in zip(asks, res):
+        check(f'1.8.3 script word: the reason names the script word: {cmd!r}',
+              ('from a pipe' in (r[1] or ''), 'script whose path is built at run time' in (r[1] or '')),
+              (False, True))
+    for r in res[len(asks):]:
+        check('1.8.3 a real pipe into the interpreter still says so', 'from a pipe' in (r[1] or ''), True)
+    # Parity through the whole PreToolUse hook (protected deletes, C9, the
+    # scratch rules): the unquoted word gets the quoted word's verdict
+    cfg, cp = _fresh_cfg()
+    work = tempfile.mkdtemp(prefix='sp-183-')
+    atexit.register(shutil.rmtree, work, ignore_errors=True)
+    for template in ['S=/tmp/sp; python3 -I {w}', 'S=/tmp/sp; python3 {w}; ' + rf + '~',
+                     'S=/tmp/sp; python3 {w} > ~/.claude/settings.json', 'S=/tmp/sp; python3 {w} | sh',
+                     'S=/tmp/sp; python3 {w}; ' + rf + '$S/out', 'S=/tmp/sp; python3 {w}; frobnicate']:
+        got = [_run_cfg(PRETOOL, {'tool_name': 'Bash', 'cwd': work,
+                                  'tool_input': {'command': template.format(w=w)}}, cp, full=True)
+               for w in ('$S/fit.py', '"$S/fit.py"')]
+        check(f'1.8.3 script word: same verdict as the quoted word: {template!r}', got[0], got[1])
+
+
 def test_remote_provenance_1_8_1():
     print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')
     sys.path.insert(0, SCRIPT_DIR)
@@ -8804,6 +8844,7 @@ if __name__ == '__main__':
     test_prompt_timeout_1_8_0()
     test_script_hazard_1_8_0()
     test_remote_provenance_1_8_1()
+    test_script_word_and_quoted_heredoc_1_8_3()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
