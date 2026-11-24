@@ -65,7 +65,9 @@ from .core import (
     _elapsed_ms,
     _loggable_reason,
     _quietly,
-    set_hook_cwd,
+    session_dirs,
+    CallState,
+    using_state,
     _FAIL_CLOSED,
     CONTEXT_TRANSCRIPT_TAIL_BYTES,
     PROMPT_TIMEOUT_S,
@@ -164,7 +166,7 @@ def _prompt_answered(input_data):
     return bool(calls) and all(c in results for c in calls)
 
 
-def _developer_prompt(input_data, tool, tool_input, reason, start, rule_reason):
+def _developer_prompt(state, input_data, tool, tool_input, reason, start, rule_reason):
     """Leave the call to the developer's prompt (the ask is logged already).
     With a prompt timeout, in a session someone attends: wait out the rest
     of it in one sleep, then deny with parked_message, unless the developer
@@ -180,10 +182,11 @@ def _developer_prompt(input_data, tool, tool_input, reason, start, rule_reason):
     minutes = PROMPT_TIMEOUT_S / 60
     log_decision("permission_request", tool, tool_input, "deny", "prompt-timeout",
                  f"No answer to the prompt within {minutes:g} min; denied and parked for the "
-                 f"developer ({_loggable_reason(reason)})",
-                 duration_ms=_elapsed_ms(start), rule_reason=rule_reason, hold="prompt-timeout")
+                 f"developer ({_loggable_reason(reason, state.script_texts)})",
+                 duration_ms=_elapsed_ms(start), rule_reason=rule_reason, hold="prompt-timeout",
+                 state=state)
     try:
-        _emit_deny(parked_message(scrub_script_text(reason), minutes))
+        _emit_deny(parked_message(scrub_script_text(reason, state.script_texts), minutes))
         sys.stdout.flush()
     except (BrokenPipeError, OSError):  # Claude Code stopped listening
         pass
@@ -193,20 +196,23 @@ def _developer_prompt(input_data, tool, tool_input, reason, start, rule_reason):
 def main():
     """The hook. Any failure inside (a RecursionError on a deeply nested
     command, a parser bug) falls through to the normal permission prompt:
-    never an allow, never a crash with no verdict."""
-    try:
-        _main()
-    except Exception as e:
+    never an allow, never a crash with no verdict. The call's state (see
+    CallState) is created here and is the active one throughout."""
+    state = CallState()
+    with using_state(state):
         try:
-            log_decision("permission_request", "", {}, "ask", "learner",
-                         f"smart-permissions could not evaluate this call ({type(e).__name__})",
-                         rule_reason="hook error")
-        except Exception:
-            pass
-        sys.exit(0)
+            _main(state)
+        except Exception as e:
+            try:
+                log_decision("permission_request", "", {}, "ask", "learner",
+                             f"smart-permissions could not evaluate this call ({type(e).__name__})",
+                             rule_reason="hook error", state=state)
+            except Exception:
+                pass
+            sys.exit(0)
 
 
-def _main():
+def _main(state):
     start = time.monotonic()
     try:
         input_data = json.loads(sys.stdin.read())
@@ -214,28 +220,28 @@ def _main():
         # Can't parse — let the normal prompt show, but still record it.
         log_decision("permission_request", "", {}, "ask", "learner",
                      "Could not parse hook input", duration_ms=_elapsed_ms(start),
-                     rule_reason="malformed hook input")
+                     rule_reason="malformed hook input", state=state)
         sys.exit(0)
 
     if not isinstance(input_data, dict):
         input_data = {}
     # their-M2: a JSON null tool_input must not crash the hook — coerced to {}.
-    tool, tool_input = parse_hook_payload(input_data)
+    tool, tool_input, state.client_tool = parse_hook_payload(input_data)
 
-    set_hook_cwd(input_data)
+    state.cwd, state.scratchpad = session_dirs(input_data)
     # The built-in question tool (this exact name; an MCP tool ending in
     # it is an ordinary tool): its prompt is the question itself, so no
     # decision and no judge
     if tool == "AskUserQuestion":
         log_decision("permission_request", tool, tool_input, "ask", "learner",
                      "AskUserQuestion is answered by the human", duration_ms=_elapsed_ms(start),
-                     rule_reason="built-in question tool")
+                     rule_reason="built-in question tool", state=state)
         sys.exit(0)
     verdict, reason = classify_request(tool, tool_input)
 
     if verdict == "deny":
         log_decision("permission_request", tool, tool_input, "deny", "learner",
-                     reason, duration_ms=_elapsed_ms(start), rule_reason=reason)
+                     reason, duration_ms=_elapsed_ms(start), rule_reason=reason, state=state)
         # The reason says what to do instead (a steer's rewrite, or the
         # alternative to a blocked pattern), as PreToolUse shows it.
         _emit_deny(reason)
@@ -247,8 +253,8 @@ def _main():
     if verdict == "ask" or not llm_is_configured() and not flagged:
         shown = reason if verdict == "ask" else llm_not_configured_reason()
         log_decision("permission_request", tool, tool_input, "ask", "learner",
-                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, shown, start, reason)
+                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason, state=state)
+        _developer_prompt(state, input_data, tool, tool_input, shown, start, reason)
 
     # verdict == "consult": lean on the LLM, human as last resort.
     # PreToolUse already ran both LLM passes on this exact call and
@@ -259,8 +265,8 @@ def _main():
     # call itself.
     if flagged:
         log_decision("permission_request", tool, tool_input, "ask", "llm-recheck",
-                     flagged, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, flagged, start, reason)
+                     flagged, duration_ms=_elapsed_ms(start), rule_reason=reason, state=state)
+        _developer_prompt(state, input_data, tool, tool_input, flagged, start, reason)
     remote = remote_exec(tool_input.get("command", "")) if tool == "Bash" else None
     gap = remote and remote_gap(tool_input.get("command"), remote)
     # …or in a local shell script the call runs
@@ -272,11 +278,11 @@ def _main():
     if gap:  # a payload the judge can't see: the developer's, no judge call
         shown = f"Remote or production execution ({remote}): {gap}"
         log_decision("permission_request", tool, tool_input, "ask", "rule",
-                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason)
-        _developer_prompt(input_data, tool, tool_input, shown, start, reason)
+                     shown, duration_ms=_elapsed_ms(start), rule_reason=reason, state=state)
+        _developer_prompt(state, input_data, tool, tool_input, shown, start, reason)
     decision, llm_reason, info = llm_evaluate(
-        tool, tool_input, timeout=15, context=build_llm_context(input_data),
-        rule_reason=reason)
+        tool, tool_input, timeout=15, context=build_llm_context(input_data, state),
+        rule_reason=reason, script_texts=state.script_texts)
     source = info["source"]
     llm_ms = info.get("llm_ms")
     if remote:  # the same strict policy as PreToolUse: confident, payload visible
@@ -284,14 +290,14 @@ def _main():
     if decision == "allow":
         log_decision("permission_request", tool, tool_input, "allow",
                      source, llm_reason, duration_ms=_elapsed_ms(start),
-                     llm_ms=llm_ms, rule_reason=reason)
+                     llm_ms=llm_ms, rule_reason=reason, state=state)
         _emit_allow()
         return
     # Confirmed flag, LLM error or unparseable → manual prompt.
     log_decision("permission_request", tool, tool_input, "ask", source,
                  llm_reason, duration_ms=_elapsed_ms(start), llm_ms=llm_ms,
-                 rule_reason=reason)
-    _developer_prompt(input_data, tool, tool_input, llm_reason, start, reason)
+                 rule_reason=reason, state=state)
+    _developer_prompt(state, input_data, tool, tool_input, llm_reason, start, reason)
 
 
 def classify_request(tool, tool_input):

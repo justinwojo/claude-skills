@@ -145,9 +145,14 @@ def import_hook():
     return p
 
 
+def case_state(p, case, cwd=None):
+    """The hook call's state for a case: its working directory, no scratchpad."""
+    return p.CallState(*p.session_dirs({"cwd": cwd or case["cwd"]}))
+
+
 def rule_verdict(p, case):
-    """(decision, reason, reaches_llm) the way the PreToolUse hook gets them."""
-    p.set_hook_cwd({"cwd": case["cwd"]})
+    """(decision, reason, reaches_llm) the way the PreToolUse hook gets them,
+    under the case's state (the caller's `with p.using_state(...)`)."""
     tool, inp = case["tool"], case["input"]
     if tool == "Bash":
         decision, reason = p.evaluate_bash(inp.get("command", ""), log_unknowns=False)
@@ -241,16 +246,16 @@ def build_sandbox_context(p, case, tmpdir):
                                 "timestamp": _iso(now - 600), "sessionId": session,
                                 "message": {"role": "user", "content": box["brief"].replace("{root}", real)}}) + "\n")
         payload["agent_transcript_path"] = agent
-    p.set_hook_cwd({"cwd": to_real(case["cwd"])})
+    state = case_state(p, case, to_real(case["cwd"]))
     # Hermetic: the runner's own gh login is no part of the case.
     real_probe = p._probe
     p._probe = lambda argv, *a, **k: None if argv[0] == "gh" else real_probe(argv, *a, **k)
     try:
-        context = p.build_llm_context(payload)
+        with p.using_state(state):
+            context = p.build_llm_context(payload, state)
     finally:
         p._probe = real_probe
-    case["provenance"] = p.LLM_CONTEXT_PROVENANCE
-    p.set_hook_cwd({"cwd": case["cwd"]})
+    case["provenance"], case["script_texts"] = state.provenance, state.script_texts
     context = context.replace(real, display)
     # A snippet cut mid-path leaves a piece of the temp path at its ellipsis.
     for k in range(len(real) - 1, 7, -1):
@@ -283,7 +288,10 @@ def _build_context(p, case, tmpdir):
     payload = {"cwd": case["cwd"], "transcript_path": transcript}
     if case.get("mcp_context"):  # the tool's name picks the notes; no probes run for MCP calls
         payload.update(tool_name=case["tool"], tool_input=case["input"])
-    context = p.build_llm_context(payload)
+    state = case_state(p, case)
+    with p.using_state(state):
+        context = p.build_llm_context(payload, state)
+    case["provenance"], case["script_texts"] = state.provenance, state.script_texts
     # The hook's note on which copy of the guard is live (a pure function of
     # the input, so no probes run for it); the payload above carries the
     # input only for MCP cases, where build_llm_context already added it
@@ -341,7 +349,8 @@ def run_one(p, case, run, variant):
     t0 = time.monotonic()
     rule_reason = case["rule_reason"] if case["reaches_llm"] else None
     decision, reason, info = p.llm_evaluate(
-        case["tool"], case["input"], context=case["context"], rule_reason=rule_reason)
+        case["tool"], case["input"], context=case["context"], rule_reason=rule_reason,
+        script_texts=case.get("script_texts", []))
     passes = _tls.passes
     wall_ms = int((time.monotonic() - t0) * 1000)
     first = passes[0].get("decision") if passes else None
@@ -365,7 +374,7 @@ def run_one(p, case, run, variant):
         t1 = time.monotonic()
         d2, r2, _ = p.llm_evaluate_retry(
             case["tool"], case["input"], hold, v["answer"], context=v.get("context", case["context"]),
-            rule_reason=rule_reason)
+            rule_reason=rule_reason, script_texts=v.get("script_texts", case.get("script_texts", [])))
         retries.append({"name": v["name"], "expect": v["expect"], "natural": natural,
                         "result": "clear" if d2 == "allow" else "developer", "reason": r2,
                         "ms": int((time.monotonic() - t1) * 1000)})
@@ -554,9 +563,10 @@ def main():
     tmpdir = tempfile.mkdtemp(prefix="sp-llm-eval-")
     atexit.register(shutil.rmtree, tmpdir, ignore_errors=True)
     for c in cases:
-        c["rule_decision"], c["rule_reason"], c["reaches_llm"] = rule_verdict(p, c)
-        c["remote"] = p.remote_exec(c["input"].get("command", "")) if c["tool"] == "Bash" else None
-        gap = c["remote"] and p.remote_gap(c["input"].get("command"), c["remote"])
+        with p.using_state(case_state(p, c)):  # the rules' view of the case, as in the hook
+            c["rule_decision"], c["rule_reason"], c["reaches_llm"] = rule_verdict(p, c)
+            c["remote"] = p.remote_exec(c["input"].get("command", "")) if c["tool"] == "Bash" else None
+            gap = c["remote"] and p.remote_gap(c["input"].get("command"), c["remote"])
         if gap:  # the developer's before any judge call, as in the hooks
             c["rule_decision"], c["rule_reason"], c["reaches_llm"] = "ask", f"remote exec: {gap}", False
         elif c["remote"] and not c["reaches_llm"] and c["rule_decision"] == "allow":
@@ -568,6 +578,7 @@ def main():
                 changed = dict(c, id=f"{c['id']}-{v['name']}",
                                sandbox=dict(c["sandbox"], setup=c["sandbox"].get("setup", []) + v["retry_setup"]))
                 v["context"] = build_context(p, changed, tmpdir)
+                v["script_texts"] = changed.get("script_texts", [])
 
     if args.context:
         for c in cases:
