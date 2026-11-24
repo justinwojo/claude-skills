@@ -7951,6 +7951,12 @@ def test_review_fixes_1_7_0():
           cx_prov._stash_made_in('echo "a; b" && git stash push -m wip', repo, top), True)
 
 
+# The prompt timeout the wait tests give the learner: far above the time the
+# hook takes to start and reach its wait (a timeout already used up by then
+# leaves nothing to sleep), and free, as _wait_patch caps each sleep at 0.2 s.
+_WAIT_S = 30.0
+
+
 def _wait_patch(timeout_s, sleeps):
     """_run_cfg patch: the learner's prompt timeout set to `timeout_s` (None:
     as configured), each wait appended to the file `sleeps` and slept."""
@@ -8006,10 +8012,10 @@ def test_prompt_timeout_1_8_0():
     sl = os.path.join(cfg, 'sleeps')
     outs = []
     t0 = time.monotonic()
-    got = _run_cfg(LEARNER, unknown, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl), outputs=outs)
+    got = _run_cfg(LEARNER, unknown, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl), outputs=outs)
     check('parked: denied after the wait', got, 'deny')
     check('parked: one sleep, no longer than the timeout',
-          (len(_sleeps(sl)), all(0 < s <= 0.05 for s in _sleeps(sl))), (1, True))
+          (len(_sleeps(sl)), all(0 < s <= _WAIT_S for s in _sleeps(sl))), (1, True))
     check('parked: the hook returned promptly', time.monotonic() - t0 < 10, True)
     dec = _learner_out(outs[-1])
     msg = dec.get('message', '')
@@ -8038,7 +8044,7 @@ def test_prompt_timeout_1_8_0():
         cfg, cp = _fresh_cfg(initial)
         sl = os.path.join(cfg, 'sleeps')
         env = dict(env)
-        patch = _wait_patch(None if initial else 0.05, sl)
+        patch = _wait_patch(None if initial else _WAIT_S, sl)
         if env.get('CLAUDE_CODE_SESSION_ATTENDED') == '':
             env.pop('CLAUDE_CODE_SESSION_ATTENDED')
             patch += "import os as _o\n_o.environ.pop('CLAUDE_CODE_SESSION_ATTENDED', None)\n"
@@ -8046,7 +8052,7 @@ def test_prompt_timeout_1_8_0():
         check(f'no wait ({title}): falls through to the prompt', (got, _sleeps(sl)), (('ask', False), []))
     cfg, cp = _fresh_cfg()
     sl = os.path.join(cfg, 'sleeps')
-    patch = _wait_patch(0.05, sl) + "import os as _o\n_o.environ.pop('CLAUDE_CODE_SESSION_ATTENDED', None)\n"
+    patch = _wait_patch(_WAIT_S, sl) + "import os as _o\n_o.environ.pop('CLAUDE_CODE_SESSION_ATTENDED', None)\n"
     check('no attended flag, interactive entrypoint: waits',
           (_run_cfg(LEARNER, unknown, cp, extra_env={'CLAUDE_CODE_ENTRYPOINT': 'cli'}, patch=patch),
            len(_sleeps(sl))), ('deny', 1))
@@ -8062,7 +8068,7 @@ def test_prompt_timeout_1_8_0():
         cfg, cp = _fresh_cfg()
         sl = os.path.join(cfg, 'sleeps')
         outs = []
-        got = _run_cfg(LEARNER, payload, cp, llm=llm, extra_env=_attended(), patch=_wait_patch(0.05, sl),
+        got = _run_cfg(LEARNER, payload, cp, llm=llm, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl),
                        outputs=outs)
         check(f'no wait ({title})', (got, _sleeps(sl)), (want, []))
         if want == 'deny':
@@ -8075,7 +8081,7 @@ def test_prompt_timeout_1_8_0():
     outs = []
     check('judge flag: parked after the wait',
           _run_cfg(LEARNER, unknown, cp, llm=[_HFLAG, _HFLAG], extra_env=_attended(),
-                   patch=_wait_patch(0.05, sl), outputs=outs), 'deny')
+                   patch=_wait_patch(_WAIT_S, sl), outputs=outs), 'deny')
     check('judge flag: its reason in the message',
           'deletes runner checkouts' in _learner_out(outs[-1]).get('message', ''), True)
     cfg, cp = _fresh_cfg()
@@ -8087,7 +8093,7 @@ def test_prompt_timeout_1_8_0():
     outs = []
     check('explicit ask: the learner parks it, never allows',
           _run_cfg(LEARNER, k_exec, cp, llm={'safe': True, 'confident': True}, extra_env=_attended(),
-                   patch=_wait_patch(0.05, sl), outputs=outs), 'deny')
+                   patch=_wait_patch(_WAIT_S, sl), outputs=outs), 'deny')
     check('explicit ask: the reason the developer saw',
           'Remote or production execution (kubectl exec)' in _learner_out(outs[-1]).get('message', ''), True)
     cfg, cp = _fresh_cfg()
@@ -8096,7 +8102,7 @@ def test_prompt_timeout_1_8_0():
     outs = []
     check('explicit ask, no judge: parked with the reason PreToolUse gave, not the judge setup',
           (_run_cfg(LEARNER, gap_call, cp, extra_env=_attended(),
-                    patch=_wait_patch(0.05, os.path.join(cfg, 'sleeps')), outputs=outs),
+                    patch=_wait_patch(_WAIT_S, os.path.join(cfg, 'sleeps')), outputs=outs),
            'Remote or production execution (kubectl exec)' in _learner_out(outs[-1]).get('message', '')),
           ('deny', True))
     cfg, cp = _fresh_cfg()
@@ -8104,7 +8110,7 @@ def test_prompt_timeout_1_8_0():
     check('remote payload gap in the learner: parked',
           _run_cfg(LEARNER, {'tool_name': 'Bash', 'tool_input': {'command': 'kubectl exec -i w -- bash < d.sh'},
                              'cwd': work}, cp, llm={'safe': True, 'confident': True}, extra_env=_attended(),
-                   patch=_wait_patch(0.05, os.path.join(cfg, 'sleeps')), outputs=outs), 'deny')
+                   patch=_wait_patch(_WAIT_S, os.path.join(cfg, 'sleeps')), outputs=outs), 'deny')
 
     # The developer answered first: the transcript holds the call's result.
     cfg, cp = _fresh_cfg()
@@ -8121,21 +8127,31 @@ def test_prompt_timeout_1_8_0():
                                                        'content': 'ok'}]}}
     write(use, result)
     sl = os.path.join(cfg, 'sleeps')
-    got = _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl), full=True)
+    got = _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl), full=True)
     check('answered first: no deny after the wait', (got, len(_sleeps(sl))), (('ask', False), 1))
     check('answered first: no timeout record',
           [r.get('source') for r in _decision_records(cfg) if r.get('source') == 'prompt-timeout'], [])
+    # 1.8.3: a slow start (here 0.3 s before the wait, as on a loaded machine)
+    # still leaves a wait to sleep; with a 0.05 s timeout it left none
+    os.remove(sl)
+    slow = ("_u = _m._unattended\n"
+            "def _slow():\n"
+            "    _t.sleep(0.3)\n"
+            "    return _u()\n"
+            "_m._unattended = _slow\n")
+    got = _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl) + slow, full=True)
+    check('answered first, slow start: still one wait, no deny', (got, len(_sleeps(sl))), (('ask', False), 1))
     other = {'type': 'assistant', 'message': {'content': [
         {'type': 'tool_use', 'id': 'tu2', 'name': 'Bash', 'input': unknown['tool_input']}]}}
     write(use, result, other)  # an earlier identical call answered; this one is not
     check('only the latest identical call counts',
-          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl)), 'deny')
     write(other, use, result)  # a pending identical call: no telling which one this prompt is
     check('an identical call still pending: parked',
-          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl)), 'deny')
     write(use)
     check('no result yet: parked',
-          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(0.05, sl)), 'deny')
+          _run_cfg(LEARNER, call, cp, extra_env=_attended(), patch=_wait_patch(_WAIT_S, sl)), 'deny')
 
     # The parked message: judge words that quote a script shown to it are scrubbed.
     sys.path.insert(0, SCRIPT_DIR)
