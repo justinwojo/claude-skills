@@ -365,10 +365,11 @@ def outcome_of(p, case, decision, info):
 
 
 def run_one(p, case, run, variant):
+    from smart_permissions import holds, judge
     _tls.passes = []
     t0 = time.monotonic()
     rule_reason = case["rule_reason"] if case["reaches_llm"] else None
-    decision, reason, info = p.llm_evaluate(
+    decision, reason, info = judge.llm_evaluate(
         case["tool"], case["input"], context=case["context"], rule_reason=rule_reason,
         script_texts=case.get("script_texts", []))
     passes = _tls.passes
@@ -386,13 +387,13 @@ def run_one(p, case, run, variant):
         if natural:
             flag = re.sub(r"^LLM:\s*", "", reason).strip().rstrip(".")
             hold = {"reason": f"the judge flagged it ({flag})",
-                    "question": (verdict.get("question") or "").strip() or p._HOLD_DEFAULT_QUESTION}
+                    "question": (verdict.get("question") or "").strip() or holds._HOLD_DEFAULT_QUESTION}
         else:
             hold = case.get("hold") or {"reason": f"the judge flagged it ({case['title']})",
-                                        "question": p._HOLD_DEFAULT_QUESTION}
+                                        "question": holds._HOLD_DEFAULT_QUESTION}
         _tls.passes = []
         t1 = time.monotonic()
-        d2, r2, _ = p.llm_evaluate_retry(
+        d2, r2, _ = judge.llm_evaluate_retry(
             case["tool"], case["input"], hold, v["answer"], context=v.get("context", case["context"]),
             rule_reason=rule_reason, script_texts=v.get("script_texts", case.get("script_texts", [])))
         retries.append({"name": v["name"], "expect": v["expect"], "natural": natural,
@@ -576,6 +577,7 @@ def main():
     args = ap.parse_args()
 
     p = import_hook()
+    from smart_permissions import judge
     cases = load_cases()
     if args.case:
         cases = [c for c in cases if c["id"] in set(args.case)]
@@ -616,7 +618,7 @@ def main():
                     print("   messages: " + " | ".join(c["messages"]))
         return 0
 
-    if not p.llm_is_configured():
+    if not judge.llm_is_configured():
         print("SKIP: LLM judge not configured (set SAFETY_HOOK_MODEL and SAFETY_HOOK_API_KEY)")
         return 0
 
@@ -628,7 +630,6 @@ def main():
         ap.error(f"unknown variant(s): {', '.join(unknown)}")
 
     llm_cases = [c for c in cases if c["reaches_llm"] or args.include_unreached]
-    from smart_permissions import judge
     base = {attr: getattr(judge, attr) for attr in _PATCHED}
     instrument()
     print(f"model {judge.LLM_MODEL}, effort {judge.LLM_REASONING_EFFORT or 'default'}, "

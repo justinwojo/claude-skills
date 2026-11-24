@@ -52,49 +52,22 @@ from urllib.parse import urlparse
 
 
 from .config import (
-    SCRIPT_DIR, PLUGIN_ROOT, HOOK_VERSION, HOME_DIR, DEFAULTS_PATH, USER_CONFIG_PATH, UNKNOWN_LOG,
-    SUBTRACTABLE_KEYS, _SAFETY_LIST_KEYS, _SAFETY_DICT_KEYS, load_config, IS_WINDOWS, _expand_path,
-    _as_list, _strip_comments, _CONFIG, _DEFAULTS_OK, _FAIL_CLOSED, _ALL_SAFE_COMMANDS,
-    SAFE_COMMANDS, SAFE_COMMANDS_MULTI, SAFE_COMMANDS_WILD, _has_interior_wildcard,
-    SAFE_COMMANDS_WORDWISE, SAFE_WRITE_PATHS, SAFE_SCRIPT_PATHS, ALLOWED_WEB_DOMAINS,
-    SAFE_MCP_TOOLS, MCP_CONTEXT, SENSITIVE_PATHS, RESERVED_TOOLS, _configured_internal,
-    _reserved_attempt, SAFE_INTERNAL_TOOLS, ALWAYS_ASK_WRITE_PATHS, DANGEROUS_PATTERNS,
-    RISKY_PATTERNS, PROTECTED_DELETE_PATHS, _raw_interp, INTERPRETER_EXEC_FLAGS, _HOOK_STATE_DIR,
-    DECISION_LOG_ENABLED, _decision_log_override, DECISION_LOG_PATH, DECISION_LOG_MAX_BYTES,
-    DECISION_LOG_INPUT_CHARS, DECISION_LOG_FLAGGED_INPUT_CHARS, DECISION_LOG_FULL_INPUT,
-    DECISION_LOG_FULL_INPUT_CHARS, LLM_FLAG_PATH, LLM_FLAG_TTL_S, HOLDS_ENABLED, HOLD_DIR,
-    PROMPT_TIMEOUT_DEFAULT_MINUTES, PROMPT_TIMEOUT_MAX_MINUTES, _prompt_timeout_s,
-    PROMPT_TIMEOUT_S, LLM_ENV_FILE, _state_path,
+    HOME_DIR, USER_CONFIG_PATH, IS_WINDOWS, _FAIL_CLOSED, SAFE_COMMANDS, SAFE_COMMANDS_MULTI,
+    SAFE_COMMANDS_WILD, SAFE_COMMANDS_WORDWISE, SAFE_WRITE_PATHS, SAFE_SCRIPT_PATHS,
+    ALLOWED_WEB_DOMAINS, SAFE_MCP_TOOLS, SENSITIVE_PATHS, SAFE_INTERNAL_TOOLS,
+    ALWAYS_ASK_WRITE_PATHS, DANGEROUS_PATTERNS, RISKY_PATTERNS, PROTECTED_DELETE_PATHS,
+    INTERPRETER_EXEC_FLAGS, DECISION_LOG_PATH, LLM_FLAG_PATH, HOLDS_ENABLED, LLM_ENV_FILE,
 )
 
 
-from .judge import (
-    _LLM_ENV_KEYS, _LLM_ENV_FILE_MAX_BYTES, _load_llm_env_file, _llm_setting, _LLM_ENV_FILE_VALUES,
-    LLM_ENV_FILE_NOTE, ANTHROPIC_MESSAGES_URL, LLM_API_URL, LLM_MODEL, _detect_llm_provider,
-    LLM_PROVIDER, LLM_API_KEY, ANTHROPIC_MAX_TOKENS, ANTHROPIC_EFFORTS, LLM_REASONING_EFFORT,
-    LLM_RECHECK_REASONING_EFFORT, LLM_RECHECK_MIN_S, LLM_PRETOOL_BUDGET_S, DEBUG,
-    LLM_SAFETY_PROMPT, LLM_RECHECK_NOTE, llm_is_configured, llm_not_configured_reason,
-    _extract_json_decision, _llm_post_once, _LLM_RETRY_HTTP_CODES, _retry_after_s,
-    _llm_post_with_deadline, _SAFETY_SCHEMA, _anthropic_effort, _build_llm_http_request,
-    _llm_refused, _llm_response_text, _llm_request, _flag_text, llm_evaluate, scrub_script_text,
-    _llm_user_prompt, _llm_evaluate, remote_exec_verdict, llm_evaluate_retry,
-)
-
-
-from .transcript import (
-    CONTEXT_MAX_MESSAGES, CONTEXT_MAX_MESSAGE_CHARS, CONTEXT_TRANSCRIPT_TAIL_BYTES,
-    _SYSTEM_REMINDER_RE, _message_text, recent_user_messages, _ts_seconds, agent_answer_since,
-)
+from .judge import llm_evaluate, remote_exec_verdict
 
 
 # ============================================================
 # EVALUATION LOGIC
 # ============================================================
 
-from .log import (
-    log_unknown, _decision_log_input, _CREDENTIAL_NAME, _SECRET_PATTERNS, _SECRET_KEY_RE,
-    _redact_values, _redact_secrets, _append_log_line, _loggable_reason, log_decision,
-)
+from .log import log_unknown, log_decision
 
 
 from .util import (
@@ -105,14 +78,10 @@ from .util import (
 from .state import CallState, current_state, using_state
 
 
-from .payload import (
-    _FOREIGN_TOOL_ALIASES, _FOREIGN_FILE_TOOLS, parse_hook_payload,
-)
+from .payload import parse_hook_payload
 
 
-from .flags import (
-    _call_key, _flag_put, _flag_get, _read_json_dict,
-)
+from .flags import _flag_put
 
 
 # ============================================================
@@ -1555,14 +1524,6 @@ def _split_one(word):
     except ValueError:
         return None
     return words[0] if len(words) == 1 else None
-
-
-from .holds import (
-    HOLD_TTL_S, HOLD_SESSION_CAP, HOLD_CAP_WINDOW_S, HOLD_PRUNE_S, HOLD_ANSWER_CHARS,
-    HOLD_CLAIM_CHARS, HOLD_QUESTION_CHARS, _HOLD_DEFAULT_QUESTION, LLM_HOLD_RETRY_NOTE, hold_key,
-    acting_transcript, _hold_path, hold_get, _hold_write, hold_create, hold_claim, hold_finish,
-    hold_count,
-)
 
 
 # Remote or production execution: a command or script run on another system.

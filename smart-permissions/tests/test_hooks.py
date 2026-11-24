@@ -154,12 +154,12 @@ def test_entry_shims():
     probe = (
         'import sys, json\nsys.path.insert(0, %r)\n'
         'import pretool_safety, permission_learner\n'
-        'from smart_permissions import core, learner\n'
+        'from smart_permissions import config, core, learner\n'
         'pretool_safety._probe = "/x/rebound"\n'
         'core.evaluate("Read", {"file_path": "/etc/hosts"})\n'
         'print(json.dumps([pretool_safety is core, permission_learner is learner,\n'
         '                  core._probe, learner.evaluate_bash is core.evaluate_bash,\n'
-        '                  "urllib.request" in sys.modules, core.SCRIPT_DIR, core.PLUGIN_ROOT]))\n'
+        '                  "urllib.request" in sys.modules, config.SCRIPT_DIR, config.PLUGIN_ROOT]))\n'
     ) % SCRIPT_DIR
     r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
     try:
@@ -203,24 +203,27 @@ def test_entry_shims():
     os.makedirs(broken)
     for n in (PRETOOL, LEARNER):
         shutil.copy(n, broken)
-    with open(os.path.join(SCRIPT_DIR, 'smart_permissions', 'learner.py')) as f:
-        real_learner = f.read()
     exits = 'import sys\ndef main():\n    print("{}")\n    sys.exit(0)\n'
     read = json.dumps({'tool_name': 'Read', 'tool_input': {'file_path': '/etc/hosts'}})
     for label, core_src, learner_src, extra in (
             ('missing package', None, None, {}),
             # a package elsewhere on the import path is not this install's
             ('only a package elsewhere on PYTHONPATH', None, None, {'PYTHONPATH': os.path.abspath(SCRIPT_DIR)}),
-            ('package that does not import', 'x = (\n', real_learner, {}),
+            # the real package with a core that does not compile (learner_src None: the real learner)
+            ('package that does not import', 'x = (\n', None, {}),
             ('main that exits', exits, 'from . import core\n' + exits, {})):
         if core_src is not None:
             pkg_dir = os.path.join(broken, 'smart_permissions')
+            shutil.rmtree(pkg_dir, ignore_errors=True)
+            if learner_src is None:
+                shutil.copytree(os.path.join(SCRIPT_DIR, 'smart_permissions'), pkg_dir,
+                                ignore=shutil.ignore_patterns('__pycache__'))
             os.makedirs(pkg_dir, exist_ok=True)
             open(os.path.join(pkg_dir, '__init__.py'), 'w').close()
             for name, src in (('core.py', core_src), ('learner.py', learner_src)):
-                with open(os.path.join(pkg_dir, name), 'w') as f:
-                    f.write(src)
-            shutil.rmtree(os.path.join(pkg_dir, '__pycache__'), ignore_errors=True)
+                if src is not None:
+                    with open(os.path.join(pkg_dir, name), 'w') as f:
+                        f.write(src)
         run_env = dict(env, **extra)
         pre = subprocess.run([sys.executable, os.path.join(broken, 'pretool_safety.py')], input=read,
                              capture_output=True, text=True, env=run_env)
@@ -249,8 +252,8 @@ def test_entry_shims():
 
 
 def _manual_install_checks(dest, pkg, env):
-    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import pretool_safety as p; '
-                        'print(p.PLUGIN_ROOT); print(p.DEFAULTS_PATH)' % dest],
+    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import pretool_safety; '
+                        'from smart_permissions import config as c; print(c.PLUGIN_ROOT); print(c.DEFAULTS_PATH)' % dest],
                        capture_output=True, text=True, env=env)
     check('manual install: PLUGIN_ROOT is the install folder',
           r.stdout.split(), [dest, os.path.join(dest, 'config', 'defaults.json')])
@@ -260,42 +263,131 @@ def _manual_install_checks(dest, pkg, env):
     check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
 
 
-_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 'flags', 'transcript')
-# What each leaf may import from the package (default: config only)
-_LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'},
-                 'transcript': {'holds'}, 'judge': {'config', 'util', 'holds'}}
-# Leaf names core must not hold: a copy of the active state would go stale
-_LEAF_PRIVATE = {'state': {'_active', '_Active'}}
+# The package's layers, bottom up. At module level a module imports from the
+# package only modules of a lower layer, so the import graph has no cycle.
+# Below core: the settings, the state and the leaf services. core holds the
+# shell parser, the rules, the gates and the PreToolUse flow. Above it: the
+# judge's context and the hold steps (they read commands with core's
+# parser), then the learner's flow.
+_LAYERS = (
+    ('config', 'util', 'state', 'payload'),
+    ('log', 'holds'),
+    ('flags', 'transcript', 'judge'),
+    ('core',),
+    ('context.git', 'context.scripts', 'context.notes', 'holdflow'),
+    ('context.provenance',),
+    ('context.loss',),
+    ('context',),
+    ('learner',),
+)
+# The only package imports inside a function: core's PreToolUse flow loads
+# the layers above core on the judged path only
+_DEFERRED_IMPORTS = [('core', '_main', 'context'), ('core', '_main', 'holdflow')]
+# Names only their own module may bind: a copy of the active state would go stale
+_PRIVATE_NAMES = {'state': {'_active', '_Active'}}
+
+
+def _package_sources():
+    """{module: (path, ast)} for every module of the package, the context
+    package as 'context' and its submodules as 'context.git' and so on."""
+    import ast
+    pkg = os.path.join(SCRIPT_DIR, 'smart_permissions')
+    out = {}
+    for root, dirs, files in os.walk(pkg):
+        dirs[:] = sorted(d for d in dirs if d != '__pycache__')
+        for f in sorted(files):
+            if f.endswith('.py'):
+                rel = os.path.relpath(os.path.join(root, f), pkg)[:-3].replace(os.sep, '.')
+                mod = '__init__' if rel == '__init__' else rel[:-len('.__init__')] if rel.endswith('.__init__') else rel
+                with open(os.path.join(root, f)) as fh:
+                    out[mod] = (os.path.join(root, f), ast.parse(fh.read()))
+    return out
+
+
+def _import_targets(mod, path, node):
+    """The package modules a relative `from ... import` in `mod` names (for
+    `from . import x`, each x)."""
+    here = mod.split('.') if path.endswith('__init__.py') and mod != '__init__' else mod.split('.')[:-1]
+    base = here[:len(here) - (node.level - 1)] if node.level > 1 else here
+    if node.module:
+        return ['.'.join(base + [node.module])]
+    return ['.'.join(base + [a.name]) for a in node.names]
 
 
 def test_package_modules():
-    """The modules core is built on import nothing from core or the learner
-    (only the leaves _LEAF_IMPORTS allows), and core re-exports every name
-    they hold as the same object, so `core.X` keeps reaching the code that
-    moved. No memoized function reaches the per-call state."""
+    """The package's import layers (_LAYERS): no module-level cycle, no
+    layer below core importing it, package imports inside functions only
+    where _DEFERRED_IMPORTS says. Each module imports only names it uses
+    (no re-exports: a test reaches a name in the module that defines it).
+    No memoized function reaches the per-call state."""
     print('\n--- Package modules ---')
     import ast
-    pkg = os.path.join(SCRIPT_DIR, 'smart_permissions')
-    with open(os.path.join(pkg, '__init__.py')) as f:
-        init = ast.parse(f.read())
+    import symtable
+    srcs = _package_sources()
+    rank = {m: k for k, layer in enumerate(_LAYERS) for m in layer}
+    check('every module has a layer, every layer a module',
+          (sorted(set(srcs) - set(rank) - {'__init__'}), sorted(set(rank) - set(srcs))), ([], []))
+    init = srcs['__init__'][1]
     check('the package __init__ imports nothing',
           [type(n).__name__ for n in init.body if isinstance(n, (ast.Import, ast.ImportFrom))], [])
-    for name in _LEAF_MODULES:
-        with open(os.path.join(pkg, name + '.py')) as f:
-            tree = ast.parse(f.read())
-        rel = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level}
-        allowed = _LEAF_IMPORTS.get(name, {'config'})
-        check(f'{name}.py imports from the package only {sorted(allowed) or "nothing"}',
-              sorted(rel - allowed), [])
+    top, deferred = {}, []
+    for mod, (path, tree) in srcs.items():
+        in_functions = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for n in ast.walk(fn):
+                    if isinstance(n, ast.ImportFrom) and n.level and id(n) not in in_functions:
+                        in_functions.add(id(n))
+                        deferred += [(mod, fn.name, t) for t in _import_targets(mod, path, n)]
+        # module level: anywhere outside a function, under an if or try too
+        top[mod] = {t for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.level
+                    and id(n) not in in_functions for t in _import_targets(mod, path, n)}
+    for mod in sorted(rank, key=lambda m: (rank[m], m)):
+        up = sorted(t for t in top.get(mod, ()) if rank.get(t, len(_LAYERS)) >= rank[mod])
+        check(f'{mod} imports only from the layers below it at module level', up, [])
+    order, left = [], {m: set(ts) & set(srcs) for m, ts in top.items()}
+    while left:
+        ready = sorted(m for m, ts in left.items() if not ts - set(order))
+        if not ready:
+            break
+        order += ready
+        for m in ready:
+            del left[m]
+    check('the module-level import graph is acyclic', sorted(left), [])
+    check('only the layers above core import it (the rules and gates are core\'s)',
+          sorted(m for m, ts in top.items() if 'core' in ts and rank.get(m, 0) <= rank['core']), [])
+    check('package imports inside functions: core._main loads the layers above core only',
+          sorted(set(deferred)), sorted(_DEFERRED_IMPORTS))
+    # no re-exports: each name a module imports from the package, it reads
+    private_copies = []
+    for mod, (path, tree) in sorted(srcs.items()):
+        with open(path) as f:
+            table = symtable.symtable(f.read(), path, 'exec')
+        reads = set()
+        stack = [(table, True)]
+        while stack:
+            t, at_top = stack.pop()
+            reads |= {s.get_name() for s in t.get_symbols()
+                      if s.is_referenced() and (at_top or s.is_global() or s.is_declared_global())}
+            stack += [(c, False) for c in t.get_children()]
+        bound = [a.asname or a.name for n in tree.body if isinstance(n, ast.ImportFrom) and n.level
+                 for a in n.names]
+        check(f'{mod} imports from the package only names it uses ({len(bound)})',
+              sorted(b for b in bound if b not in reads), [])
+        private_copies += [f'{mod}.{b}' for owner, private in _PRIVATE_NAMES.items() if mod != owner
+                           for b in bound if b in private]
+    check('no module imports another\'s private names', private_copies, [])
     # A memoized answer must depend on its arguments only: no @_memo or
-    # lru_cache function of core reaches current_state, by name, transitively
-    with open(os.path.join(pkg, 'core.py')) as f:
-        tree = ast.parse(f.read())
-    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
-    memo = sorted(f for f, n in funcs.items()
+    # lru_cache function reaches current_state, by name, transitively, across
+    # the package's modules (a name shared by two functions counts for both)
+    funcs = [(mod, n) for mod, (_, tree) in srcs.items() for n in tree.body if isinstance(n, ast.FunctionDef)]
+    memo = sorted(f'{mod}.{n.name}' for mod, n in funcs
                   if any('_memo' in ast.dump(d) or 'lru_cache' in ast.dump(d) for d in n.decorator_list))
-    names = {f: {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}
-             | {x.attr for x in ast.walk(n) if isinstance(x, ast.Attribute)} for f, n in funcs.items()}
+    names = {}
+    for mod, n in funcs:
+        names.setdefault(n.name, set()).update(
+            {x.id for x in ast.walk(n) if isinstance(x, ast.Name)}
+            | {x.attr for x in ast.walk(n) if isinstance(x, ast.Attribute)})
     stateful = {'current_state', 'using_state', 'CallState'}
     reach = {f for f, ns in names.items() if ns & stateful}
     grew = True
@@ -303,32 +395,7 @@ def test_package_modules():
         more = {f for f, ns in names.items() if f not in reach and ns & reach}
         grew, reach = bool(more), reach | more
     check(f'no memoized function reaches the call state ({len(memo)} memoized)',
-          (bool(memo), [f for f in memo if f in reach]), (True, []))
-    _, cp = _fresh_cfg()
-    env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
-    env['SMART_PERMISSIONS_CONFIG'] = cp
-    probe = (
-        'import sys, json, types, importlib\nsys.path.insert(0, %r)\n'
-        'from smart_permissions import core\n'
-        'out = {}\n'
-        'for name in %r:\n'
-        '    m = importlib.import_module("smart_permissions." + name)\n'
-        '    private = set(%r.get(name, ()))\n'
-        '    names = [k for k, v in vars(m).items() if k not in private\n'
-        '             and not k.startswith("__") and not isinstance(v, types.ModuleType)]\n'
-        '    out[name] = [len(names), [k for k in names if getattr(core, k, out) is not getattr(m, k)]\n'
-        '                 + [k for k in private if hasattr(core, k)]]\n'
-        'print(json.dumps(out))\n'
-    ) % (SCRIPT_DIR, _LEAF_MODULES, {k: sorted(v) for k, v in _LEAF_PRIVATE.items()})
-    r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
-    try:
-        got = json.loads(r.stdout)
-    except ValueError:
-        got = {'error': r.stderr.strip()[-300:]}
-    for name in _LEAF_MODULES:
-        count, missing = got.get(name, [0, ['(module not loaded)']])
-        check(f'core re-exports all {name}.py names as the same objects ({count})',
-              (count > 0, missing), (True, []))
+          (bool(memo), [f for f in memo if f.rsplit('.', 1)[1] in reach]), (True, []))
     test_call_state_scopes()
 
 
@@ -1532,7 +1599,7 @@ def _cache_file(cfg_dir):
 
 
 def _cache_key(tool, tool_input):
-    """Replicate pretool_safety._call_key (the LLM flag-file key) independently."""
+    """Replicate flags._call_key (the LLM flag-file key) independently."""
     canonical = json.dumps(tool_input, sort_keys=True, separators=(',', ':'))
     raw = tool + '\0' + canonical
     return hashlib.sha256(raw.encode('utf-8', 'replace')).hexdigest()
@@ -2168,6 +2235,7 @@ def test_h1_bash_config_write_guard():
 def test_llm_wall_clock_deadline():
     print('\n--- LLM call: hard wall-clock deadline + one retry on hang ---')
     pretool = _pretool_module()
+    from smart_permissions import judge as sp_judge
     import threading
     calls = []
 
@@ -2189,7 +2257,7 @@ def test_llm_wall_clock_deadline():
         urllib.request.urlopen = lambda req, timeout=None: _Ctx(hang_then_answer(req, timeout))
         t0 = time.monotonic()
         try:
-            pretool._llm_post_once(None, 0.3)
+            sp_judge._llm_post_once(None, 0.3)
             check('single attempt hang raises TimeoutError', False, True)
         except TimeoutError:
             check('single attempt hang raises TimeoutError', True, True)
@@ -2203,7 +2271,7 @@ def test_llm_wall_clock_deadline():
         orig_once = judge._llm_post_once
         judge._llm_post_once = lambda req, s: orig_once(req, min(s, 0.3))
         try:
-            result = pretool._llm_post_with_deadline(None, 24)
+            result = sp_judge._llm_post_with_deadline(None, 24)
         finally:
             judge._llm_post_once = orig_once
         check('hung first attempt → retry succeeds', result, {'v': 'ok'})
@@ -2650,22 +2718,23 @@ def test_llm_context():
 
     # In-process: truncation and the partial first line of a tail read.
     pretool = _pretool_module()
+    from smart_permissions import transcript as sp_transcript
     cfg, _ = _fresh_cfg()
     tpath = os.path.join(cfg, 't.jsonl')
     _transcript(tpath, [_human('x' * 5000)])
-    msgs = pretool.recent_user_messages(tpath)
+    msgs = sp_transcript.recent_user_messages(tpath)
     check('long message truncated',
-          len(msgs) == 1 and len(msgs[0]) <= pretool.CONTEXT_MAX_MESSAGE_CHARS + 10, True)
+          len(msgs) == 1 and len(msgs[0]) <= sp_transcript.CONTEXT_MAX_MESSAGE_CHARS + 10, True)
     _transcript(tpath, [_human('FIRST ' + 'y' * 300), _human('SECOND')])
     from smart_permissions import transcript  # the module whose code reads it
     orig = transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES
     transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES = 150  # cuts into the first record
     try:
-        msgs = pretool.recent_user_messages(tpath)
+        msgs = sp_transcript.recent_user_messages(tpath)
     finally:
         transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES = orig
     check('tail read drops the partial first line', msgs, ['SECOND'])
-    check('non-string transcript path → []', pretool.recent_user_messages(None), [])
+    check('non-string transcript path → []', sp_transcript.recent_user_messages(None), [])
 
 
 # =====================================================================
@@ -5275,8 +5344,8 @@ def test_phase4_bodies_built_words_env():
     check('a built git word names its reason', res[1][1],
           'Risky git with a word built at run time where it decides the verdict ($S) — LLM review')
     check('a loader variable names its reason', res[2][1], 'Sets LD_PRELOAD to run other code (/tmp/x.so)')
-    code = ('import sys, json\nsys.path.insert(0, %r)\nfrom smart_permissions import core as p\n'
-            'print(json.dumps([p._extract_json_decision(c) for c in json.loads(sys.stdin.read())]))\n'
+    code = ('import sys, json\nsys.path.insert(0, %r)\nfrom smart_permissions import judge\n'
+            'print(json.dumps([judge._extract_json_decision(c) for c in json.loads(sys.stdin.read())]))\n'
             ) % SCRIPT_DIR
     texts = ['Sure:\n```json\n{"safe": true, "reason": "ok"}\n```',
              'It uses {a,b} braces. {"x": 1} {"safe": false, "reason": "a } in text"}',
@@ -6356,6 +6425,7 @@ def test_phase1b_fewer_judge_calls():
     print('\n--- 1.6.0: Python heredocs, tighter inline reads, conditional names, CLIs, log, learner ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions import config as sp_config, log as sp_log
     from smart_permissions import context as sp_ctx
     from smart_permissions.context import notes as cx_notes
     rmrf = d('cm0gLXJm')
@@ -6633,7 +6703,7 @@ def test_phase1b_fewer_judge_calls():
         # ---- e. every log record carries the version, the input length and a truncated flag ----
         mk = os.path.join(SCRIPT_DIR, '..', '..', '.claude-plugin', 'marketplace.json')
         with open(mk) as f:
-            check('HOOK_VERSION is the marketplace version', p.HOOK_VERSION, json.load(f)['metadata']['version'])
+            check('HOOK_VERSION is the marketplace version', sp_config.HOOK_VERSION, json.load(f)['metadata']['version'])
         cfg, cp = _fresh_cfg()
 
         def hook(payload, path=cp):
@@ -6644,7 +6714,7 @@ def test_phase1b_fewer_judge_calls():
         recs = _decision_records(cfg)
         check('log: version, length and truncated flag',
               [(r.get('v'), r.get('input_len'), r.get('truncated'), len(r.get('input', ''))) for r in recs[-2:]],
-              [(p.HOOK_VERSION, 705, True, 500), (p.HOOK_VERSION, 2, False, 2)])
+              [(sp_config.HOOK_VERSION, 705, True, 500), (sp_config.HOOK_VERSION, 2, False, 2)])
         logp = os.path.join(cfg, 'hooks', 'smart-permissions-decisions.jsonl')
         if os.name != 'nt':  # POSIX mode bits
             check('log: created owner-only', oct(os.stat(logp).st_mode & 0o777), '0o600')
@@ -6663,17 +6733,17 @@ def test_phase1b_fewer_judge_calls():
         if fcntl:
             held = os.open(rot + '.lock', os.O_WRONLY | os.O_CREAT, 0o600)
             fcntl.flock(held, fcntl.LOCK_EX)
-            p._append_log_line(rot, 'a\n', 50)
+            sp_log._append_log_line(rot, 'a\n', 50)
             check('rotation: skipped while the other hook holds the lock',
                   (os.path.exists(rot + '.1'), os.path.getsize(rot)), (False, 102))
             os.close(held)
-            p._append_log_line(rot, 'b\n', 50)
+            sp_log._append_log_line(rot, 'b\n', 50)
             with open(rot) as f:
                 check('rotation: one generation once the lock is free, both owner-only',
                       (os.path.getsize(rot + '.1'), f.read(), oct(os.stat(rot).st_mode & 0o777),
                        oct(os.stat(rot + '.1').st_mode & 0o777)),
                       (102, 'b\n', '0o600', '0o600'))
-            p._append_log_line(rot, 'c\n', 50)
+            sp_log._append_log_line(rot, 'c\n', 50)
             check('rotation: a short new log is not rotated again', os.path.getsize(rot + '.1'), 102)
         # opt-in fuller capture: capped, secrets redacted, marked incomplete
         cfg2, cp2 = _fresh_cfg({'decision_log_full_input': True})
@@ -6705,20 +6775,20 @@ def test_phase1b_fewer_judge_calls():
         finally:
             plog.DECISION_LOG_FULL_INPUT_CHARS = saved_cap
             plog.DECISION_LOG_ENABLED, plog.DECISION_LOG_FULL_INPUT, plog.DECISION_LOG_PATH = saved
-        red, hit = p._redact_secrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- and '
+        red, hit = sp_log._redact_secrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY----- and '
                                      'https://user:pw123@git.example/x and ghp_' + 'a' * 30)
         check('redaction: key block, URL password, token', ('MIIabc' in red, 'pw123' in red, 'ghp_' in red, hit),
               (False, False, False, True))
-        check('redaction: a shell variable is not a secret', p._redact_secrets('TOKEN="$T" ./x')[1], False)
+        check('redaction: a shell variable is not a secret', sp_log._redact_secrets('TOKEN="$T" ./x')[1], False)
         check('redaction: a backslash before a newline in the value',
-              p._redact_secrets('x --password "ab\\\ncd" next')[0], 'x --password [REDACTED] next')
+              sp_log._redact_secrets('x --password "ab\\\ncd" next')[0], 'x --password [REDACTED] next')
         _t0 = time.time()
-        p._redact_secrets(('a.' * 20000) + ' x')
+        sp_log._redact_secrets(('a.' * 20000) + ' x')
         check('redaction: long dotted text stays fast', time.time() - _t0 < 0.5, True)
         check('redaction: a quoted value over two lines',
-              p._redact_secrets('x --password "line1\nline2" next')[0], 'x --password [REDACTED] next')
+              sp_log._redact_secrets('x --password "line1\nline2" next')[0], 'x --password [REDACTED] next')
         check('redaction: an escaped quote inside the value',
-              p._redact_secrets('x --password "ab\\"cd efgh" next')[0], 'x --password [REDACTED] next')
+              sp_log._redact_secrets('x --password "ab\\"cd efgh" next')[0], 'x --password [REDACTED] next')
 
         # ---- f. the learner: rule_reason everywhere, AskUserQuestion left alone ----
         cfg3, cp3 = _fresh_cfg()
@@ -6746,19 +6816,20 @@ def test_phase1b_fewer_judge_calls():
         # ---- h. the judge is told which copy of the guard is live ----
         note = cx_notes.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
         check('judge note: names the live copy',
-              (p.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
+              (sp_config.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
         check('judge note: a relative path into the package names the live copy',
-              p.PLUGIN_ROOT in cx_notes.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
+              sp_config.PLUGIN_ROOT in cx_notes.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
         check('judge note: none for other calls', cx_notes.live_hook_note({'command': 'ls'}), '')
         ctx = sp_ctx.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
             'file_path': '/src/wt/smart-permissions/scripts/permission_learner.py'}}, call_state)
-        check('judge note: in the context', p.PLUGIN_ROOT in ctx, True)
+        check('judge note: in the context', sp_config.PLUGIN_ROOT in ctx, True)
 
 
 def test_phase1_evidence_and_rule_fixes():
     print('\n--- 1.5.0: judge key file, clones, brief, scripts, stashes, /tmp, MCP notes, rule fixes ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions import config as sp_config, judge as sp_judge
     from smart_permissions import context as sp_ctx
     from smart_permissions.context import loss as cx_loss, notes as cx_notes, provenance as cx_prov, scripts as cx_scripts
     rmrf = d('cm0gLXJm')
@@ -6771,24 +6842,24 @@ def test_phase1_evidence_and_rule_fixes():
         f.write('# judge\nexport SAFETY_HOOK_MODEL="mock-model"\nSAFETY_HOOK_API_KEY=k-123  # note\n'
                 "SAFETY_HOOK_API_URL='https://mock.invalid/v1'\nOTHER=ignored\n")
     os.chmod(keyfile, 0o600)
-    values, note = p._load_llm_env_file(keyfile)
+    values, note = sp_judge._load_llm_env_file(keyfile)
     check('key file: 0600 file read', (values, note), (
         {'SAFETY_HOOK_MODEL': 'mock-model', 'SAFETY_HOOK_API_KEY': 'k-123',
          'SAFETY_HOOK_API_URL': 'https://mock.invalid/v1'}, ''))
     os.chmod(keyfile, 0o644)
-    values, note = p._load_llm_env_file(keyfile)
+    values, note = sp_judge._load_llm_env_file(keyfile)
     check('key file: group/world-readable refused', (values, 'chmod 600' in note), ({}, True))
     os.chmod(keyfile, 0o600)
     link = os.path.join(base, 'judge-link.env')
     os.symlink(keyfile, link)
-    check('key file: a link is not followed', p._load_llm_env_file(link)[0], {})
-    check('key file: missing file is no note', p._load_llm_env_file(os.path.join(base, 'none.env')), ({}, ''))
+    check('key file: a link is not followed', sp_judge._load_llm_env_file(link)[0], {})
+    check('key file: missing file is no note', sp_judge._load_llm_env_file(os.path.join(base, 'none.env')), ({}, ''))
     cfg, cp = _fresh_cfg()
     shutil.copy(keyfile, os.path.join(cfg, 'smart-permissions-llm.env'))
     os.chmod(os.path.join(cfg, 'smart-permissions-llm.env'), 0o600)
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
-    probe = ('import sys; sys.path.insert(0, %r); from smart_permissions import core as p; '
-             'print(p.llm_is_configured(), p.LLM_MODEL, p.LLM_API_URL)' % SCRIPT_DIR)
+    probe = ('import sys; sys.path.insert(0, %r); from smart_permissions import judge; '
+             'print(judge.llm_is_configured(), judge.LLM_MODEL, judge.LLM_API_URL)' % SCRIPT_DIR)
     out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
                          env=dict(env, SMART_PERMISSIONS_CONFIG=cp)).stdout.split()
     check('key file: a hook with no env is configured from it', out, ['True', 'mock-model', 'https://mock.invalid/v1'])
@@ -6982,7 +7053,7 @@ def test_phase1_evidence_and_rule_fixes():
     user = sent[0]['messages'][1]['content'] if sent else ''
     check('mcp: matching note given', 'BENCH-NOTE' in user and 'OTHER-NOTE' not in user, True)
     cfg, cp = _fresh_cfg({'mcp_context': ['not', 'a', 'dict']})
-    probe = 'import sys; sys.path.insert(0, %r); from smart_permissions import core as p; print(p.MCP_CONTEXT)' % SCRIPT_DIR
+    probe = 'import sys; sys.path.insert(0, %r); from smart_permissions import config; print(config.MCP_CONTEXT)' % SCRIPT_DIR
     check('mcp: wrong type ignored', subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
                                                     env=dict(os.environ, SMART_PERMISSIONS_CONFIG=cp)).stdout.strip(), '{}')
     with open(os.path.join(SCRIPT_DIR, '..', 'config', 'defaults.json')) as f:
@@ -7039,7 +7110,7 @@ def test_phase1_evidence_and_rule_fixes():
     os.mkfifo(fifo, 0o600)
     t0 = time.monotonic()
     check('key file: a FIFO is refused without blocking',
-          p._load_llm_env_file(fifo)[0] == {} and time.monotonic() - t0 < 2, True)
+          sp_judge._load_llm_env_file(fifo)[0] == {} and time.monotonic() - t0 < 2, True)
     check('brief: a FIFO or a NUL in the path is no brief',
           (cx_notes.subagent_brief(fifo), cx_notes.subagent_brief(base + '/a\0b')), (None, None))
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 7}]}}])
@@ -7059,7 +7130,7 @@ def test_phase1_evidence_and_rule_fixes():
     check('scripts: an unquoted echo of script text stays out of the log',
           any('RUN-BODY' in json.dumps(r) for r in _decision_records(cfg)), False)
     check('scripts: the reason shown is scrubbed of quoted script text',
-          p.scrub_script_text('it runs `echo RUN-BODY` remotely', ['#!/bin/sh\necho RUN-BODY\n']),
+          sp_judge.scrub_script_text('it runs `echo RUN-BODY` remotely', ['#!/bin/sh\necho RUN-BODY\n']),
           'it runs `[script text]` remotely')
     os.makedirs(os.path.join(base, 'fake-home', '.ssh'))
     with open(os.path.join(base, 'fake-home', '.ssh', 'id_x'), 'w') as f:
@@ -7438,6 +7509,7 @@ def test_phase2_holds():
 def test_phase2_remote_exec():
     print('\n--- Phase 2: remote and production execution ---')
     p = _pretool_module()
+    from smart_permissions import flags as sp_flags, holds as sp_holds, judge as sp_judge, transcript as sp_transcript
     dcfg = tempfile.mkdtemp(prefix='sp-dcfg-')
     atexit.register(shutil.rmtree, dcfg, ignore_errors=True)
     old = os.environ.get('DOCKER_CONFIG')
@@ -7545,12 +7617,12 @@ def test_phase2_remote_exec():
 
     # The hold key: description left out; session, agent and cwd count.
     base = {'session_id': 's', 'cwd': '/a'}
-    k = p.hold_key(base, 'Bash', {'command': 'x', 'description': 'one'})
-    check('hold_key: description left out', k, p.hold_key(base, 'Bash', {'command': 'x', 'description': 'two'}))
-    check('hold_key: command counts', k == p.hold_key(base, 'Bash', {'command': 'y'}), False)
-    check('hold_key: cwd counts', k == p.hold_key(dict(base, cwd='/b'), 'Bash', {'command': 'x'}), False)
-    check('hold_key: session counts', k == p.hold_key(dict(base, session_id='t'), 'Bash', {'command': 'x'}), False)
-    check('hold_key: acting agent counts', k == p.hold_key(dict(base, agent_id='z'), 'Bash', {'command': 'x'}),
+    k = sp_holds.hold_key(base, 'Bash', {'command': 'x', 'description': 'one'})
+    check('hold_key: description left out', k, sp_holds.hold_key(base, 'Bash', {'command': 'x', 'description': 'two'}))
+    check('hold_key: command counts', k == sp_holds.hold_key(base, 'Bash', {'command': 'y'}), False)
+    check('hold_key: cwd counts', k == sp_holds.hold_key(dict(base, cwd='/b'), 'Bash', {'command': 'x'}), False)
+    check('hold_key: session counts', k == sp_holds.hold_key(dict(base, session_id='t'), 'Bash', {'command': 'x'}), False)
+    check('hold_key: acting agent counts', k == sp_holds.hold_key(dict(base, agent_id='z'), 'Bash', {'command': 'x'}),
           False)
     # A subagent's PreToolUse may carry only agent_id: its own transcript, never the lead's.
     lead = os.path.join(tempfile.mkdtemp(prefix='sp-act-'), 'sess.jsonl')
@@ -7558,15 +7630,15 @@ def test_phase2_remote_exec():
     open(lead, 'w').close()
     sub = os.path.join(lead[:-6], 'subagents', 'agent-a1b2.jsonl')
     check('acting transcript: agent_id, none written yet → None',
-          p.acting_transcript({'transcript_path': lead, 'agent_id': 'a1b2'}), None)
+          sp_holds.acting_transcript({'transcript_path': lead, 'agent_id': 'a1b2'}), None)
     os.makedirs(os.path.dirname(sub))
     open(sub, 'w').close()
     check('acting transcript: agent_id → the subagent\'s file',
-          p.acting_transcript({'transcript_path': lead, 'agent_id': 'a1b2'}), sub)
-    check('acting transcript: no agent → the session\'s', p.acting_transcript({'transcript_path': lead}), lead)
-    check('hold_key: none without a session', p.hold_key({'cwd': '/a'}, 'Bash', {'command': 'x'}), None)
+          sp_holds.acting_transcript({'transcript_path': lead, 'agent_id': 'a1b2'}), sub)
+    check('acting transcript: no agent → the session\'s', sp_holds.acting_transcript({'transcript_path': lead}), lead)
+    check('hold_key: none without a session', sp_holds.hold_key({'cwd': '/a'}, 'Bash', {'command': 'x'}), None)
     check('hold_key: timeout counts (not cosmetic)',
-          k == p.hold_key(base, 'Bash', {'command': 'x', 'timeout': 5}), False)
+          k == sp_holds.hold_key(base, 'Bash', {'command': 'x', 'timeout': 5}), False)
 
     # The agent's answer: assistant text after the hold only, reminders out.
     d = tempfile.mkdtemp(prefix='sp-ans-')
@@ -7586,17 +7658,17 @@ def test_phase2_remote_exec():
             rec['timestamp'] = _iso_now(off)
             f.write(json.dumps(rec) + '\n')
         f.write('not json\n')
-    ans = p.agent_answer_since(tr, since)
+    ans = sp_transcript.agent_answer_since(tr, since)
     check('answer: text and kept thinking after the hold',
           'AFTER' in ans and 'PLAIN' in ans and 'THOUGHT' in ans, True)
     check('answer: nothing from before, users, tools, reminders or API errors',
           [w for w in ('BEFORE', 'USER-TEXT', 'TOOLINPUT', 'RIDER', 'APIERROR') if w in ans], [])
-    check('answer: missing file → empty', p.agent_answer_since(os.path.join(d, 'none'), since), '')
+    check('answer: missing file → empty', sp_transcript.agent_answer_since(os.path.join(d, 'none'), since), '')
     with open(tr, 'a') as f:
         f.write(json.dumps({'type': 'assistant', 'timestamp': _iso_now(5),
                             'message': {'content': [{'type': 'text', 'text': 'z' * 5000 + 'END'}]}}) + '\n')
-    ans = p.agent_answer_since(tr, since)
-    check('answer: capped, its end kept', (len(ans) <= p.HOLD_ANSWER_CHARS + 40, ans.endswith('END')), (True, True))
+    ans = sp_transcript.agent_answer_since(tr, since)
+    check('answer: capped, its end kept', (len(ans) <= sp_holds.HOLD_ANSWER_CHARS + 40, ans.endswith('END')), (True, True))
 
     # The policy in the hook: an allow needs a confident verdict and the
     # whole payload in view; anything else asks the developer explicitly.
@@ -7704,12 +7776,12 @@ def test_phase2_remote_exec():
         [t.start() for t in threads]
         [t.join() for t in threads]
         check('flag store: concurrent puts all kept',
-              sum(bool(p._flag_get('Bash', {'command': f'c{i}'})) for i in range(12)), 12)
+              sum(bool(sp_flags._flag_get('Bash', {'command': f'c{i}'})) for i in range(12)), 12)
     finally:
         pflags.LLM_FLAG_PATH = saved
     check('schema: confident/resolver/question',
-          sorted(p._SAFETY_SCHEMA['properties']), ['category', 'confident', 'question', 'reason', 'resolver', 'safe'])
-    check('schema: only safe required', p._SAFETY_SCHEMA['required'], ['safe'])
+          sorted(sp_judge._SAFETY_SCHEMA['properties']), ['category', 'confident', 'question', 'reason', 'resolver', 'safe'])
+    check('schema: only safe required', sp_judge._SAFETY_SCHEMA['required'], ['safe'])
 
 
 def test_review_fixes_1_7_0():
@@ -7839,14 +7911,15 @@ def _learner_out(out):
 def test_prompt_timeout_1_8_0():
     print('\n--- 1.8.0: an unanswered prompt is parked, not a freeze ---')
     p = _pretool_module()
+    from smart_permissions import config as sp_config, judge as sp_judge
     for value, want in [(0, 0), (-5, 0), (0.5, 60), (10, 600), (1000, 3600), (True, 600),
                         ('10', 600), (None, 600), (float('nan'), 600), (float('inf'), 3600)]:
-        check(f'prompt timeout bounds: {value!r}', p._prompt_timeout_s(value), want)
+        check(f'prompt timeout bounds: {value!r}', sp_config._prompt_timeout_s(value), want)
     with open(os.path.join(os.path.dirname(SCRIPT_DIR), 'hooks', 'hooks.json')) as f:
         hooks = json.load(f)['hooks']
     learner_timeout = hooks['PermissionRequest'][0]['hooks'][0]['timeout']
     check('hooks.json: the learner outlives the longest prompt timeout',
-          learner_timeout > p.PROMPT_TIMEOUT_MAX_MINUTES * 60, True)
+          learner_timeout > sp_config.PROMPT_TIMEOUT_MAX_MINUTES * 60, True)
     with open(os.path.join(os.path.dirname(SCRIPT_DIR), 'config', 'defaults.json')) as f:
         check('defaults: prompt_timeout_minutes 10', json.load(f).get('prompt_timeout_minutes'), 10)
 
@@ -7993,7 +8066,7 @@ def test_prompt_timeout_1_8_0():
     # The parked message: judge words that quote a script shown to it are scrubbed.
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import learner as pl
-    msg = pl.parked_message(p.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`',
+    msg = pl.parked_message(sp_judge.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`',
                                                 ['az group delete -n rg-example --yes\n']), 10)
     check('parked message: script text scrubbed', ('rg-example' in msg, '[script text]' in msg), (False, True))
     check('parked message: minutes shown', 'within 10 minutes' in pl.parked_message('x', 10), True)
@@ -8186,23 +8259,24 @@ def test_remote_provenance_1_8_1():
     print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions import holds as sp_holds, log as sp_log
     from smart_permissions.context import loss as cx_loss, provenance as cx_prov
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-remote-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
 
     # ---- 1. an MCP tool's input is logged, not just its name ----
-    check('log: MCP command and cwd', p._decision_log_input(
+    check('log: MCP command and cwd', sp_log._decision_log_input(
         'mcp__bench__run', {'command': 'dir', 'cwd': 'C:\\Lab', 'timeout_s': 30}, None), 'dir  (cwd: C:\\Lab)')
     check('log: MCP input without a command → compact JSON',
-          p._decision_log_input('mcp__bench__read_file', {'path': 'C:\\Lab\\a.txt', 'n': 1}, None),
+          sp_log._decision_log_input('mcp__bench__read_file', {'path': 'C:\\Lab\\a.txt', 'n': 1}, None),
           '{"path":"C:\\\\Lab\\\\a.txt","n":1}')
-    check('log: MCP tool with no input → its name', p._decision_log_input('mcp__bench__health', {}, None),
+    check('log: MCP tool with no input → its name', sp_log._decision_log_input('mcp__bench__health', {}, None),
           'mcp__bench__health')
-    check('log: MCP input cut like a command', len(p._decision_log_input(
+    check('log: MCP input cut like a command', len(sp_log._decision_log_input(
         'mcp__bench__run', {'command': 'x' * 900})), 500)
     check('log: a credential-named field is masked whatever its value',
-          p._redact_values({'Authorization': ['Basic Zm9vOmJhcg=='], 'token': {'v': 1}, 'n': 'ok'}),
+          sp_log._redact_values({'Authorization': ['Basic Zm9vOmJhcg=='], 'token': {'v': 1}, 'n': 'ok'}),
           {'Authorization': '[REDACTED]', 'token': '[REDACTED]', 'n': 'ok'})
     for script, hook in ((PRETOOL, 'pretool'), (LEARNER, 'permission_request')):
         cfg, cp = _fresh_cfg()
@@ -8329,7 +8403,7 @@ def test_remote_provenance_1_8_1():
     system = req[0]['messages'][0]['content'] if req else ''
     check('prompt: remote wording present',
           'On another machine (an MCP tool that' in system and 'the resolver is "agent"' in system, True)
-    check('hold note: remote scratch worktree wording', 'is not such a remote resource' in p.LLM_HOLD_RETRY_NOTE,
+    check('hold note: remote scratch worktree wording', 'is not such a remote resource' in sp_holds.LLM_HOLD_RETRY_NOTE,
           True)
 
     # ---- review fixes ----
@@ -8406,7 +8480,7 @@ def test_remote_provenance_1_8_1():
           ('found', True, False, True))
     # C13: the structured credential names are the Bash redactor's
     check('C13: credentials, client_key, pwd masked whole',
-          json.loads(p._decision_log_input('mcp__bench__x', {'credentials': {'u': 'a'}, 'client_key': 'k',
+          json.loads(sp_log._decision_log_input('mcp__bench__x', {'credentials': {'u': 'a'}, 'client_key': 'k',
                                                              'pwd': 'p', 'n': 1}, None, redact=True)),
           {'credentials': '[REDACTED]', 'client_key': '[REDACTED]', 'pwd': '[REDACTED]', 'n': 1})
     # C14: the word the scan limit cuts through is no path
@@ -8431,7 +8505,7 @@ def test_remote_provenance_1_8_1():
     check('C18: a clipped snippet keeps its tool name', ('names a path inside it, read_file: …' in text,
                                                           'f.txt' in text), (True, True))
     # C5: X-API-Key, any value type under a credential key, valid JSON
-    red = p._decision_log_input('mcp__bench__fetch', {'headers': {'X-API-Key': ['k1', 'k2'], 'token': 7},
+    red = sp_log._decision_log_input('mcp__bench__fetch', {'headers': {'X-API-Key': ['k1', 'k2'], 'token': 7},
                                                      'q': 'Bearer abcdefghijkl'}, None, redact=True)
     check('C5: credential keys masked whole, values redacted, valid JSON',
           json.loads(red), {'headers': {'X-API-Key': '[REDACTED]', 'token': '[REDACTED]'},

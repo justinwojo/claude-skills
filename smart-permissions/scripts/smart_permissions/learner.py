@@ -42,34 +42,22 @@ import json
 import os
 import time
 
-# Shared logic from the PreToolUse hook (smart_permissions/core.py)
-from .core import (
-    evaluate_bash,
-    evaluate_file_path,
-    evaluate_web_fetch,
-    bash_parse_uncertain,
-    human_required_reason,
-    llm_evaluate,
-    llm_is_configured,
-    llm_not_configured_reason,
-    _flag_get,
-    remote_exec,
-    remote_gap,
-    remote_exec_verdict,
-    script_hazard,
+# Shared logic with the PreToolUse hook (its rules and gates are core's)
+from .config import _FAIL_CLOSED, PROMPT_TIMEOUT_S
+from .util import _elapsed_ms, _quietly
+from .state import CallState, using_state
+from .payload import parse_hook_payload
+from .log import log_decision, _loggable_reason
+from .flags import _flag_get
+from .holds import acting_transcript
+from .transcript import CONTEXT_TRANSCRIPT_TAIL_BYTES
+from .judge import (
+    llm_evaluate, llm_is_configured, llm_not_configured_reason, remote_exec_verdict,
     scrub_script_text,
-    acting_transcript,
-    log_decision,
-    parse_hook_payload,
-    _elapsed_ms,
-    _loggable_reason,
-    _quietly,
-    session_dirs,
-    CallState,
-    using_state,
-    _FAIL_CLOSED,
-    CONTEXT_TRANSCRIPT_TAIL_BYTES,
-    PROMPT_TIMEOUT_S,
+)
+from .core import (
+    evaluate_bash, evaluate_file_path, evaluate_web_fetch, bash_parse_uncertain,
+    human_required_reason, remote_exec, remote_gap, script_hazard, session_dirs,
 )
 from .context import build_llm_context
 
