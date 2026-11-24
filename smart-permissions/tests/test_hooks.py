@@ -263,7 +263,7 @@ def _manual_install_checks(dest, pkg, env):
 _LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 'flags', 'transcript')
 # What each leaf may import from the package (default: config only)
 _LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'},
-                 'transcript': {'holds'}}
+                 'transcript': {'holds'}, 'judge': {'config', 'util', 'holds'}}
 # Leaf names core must not hold: a copy of the active state would go stale
 _LEAF_PRIVATE = {'state': {'_active', '_Active'}}
 

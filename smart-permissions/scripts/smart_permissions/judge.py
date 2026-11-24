@@ -3,7 +3,12 @@ settings from the environment or the judge's key file, provider detection, the
 system prompt and recheck note, request building for the Anthropic and
 OpenAI-compatible APIs, the wall-clock deadline and single retry, and parsing a
 reply into a decision. urllib.request is imported only when a request is made.
-The two-pass decision logic (_llm_evaluate, llm_evaluate_retry) stays in core."""
+The verdict layer: the two-pass decision (llm_evaluate, _llm_evaluate), the
+one pass on a held call's retry (llm_evaluate_retry), the remote-exec policy on
+an outcome (remote_exec_verdict), and scrubbing script text from a reason.
+Everything that sends a request reads _llm_request here, so one rebinding of
+judge._llm_request reaches every pass. Which calls may be held (hold_resolver)
+is core's: it re-runs the gates."""
 import sys
 import json
 import os
@@ -12,6 +17,8 @@ import threading
 import time
 
 from .config import LLM_ENV_FILE
+from .util import _elapsed_ms
+from .holds import LLM_HOLD_RETRY_NOTE
 
 
 # ============================================================
@@ -560,3 +567,184 @@ def _llm_request(user_prompt, reasoning_effort, budget):
         print(f"LLM response unparseable: {content[:300]}", file=sys.stderr)
         return None
     return decision
+
+
+def _flag_text(decision):
+    """'category N: reason' for a flagged decision."""
+    reason = decision.get("reason") or "flagged as unsafe"
+    category = decision.get("category")
+    return f"category {category}: {reason}" if category else reason
+
+
+def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
+                 rule_reason=None, *, script_texts):
+    """_llm_evaluate, with any script text the context showed the judge
+    (`script_texts`) scrubbed from the reason (it is logged, stored and shown)."""
+    decision, reason, info = _llm_evaluate(tool, tool_input, timeout, context, rule_reason)
+    return decision, scrub_script_text(reason, script_texts), info
+
+
+def scrub_script_text(reason, script_texts):
+    """`reason` with each quote of a script this call showed the judge
+    (`script_texts`: a whole line, or a quoted span of 6+ characters)
+    replaced by `[script text]`: script contents never reach the decision log."""
+    if not script_texts or not isinstance(reason, str):
+        return reason
+    spans = {line.strip() for text in script_texts for line in text.splitlines()
+             if len(line.strip()) >= 8 and line.strip() in reason}
+    for m in re.finditer(r"`([^`]{6,})`|'([^']{6,})'|\"([^\"]{6,})\"", reason):
+        span = next(g for g in m.groups() if g)
+        if any(span in text for text in script_texts):
+            spans.add(span)
+    for span in sorted(spans, key=len, reverse=True):
+        reason = reason.replace(span, "[script text]")
+    return reason
+
+
+def _llm_user_prompt(tool, tool_input, context, rule_reason):
+    """The judge's user message: the context, the call and the rule reason."""
+    prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
+    if rule_reason:
+        prompt += f"\n\nLocal rules sent this call to you because: {rule_reason}"
+    if context:
+        prompt = f"{context}\n\n{prompt}"
+    return prompt
+
+
+def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
+                  rule_reason=None):
+    """Call an LLM to evaluate a tool call that local rules couldn't decide.
+
+    Returns (decision, reason, info). decision is "allow" or "ask" — the LLM
+    never hard-denies. info is a dict with:
+      - source: "llm-recheck" when the second pass decided, else "llm"
+      - llm_ms: total HTTP time in ms (None when not configured)
+      - flagged: True when both passes flagged the call, or the model
+        refused to judge it; the caller should put it in front of the human
+        (explicit ask), not fall through
+
+    A first-pass flag gets a second pass at LLM_RECHECK_REASONING_EFFORT with
+    the first verdict attached, inside the same budget. The second pass
+    decides; if it can't run (time, error), the call goes to the human.
+
+    `timeout` is a total wall-clock budget for both passes including one retry
+    on a hang (24s for PreToolUse — Claude Code kills hooks at 30s regardless
+    of the hooks.json value; 15s from the learner). `context`
+    (build_llm_context) is prepended to the tool call. `rule_reason`, why the
+    local rules sent the call here, goes with it as evidence. Every call gets
+    a fresh verdict: nothing is cached.
+    """
+    if not llm_is_configured():
+        return ("ask",
+                llm_not_configured_reason(),
+                {"source": "llm", "llm_ms": None, "flagged": False, "verdict": None})
+
+    prompt = _llm_user_prompt(tool, tool_input, context, rule_reason)
+    _t0 = time.monotonic()
+
+    def info(source, flagged=False, verdict=None):
+        # verdict: the pass that decided, for its confident/resolver/question
+        return {"source": source, "llm_ms": _elapsed_ms(_t0), "flagged": flagged,
+                "verdict": verdict}
+
+    def failure(e):
+        # The time across every attempt and the recheck, not the last one's
+        return f"{e}; {time.monotonic() - _t0:.1f}s in all"
+
+    try:
+        first = _llm_request(prompt, LLM_REASONING_EFFORT, timeout)
+    except Exception as e:
+        # Always log — API failures need visibility
+        print(f"LLM error: {failure(e)}", file=sys.stderr)
+        return ("ask", f"LLM unavailable ({failure(e)}) — manual approval required", info("llm"))
+    if first is None:  # malformed: the developer's call, never held
+        return ("ask", "LLM response had no valid verdict (boolean `safe`)", info("llm", flagged=True))
+
+    if first["safe"] is True:
+        if DEBUG:
+            print(f"LLM APPROVED: {tool}", file=sys.stderr)
+        return ("allow", "LLM approved", info("llm", verdict=first))
+    if first.get("refused"):  # a recheck would be asked the same thing
+        return ("ask", "LLM refused to judge this call — confirm it yourself",
+                info("llm", flagged=True, verdict=first))
+
+    flag = _flag_text(first)
+    if DEBUG:
+        print(f"LLM FLAGGED: {tool} — {flag}; rechecking", file=sys.stderr)
+    # A flag the recheck could not confirm or clear goes to the developer
+    # (flagged, no verdict: never held).
+    remaining = timeout - (time.monotonic() - _t0)
+    if remaining < LLM_RECHECK_MIN_S:
+        return ("ask", f"LLM flagged ({flag}); no time left to recheck", info("llm", flagged=True))
+    try:
+        second = _llm_request(prompt + LLM_RECHECK_NOTE.format(flag=flag),
+                              LLM_RECHECK_REASONING_EFFORT, remaining)
+    except Exception as e:
+        print(f"LLM recheck error: {failure(e)}", file=sys.stderr)
+        return ("ask", f"LLM flagged ({flag}); recheck unavailable ({failure(e)})",
+                info("llm", flagged=True))
+    if second is None:
+        return ("ask", f"LLM flagged ({flag}); recheck unparseable", info("llm", flagged=True))
+
+    if second["safe"] is True:
+        if DEBUG:
+            print(f"LLM RECHECK CLEARED: {tool}", file=sys.stderr)
+        return ("allow", f"LLM recheck cleared first-pass flag ({flag})",
+                info("llm-recheck", verdict=second))
+    confirmed = flag if second.get("refused") else _flag_text(second)
+    if not second.get("refused") and second.get("category") != first.get("category"):
+        confirmed += f" (first pass: {flag})"  # the developer sees both concerns
+    if DEBUG:
+        print(f"LLM RECHECK CONFIRMED: {tool} — {confirmed}", file=sys.stderr)
+    if second.get("refused"):
+        second = dict(first, refused=True)  # the first pass's words, never held
+    flagged = info("llm-recheck", flagged=True, verdict=second)
+    flagged["first"] = first  # a developer-only first flag stays one (_hold_new)
+    return ("ask", f"LLM: {confirmed}", flagged)
+
+
+def remote_exec_verdict(decision, reason, info, label):
+    """The remote-exec policy on a judge outcome, for a call whose payload is
+    the command text (remote_gap None, checked first): (decision, reason,
+    for_developer). An allow stands only when the judge was confident;
+    anything else, a missing judge or an error included, is an explicit ask
+    for the developer."""
+    verdict = (info or {}).get("verdict") or {}
+    head = f"Remote or production execution ({label})"
+    if decision == "allow":
+        if verdict.get("confident") is not True:
+            return ("ask", f"{head}: the judge was not confident it does only what it should — "
+                    "confirm it yourself", True)
+        return "allow", reason, False
+    return "ask", f"{head}: {reason}", True
+
+
+def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGET_S, context="",
+                       rule_reason=None, *, script_texts):
+    """One judge pass, at the recheck effort, on the retry of a held call:
+    the hold's flag and question and the agent's answer go with the fresh
+    context. Returns (decision, reason, info) like llm_evaluate, with source
+    "hold-retry"; every outcome but a clear is "ask" with info["flagged"]
+    True, since a retry's second flag is terminal."""
+    if not llm_is_configured():
+        return "ask", llm_not_configured_reason(), {"source": "hold-retry", "llm_ms": None,
+                                                    "flagged": True, "verdict": None}
+    prompt = _llm_user_prompt(tool, tool_input, context, rule_reason) + LLM_HOLD_RETRY_NOTE.format(
+        reason=hold["reason"], question=hold["question"], answer=answer)
+    t0 = time.monotonic()
+
+    def info(verdict=None, flagged=True):
+        return {"source": "hold-retry", "llm_ms": _elapsed_ms(t0), "flagged": flagged,
+                "verdict": verdict}
+    try:
+        verdict = _llm_request(prompt, LLM_RECHECK_REASONING_EFFORT, timeout)
+    except Exception as e:
+        print(f"LLM retry error: {e}", file=sys.stderr)
+        return "ask", f"the judge was unavailable ({e}; {time.monotonic() - t0:.1f}s)", info()
+    if verdict is None:
+        return "ask", "the judge gave no valid verdict", info()
+    if verdict.get("safe") is True and not verdict.get("refused"):
+        return "allow", "LLM cleared the held call on the agent's answer", info(verdict, False)
+    if verdict.get("refused"):
+        return "ask", "the judge refused to judge it", info(verdict)
+    return "ask", scrub_script_text(f"LLM: {_flag_text(verdict)}", script_texts), info(verdict)

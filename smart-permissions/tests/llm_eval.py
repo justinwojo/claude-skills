@@ -20,7 +20,7 @@ eval prints SKIP and exits 0. Rule verdicts use the same config files as
 the hook (SMART_PERMISSIONS_CONFIG / ~/.claude/smart-permissions-config.json).
 
 Variants monkeypatch the modules in this process only (prompt, recheck
-note, model, efforts, in smart_permissions.core and .judge); the files
+note, model, efforts, in smart_permissions.judge); the files
 are never edited.
 
 Usage:
@@ -120,16 +120,13 @@ _PATCHED = ("LLM_MODEL", "LLM_REASONING_EFFORT", "LLM_RECHECK_REASONING_EFFORT",
             "LLM_SAFETY_PROMPT", "LLM_RECHECK_NOTE")
 
 
-def apply_variant(p, base, name):
-    # core re-exports the judge's settings, and code in both modules reads them
-    # (the request builder reads judge's own LLM_MODEL and LLM_SAFETY_PROMPT,
-    # the two passes read core's efforts and recheck note): set each in both.
+def apply_variant(base, name):
+    # Every pass and the request builder read the judge module's settings
     from smart_permissions import judge
-    for mod in (p, judge):
-        for attr in _PATCHED:
-            setattr(mod, attr, base[attr])
-        for attr, value in VARIANTS[name].items():
-            setattr(mod, attr, value)
+    for attr in _PATCHED:
+        setattr(judge, attr, base[attr])
+    for attr, value in VARIANTS[name].items():
+        setattr(judge, attr, value)
 
 
 # ============================================================
@@ -326,13 +323,15 @@ def _build_context(p, case, tmpdir):
 _tls = threading.local()
 
 
-def instrument(p):
-    """Wrap _llm_request so each pass's verdict and latency are recorded."""
-    original = p._llm_request
+def instrument():
+    """Wrap _llm_request so each pass's verdict and latency are recorded (every
+    pass calls it from the judge module)."""
+    from smart_permissions import judge
+    original = judge._llm_request
 
     def recorded(user_prompt, reasoning_effort, budget):
         t0 = time.monotonic()
-        entry = {"effort": reasoning_effort, "model": p.LLM_MODEL}
+        entry = {"effort": reasoning_effort, "model": judge.LLM_MODEL}
         try:
             decision = original(user_prompt, reasoning_effort, budget)
             entry["decision"] = decision
@@ -344,7 +343,7 @@ def instrument(p):
             entry["ms"] = int((time.monotonic() - t0) * 1000)
             getattr(_tls, "passes", []).append(entry)
 
-    p._llm_request = recorded
+    judge._llm_request = recorded
 
 
 def outcome_of(p, case, decision, info):
@@ -414,7 +413,7 @@ def case_developer_only(case):
 
 
 def run_variant(p, base, variant, cases, runs, workers):
-    apply_variant(p, base, variant)
+    apply_variant(base, variant)
     jobs = [(c, r) for c in cases for r in range(runs)]
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(lambda job: run_one(p, job[0], job[1], variant), jobs))
@@ -626,10 +625,11 @@ def main():
         ap.error(f"unknown variant(s): {', '.join(unknown)}")
 
     llm_cases = [c for c in cases if c["reaches_llm"] or args.include_unreached]
-    base = {attr: getattr(p, attr) for attr in _PATCHED}
-    instrument(p)
-    print(f"model {p.LLM_MODEL}, effort {p.LLM_REASONING_EFFORT or 'default'}, "
-          f"recheck effort {p.LLM_RECHECK_REASONING_EFFORT or 'default'}; "
+    from smart_permissions import judge
+    base = {attr: getattr(judge, attr) for attr in _PATCHED}
+    instrument()
+    print(f"model {judge.LLM_MODEL}, effort {judge.LLM_REASONING_EFFORT or 'default'}, "
+          f"recheck effort {judge.LLM_RECHECK_REASONING_EFFORT or 'default'}; "
           f"{len(llm_cases)} cases x {args.runs} runs "
           f"({sum(c['reaches_llm'] for c in cases)} reach the LLM in production)")
     unreached = [c for c in cases if not c["reaches_llm"]]
