@@ -260,9 +260,9 @@ def _manual_install_checks(dest, pkg, env):
     check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
 
 
-_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload')
+_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 'flags')
 # What each leaf may import from the package (default: config only)
-_LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set()}
+_LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'}}
 # Leaf names core must not hold: a copy of the active state would go stale
 _LEAF_PRIVATE = {'state': {'_active'}}
 
@@ -7078,16 +7078,17 @@ def test_phase1_evidence_and_rule_fixes():
           ['ask'] * 3)
     check('stash: git stash inside quoted text is no stash call',
           p._stash_made_in("printf 'note; git stash push; end'", repo, os.path.realpath(repo)), False)
-    saved_flag = p.LLM_FLAG_PATH
-    p.LLM_FLAG_PATH = os.path.join(base, 'flags.json')
+    from smart_permissions import flags as pflags  # the module whose code reads it
+    saved_flag = pflags.LLM_FLAG_PATH
+    pflags.LLM_FLAG_PATH = os.path.join(base, 'flags.json')
     try:
         p._flag_put('Bash', {'command': 'x'}, 'LLM: category 2: runs RUN-BODY, category 4242', ['echo RUN-BODY\n'])
-        with open(p.LLM_FLAG_PATH) as f:
+        with open(pflags.LLM_FLAG_PATH) as f:
             stored = f.read()
         check('scripts: the flag state the learner logs holds no judge words',
               'RUN-BODY' not in stored and '4242' not in stored and 'category 2' in stored, True)
     finally:
-        p.LLM_FLAG_PATH = saved_flag
+        pflags.LLM_FLAG_PATH = saved_flag
 
 
 # ---- Phase 2: hold and ask --------------------------------------------
@@ -7642,9 +7643,10 @@ def test_phase2_remote_exec():
     # The judge's schema carries the new fields, all optional but `safe`.
     # Parallel calls put to the developer: no flag-store entry is lost.
     import threading
-    saved = p.LLM_FLAG_PATH
-    p.LLM_FLAG_PATH = os.path.join(tempfile.mkdtemp(prefix='sp-flags-'), 'flags.json')
-    atexit.register(shutil.rmtree, os.path.dirname(p.LLM_FLAG_PATH), ignore_errors=True)
+    from smart_permissions import flags as pflags  # the module whose code reads it
+    saved = pflags.LLM_FLAG_PATH
+    pflags.LLM_FLAG_PATH = os.path.join(tempfile.mkdtemp(prefix='sp-flags-'), 'flags.json')
+    atexit.register(shutil.rmtree, os.path.dirname(pflags.LLM_FLAG_PATH), ignore_errors=True)
     try:
         threads = [threading.Thread(target=p._flag_put, args=('Bash', {'command': f'c{i}'}, 'r', ()))
                    for i in range(12)]
@@ -7653,7 +7655,7 @@ def test_phase2_remote_exec():
         check('flag store: concurrent puts all kept',
               sum(bool(p._flag_get('Bash', {'command': f'c{i}'})) for i in range(12)), 12)
     finally:
-        p.LLM_FLAG_PATH = saved
+        pflags.LLM_FLAG_PATH = saved
     check('schema: confident/resolver/question',
           sorted(p._SAFETY_SCHEMA['properties']), ['category', 'confident', 'question', 'reason', 'resolver', 'safe'])
     check('schema: only safe required', p._SAFETY_SCHEMA['required'], ['safe'])
