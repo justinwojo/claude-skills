@@ -243,6 +243,23 @@ def test_entry_shims():
         if label == 'only a package elsewhere on PYTHONPATH':
             check(f'learner shim, {label}: says where it came from', 'was loaded from' in lrn.stderr, True)
 
+    # A module loaded on the judged path only (holdflow) that does not import
+    # blocks a judged call as a broken startup does: an ask would skip the
+    # hold flag the PermissionRequest judge defers to. Rule-settled calls run.
+    plugin = os.path.join(base, 'broken-holdflow')
+    shutil.copytree(os.path.join(SCRIPT_DIR, '..', 'config'), os.path.join(plugin, 'config'))
+    shutil.copytree(SCRIPT_DIR, os.path.join(plugin, 'scripts'),
+                    ignore=shutil.ignore_patterns('__pycache__'))
+    with open(os.path.join(plugin, 'scripts', 'smart_permissions', 'holdflow.py'), 'w') as f:
+        f.write('x = (\n')
+    for command, want in (('frobnicate --all', (2, '', True)), ('ls', (0, 'allow', False))):
+        pre = subprocess.run([sys.executable, os.path.join(plugin, 'scripts', 'pretool_safety.py')],
+                             input=json.dumps({'tool_name': 'Bash', 'tool_input': {'command': command}}),
+                             capture_output=True, text=True, env=env)
+        out = pre.stdout and json.loads(pre.stdout)['hookSpecificOutput']['permissionDecision']
+        check(f'pretool, holdflow that does not import, {command!r}',
+              (pre.returncode, out, pre.stderr.startswith('smart-permissions could not start')), want)
+
     # The marketplace entry declares the same hooks as hooks/hooks.json (both load)
     with open(os.path.join(SCRIPT_DIR, '..', 'hooks', 'hooks.json')) as f:
         hooks_json = json.load(f)['hooks']
@@ -358,6 +375,14 @@ def test_package_modules():
           sorted(m for m, ts in top.items() if 'core' in ts and rank.get(m, 0) <= rank['core']), [])
     check('package imports inside functions: core._main loads the layers above core only',
           sorted(set(deferred)), sorted(_DEFERRED_IMPORTS))
+    # …on the judged branch, not on every call
+    main_fn = next(n for n in srcs['core'][1].body if isinstance(n, ast.FunctionDef) and n.name == '_main')
+    unbranched = [n.lineno for stmt in main_fn.body if not isinstance(stmt, ast.If)
+                  for n in ast.walk(stmt) if isinstance(n, ast.ImportFrom) and n.level]
+    check('core._main loads the layers above core inside a branch only', unbranched, [])
+    check('no module imports the package by its absolute name',
+          sorted(m for m, (_, tree) in srcs.items() for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                 and not n.level and (n.module or '').split('.')[0] == 'smart_permissions'), [])
     # no re-exports: each name a module imports from the package, it reads
     private_copies = []
     for mod, (path, tree) in sorted(srcs.items()):
@@ -405,7 +430,7 @@ def test_call_state_scopes():
     each thread is idle again after; nested scopes in one thread restore."""
     import threading
     sys.path.insert(0, SCRIPT_DIR)
-    from smart_permissions import core as p
+    from smart_permissions import state as p
     a, b, inner = p.CallState(cwd='/a'), p.CallState(cwd='/b'), p.CallState(cwd='/inner')
     idle = p.current_state()
     seen = {}

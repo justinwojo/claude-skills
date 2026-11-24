@@ -1998,6 +1998,12 @@ def _ask_developer(state, tool, tool_input, shown, logged, start, source, llm_ms
     output_decision("ask", shown)
 
 
+class _BrokenPackage(Exception):
+    """A module of the package loaded mid-call failed to import. Unlike a
+    rule crash, it is not an ask: an ask without the hold flag would let the
+    PermissionRequest judge allow a call the holds sent to the developer."""
+
+
 def main():
     """The hook. Any failure inside (a RecursionError on a deeply nested
     command, a parser bug) puts the call in front of the human: never an
@@ -2007,6 +2013,8 @@ def main():
     with using_state(state):
         try:
             _main(state)
+        except _BrokenPackage as e:  # the entry shim blocks the call (exit 2), as at startup
+            raise e.__cause__
         except Exception as e:
             reason = f"smart-permissions could not evaluate this call ({type(e).__name__}) — confirm it yourself"
             try:
@@ -2081,8 +2089,11 @@ def _main(state):
 
     # If local rules can't decide, hand off to LLM (if configured).
     if decision == "ask":
-        from .context import build_llm_context  # above core: loaded on the judged path only
-        from .holdflow import _hold_new, _hold_retry
+        try:  # above core: loaded on the judged path only
+            from .context import build_llm_context
+            from .holdflow import _hold_new, _hold_retry
+        except Exception as e:
+            raise _BrokenPackage() from e
         rule_reason = reason
         context = build_llm_context(input_data, state)
         # The retry of a held call: judged once more with the agent's answer.
