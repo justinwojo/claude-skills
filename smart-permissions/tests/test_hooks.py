@@ -303,7 +303,7 @@ def test_package_modules():
         more = {f for f, ns in names.items() if f not in reach and ns & reach}
         grew, reach = bool(more), reach | more
     check(f'no memoized function reaches the call state ({len(memo)} memoized)',
-          [f for f in memo if f in reach], [])
+          (bool(memo), [f for f in memo if f in reach]), (True, []))
     _, cp = _fresh_cfg()
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
     env['SMART_PERMISSIONS_CONFIG'] = cp
