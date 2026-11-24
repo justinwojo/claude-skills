@@ -2,7 +2,8 @@
 and claimed with exclusive markers, its TTL, per-session cap and pruning, the
 hold key of a call, the acting agent's transcript, and the retry note for the
 judge. Creating a hold and judging its retry (_hold_new, _hold_retry,
-llm_evaluate_retry) and reading the agent's answer stay in core for now."""
+llm_evaluate_retry) stay in core for now; reading the agent's answer is in
+transcript (agent_answer_since)."""
 import hashlib
 import itertools
 import json

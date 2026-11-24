@@ -260,9 +260,10 @@ def _manual_install_checks(dest, pkg, env):
     check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
 
 
-_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 'flags')
+_LEAF_MODULES = ('config', 'judge', 'log', 'util', 'holds', 'state', 'payload', 'flags', 'transcript')
 # What each leaf may import from the package (default: config only)
-_LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'}}
+_LEAF_IMPORTS = {'config': set(), 'state': set(), 'payload': set(), 'flags': {'config', 'log'},
+                 'transcript': {'holds'}}
 # Leaf names core must not hold: a copy of the active state would go stale
 _LEAF_PRIVATE = {'state': {'_active'}}
 
@@ -2614,12 +2615,13 @@ def test_llm_context():
     check('long message truncated',
           len(msgs) == 1 and len(msgs[0]) <= pretool.CONTEXT_MAX_MESSAGE_CHARS + 10, True)
     _transcript(tpath, [_human('FIRST ' + 'y' * 300), _human('SECOND')])
-    orig = pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES
-    pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES = 150  # cuts into the first record
+    from smart_permissions import transcript  # the module whose code reads it
+    orig = transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES
+    transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES = 150  # cuts into the first record
     try:
         msgs = pretool.recent_user_messages(tpath)
     finally:
-        pretool.CONTEXT_TRANSCRIPT_TAIL_BYTES = orig
+        transcript.CONTEXT_TRANSCRIPT_TAIL_BYTES = orig
     check('tail read drops the partial first line', msgs, ['SECOND'])
     check('non-string transcript path → []', pretool.recent_user_messages(None), [])
 
