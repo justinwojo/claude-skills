@@ -458,6 +458,8 @@ def run(sb, hook, payload=None, raw=None, judge=None, provider='openai', env=Non
         stdout = json.loads(out) if out else None
     except ValueError:
         stdout = {'_not_json': out}
+    if out and stdout is None:
+        stdout = {'_json_null': out}  # printed `null` is output, not silence
     hso = (stdout or {}).get('hookSpecificOutput', {}) if isinstance(stdout, dict) else {}
     decision = hso.get('permissionDecision') or (hso.get('decision') or {}).get('behavior')
 
@@ -469,12 +471,18 @@ def run(sb, hook, payload=None, raw=None, judge=None, provider='openai', env=Non
             system, user = body.get('system'), body['messages'][0]['content']
             effort = (body.get('output_config') or {}).get('effort')
             fmt = 'anthropic'
+            structured = (body.get('output_config') or {}).get('format') or {}
         else:
             system, user = body['messages'][0]['content'], body['messages'][1]['content']
             effort = body.get('reasoning_effort')
             fmt = 'openai'
+            structured = body.get('response_format') or {}
+            structured = dict(structured.get('json_schema') or {}, type=structured.get('type'))
         judge_calls.append({
             'format': fmt, 'path': q['path'], 'model': body.get('model'), 'effort': effort,
+            'roles': [m.get('role') for m in body.get('messages') or []],
+            # whether the verdict schema was sent, not the schema itself
+            'schema_sent': structured.get('type') == 'json_schema' and isinstance(structured.get('schema'), dict),
             'auth': ('bearer' if h.get('authorization') == 'Bearer test-key' else
                      'x-api-key' if h.get('x-api-key') == 'test-key' else None),
             'system_sha256': hashlib.sha256((system or '').encode()).hexdigest()[:16],

@@ -598,16 +598,18 @@ Tools like `git`, `dotnet`, `make`, and `brew` remain single-word (all subcomman
 
 If you prefer not to use the plugin system:
 
-1. From this folder, copy **both** entry scripts, the `smart_permissions` package
-   they run (it holds the code of both hooks) and the config into one directory:
+1. From this folder, copy the `smart_permissions` package (the code of both
+   hooks), the config and **both** entry scripts into one directory, in this
+   order:
    ```bash
-   mkdir -p ~/.claude/hooks/smart-permissions
+   mkdir -p ~/.claude/hooks/smart-permissions/config
+   cp -R scripts/smart_permissions ~/.claude/hooks/smart-permissions/
+   cp -R config/. ~/.claude/hooks/smart-permissions/config/
    cp scripts/pretool_safety.py scripts/permission_learner.py ~/.claude/hooks/smart-permissions/
-   cp -r scripts/smart_permissions ~/.claude/hooks/smart-permissions/
-   cp -r config/ ~/.claude/hooks/smart-permissions/config/
    ```
-   When you update, copy all three again: the entry scripts and the package
-   must come from the same version.
+   To update, run the same commands again: the entry scripts and the package
+   must come from the same version, and the entry scripts go last. While the
+   package is missing or half-copied, the PreToolUse hook blocks every call.
 
 2. Register **both** hooks in `~/.claude/settings.json`:
    ```json
@@ -701,7 +703,8 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 - **1.8.2 (2026-11-23) — the hook code is a package.**
   - The code of both hooks moved, unchanged, into `scripts/smart_permissions/` (`core.py` and `learner.py`). `scripts/pretool_safety.py` and `scripts/permission_learner.py` are now short entry scripts that import it, so Python runs it from cached bytecode instead of compiling 13,000 lines on every tool call: about half the per-call startup time. `urllib.request` is loaded only when the judge is called.
-  - Manual setup: the hooks find `config/` beside the scripts, where the instructions put it. Before, they looked one folder up and every call failed closed. Copy the `smart_permissions` folder too (see [Manual setup](#manual-setup)).
+  - Manual setup: the hooks find `config/` beside the scripts, where the instructions put it. Before, they looked one folder up and every call failed closed. Copy the `smart_permissions` folder too, before the entry scripts (see [Manual setup](#manual-setup)).
+  - If the `smart_permissions` folder is missing or can't be imported, the PreToolUse hook blocks the call and says why (exit 2), instead of a hook error that lets the call go ahead under the ordinary permissions.
   - The hook timeouts in the marketplace entry match `hooks/hooks.json` (45 s and 3660 s; it had 30 s and 45 s). The Python floor in Requirements is 3.9 (it said 3.6).
 
 - **1.8.1 (2026-11-23) — provenance for cleanups on another machine.**

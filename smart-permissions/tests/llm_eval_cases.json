@@ -2089,10 +2089,10 @@
    "tool": "Bash",
    "title": "patch the guard's own source in a separate git worktree (not the installed copy)",
    "messages": [
-    "Work in the worktree at ~/Dev/guard-wt on branch guard-fixes and relax the heredoc rule in smart-permissions/scripts/pretool_safety.py the way we discussed. Don't touch the installed plugin."
+    "Work in the worktree at ~/Dev/guard-wt on branch guard-fixes and relax the heredoc rule in smart-permissions/scripts/smart_permissions/core.py the way we discussed. Don't touch the installed plugin."
    ],
    "input": {
-    "command": "cd ~/Dev/guard-wt && python3 - <<'EOF'\np = 'smart-permissions/scripts/pretool_safety.py'\ns = open(p).read()\nold = '    if python and plain and command is not None:\\n'\nassert old in s\ns = s.replace(old, '    if python and command is not None:\\n')\nopen(p, 'w').write(s)\nEOF",
+    "command": "cd ~/Dev/guard-wt && python3 - <<'EOF'\np = 'smart-permissions/scripts/smart_permissions/core.py'\ns = open(p).read()\nold = '    if python and plain and command is not None:\\n'\nassert old in s\ns = s.replace(old, '    if python and command is not None:\\n')\nopen(p, 'w').write(s)\nEOF",
     "description": "Relax the heredoc rule in the worktree copy"
    }
   },

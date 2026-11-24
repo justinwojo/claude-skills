@@ -3185,7 +3185,7 @@ def _quietly(block, *args):
         return None
 
 
-_HOOK_FILES_RE = re.compile(r"smart-permissions|pretool_safety|permission_learner")
+_HOOK_FILES_RE = re.compile(r"smart-permissions|smart_permissions|pretool_safety|permission_learner")
 
 
 def live_hook_note(tool_input):

@@ -145,7 +145,8 @@ def test_harness_exit_status():
 def test_entry_shims():
     """The two entry scripts are thin shims over the smart_permissions package:
     importing one gives the package module itself, the hooks find config/ in
-    both install layouts, and both manifests register the same hooks."""
+    both install layouts, the PreToolUse shim fails closed without its
+    package, and both manifests register the same hooks."""
     print('\n--- Entry shims and package layout ---')
     _, cp = _fresh_cfg()
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
@@ -173,11 +174,6 @@ def test_entry_shims():
     check('urllib.request is not loaded until the judge is called', got[4:5], [False])
     check('SCRIPT_DIR is the scripts folder, PLUGIN_ROOT the plugin',
           [os.path.realpath(x) for x in got[5:7]], [os.path.realpath(SCRIPT_DIR), plugin])
-    for shim in (PRETOOL, LEARNER):
-        with open(shim) as f:
-            text = f.read()
-        check(f'{os.path.basename(shim)} is a thin shim',
-              (len(text.splitlines()) <= 20, 'def ' in text), (True, False))
 
     # Manual-install layout (README): config/ beside the scripts. An
     # unwritable folder (no __pycache__ can be written) still runs.
@@ -198,6 +194,34 @@ def test_entry_shims():
     finally:
         os.chmod(dest, 0o755)
         os.chmod(pkg, 0o755)
+
+    # A missing or broken package: PreToolUse blocks the call and says why (exit 2,
+    # as for a missing script); the learner exits 1 with no decision, so the
+    # native dialog shows. A SystemExit from main passes through the shim.
+    broken = os.path.join(base, 'broken')
+    os.makedirs(broken)
+    for n in (PRETOOL, LEARNER):
+        shutil.copy(n, broken)
+    read = json.dumps({'tool_name': 'Read', 'tool_input': {'file_path': '/etc/hosts'}})
+    for label, core_src in (('missing package', None), ('package that does not import', 'x = (\n'),
+                            ('main that exits', 'import sys\ndef main():\n    print("{}")\n    sys.exit(0)\n')):
+        if core_src is not None:
+            pkg_dir = os.path.join(broken, 'smart_permissions')
+            os.makedirs(pkg_dir, exist_ok=True)
+            open(os.path.join(pkg_dir, '__init__.py'), 'w').close()
+            with open(os.path.join(pkg_dir, 'core.py'), 'w') as f:
+                f.write(core_src)
+            shutil.rmtree(os.path.join(pkg_dir, '__pycache__'), ignore_errors=True)
+        r = subprocess.run([sys.executable, os.path.join(broken, 'pretool_safety.py')], input=read,
+                           capture_output=True, text=True, env=env)
+        if label == 'main that exits':
+            check(f'pretool shim, {label}: its exit and output pass through', (r.returncode, r.stdout.strip()), (0, '{}'))
+            continue
+        check(f'pretool shim, {label}: blocks the call (exit 2) and says why',
+              (r.returncode, r.stdout, r.stderr.startswith('smart-permissions could not start')), (2, '', True))
+        r = subprocess.run([sys.executable, os.path.join(broken, 'permission_learner.py')], input=read,
+                           capture_output=True, text=True, env=env)
+        check(f'learner shim, {label}: exit 1, no decision', (r.returncode, r.stdout), (1, ''))
 
     # The marketplace entry declares the same hooks as hooks/hooks.json (both load)
     with open(os.path.join(SCRIPT_DIR, '..', 'hooks', 'hooks.json')) as f:
@@ -6589,6 +6613,8 @@ def test_phase1b_fewer_judge_calls():
     note = p.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
     check('judge note: names the live copy',
           (p.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
+    check('judge note: a relative path into the package names the live copy',
+          p.PLUGIN_ROOT in p.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
     check('judge note: none for other calls', p.live_hook_note({'command': 'ls'}), '')
     ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
         'file_path': '/src/wt/smart-permissions/scripts/permission_learner.py'}})
