@@ -263,8 +263,9 @@ def build_sandbox_context(p, case, tmpdir):
     real_probe = p._probe
     p._probe = lambda argv, *a, **k: None if argv[0] == "gh" else real_probe(argv, *a, **k)
     try:
+        from smart_permissions.context import build_llm_context
         with p.using_state(state):
-            context = p.build_llm_context(payload, state)
+            context = build_llm_context(payload, state)
     finally:
         p._probe = real_probe
         state.cwd = display_cwd
@@ -282,12 +283,13 @@ def build_sandbox_context(p, case, tmpdir):
 def build_context(p, case, tmpdir):
     """build_llm_context() on a synthetic transcript holding the case's
     messages, with the case's mcp_context ({glob: sentence}) as the config's."""
-    saved = p.MCP_CONTEXT
-    p.MCP_CONTEXT = case.get("mcp_context", {})
+    from smart_permissions.context import notes  # _mcp_context_notes reads it there
+    saved = notes.MCP_CONTEXT
+    notes.MCP_CONTEXT = case.get("mcp_context", {})
     try:
         return _build_context(p, case, tmpdir)
     finally:
-        p.MCP_CONTEXT = saved
+        notes.MCP_CONTEXT = saved
 
 
 def _build_context(p, case, tmpdir):
@@ -302,13 +304,14 @@ def _build_context(p, case, tmpdir):
     if case.get("mcp_context"):  # the tool's name picks the notes; no probes run for MCP calls
         payload.update(tool_name=case["tool"], tool_input=case["input"])
     state = case["state"]
+    from smart_permissions.context import build_llm_context, notes
     with p.using_state(state):
-        context = p.build_llm_context(payload, state)
+        context = build_llm_context(payload, state)
     case["provenance"], case["script_texts"] = state.provenance, state.script_texts
     # The hook's note on which copy of the guard is live (a pure function of
     # the input, so no probes run for it); the payload above carries the
     # input only for MCP cases, where build_llm_context already added it
-    live = p.live_hook_note(case["input"]) if hasattr(p, "live_hook_note") else ""
+    live = notes.live_hook_note(case["input"])
     if live and live not in context:
         context = f"{context}\n{live}" if context else live
     # What the hook would compute from a real repository (worktree note, git status).

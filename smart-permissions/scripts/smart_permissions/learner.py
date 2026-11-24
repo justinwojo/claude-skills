@@ -49,7 +49,6 @@ from .core import (
     evaluate_web_fetch,
     bash_parse_uncertain,
     human_required_reason,
-    build_llm_context,
     llm_evaluate,
     llm_is_configured,
     llm_not_configured_reason,
@@ -72,6 +71,7 @@ from .core import (
     CONTEXT_TRANSCRIPT_TAIL_BYTES,
     PROMPT_TIMEOUT_S,
 )
+from .context import build_llm_context
 
 
 def _emit_allow():

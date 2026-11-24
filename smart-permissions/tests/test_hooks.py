@@ -4447,10 +4447,11 @@ def test_git_status_snapshot_for_discards():
     # GIT_DIR in the environment reaches the command, so the context follows it
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
     from smart_permissions import core as pretool_safety
+    from smart_permissions.context import git as cx_git
     saved = {k: os.environ.get(k) for k in ('GIT_DIR', 'GIT_WORK_TREE')}
     os.environ.update(GIT_DIR=os.path.join(repo, '.git'), GIT_WORK_TREE=repo)
     try:
-        ctx = pretool_safety.git_discard_context('git reset --hard', tree)
+        ctx = cx_git.git_discard_context('git reset --hard', tree)
     finally:
         for k, v in saved.items():
             os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
@@ -4458,7 +4459,7 @@ def test_git_status_snapshot_for_discards():
     check('inherited GIT_DIR: status of the real target', any(' M edited.txt' in c for c in ctx), True)
     os.environ['GIT_WORK_TREE'] = repo
     try:
-        ctx = pretool_safety.git_discard_context('git reset --hard', tree)
+        ctx = cx_git.git_discard_context('git reset --hard', tree)
     finally:
         os.environ.pop('GIT_WORK_TREE') if saved['GIT_WORK_TREE'] is None \
             else os.environ.__setitem__('GIT_WORK_TREE', saved['GIT_WORK_TREE'])
@@ -4485,6 +4486,7 @@ def test_git_remote_owners():
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
     from smart_permissions import core as p
+    from smart_permissions.context import git as cx_git
     real_probe = p._probe
     # No gh login unless a check asks for one, whatever this machine has
     p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
@@ -4516,7 +4518,7 @@ def test_git_remote_owners():
             subprocess.run(['git', '-C', bare, 'remote', 'add', 'mirror', 'https://github.com/stranger/x.git'], check=True)
             call_state.cwd = bare
             check('nothing to compare against goes to the LLM', verdict('git push mirror main'), 'ask')
-            ctx = '\n'.join(p.git_remote_context('git push mirror main', bare, time.monotonic() + 4))
+            ctx = '\n'.join(cx_git.git_remote_context('git push mirror main', bare, time.monotonic() + 4))
             check('no owners known: the owner is named', 'Remote mirror github.com/stranger.' in ctx, True)
             check('no owners known: no mismatch claimed', 'matches none' in ctx, False)
 
@@ -4585,14 +4587,14 @@ def test_git_remote_owners():
                 p._iter_commands = real_iter
             check('fish -C does not walk itself over and over', len(calls) < 200, True)
 
-            ctx = '\n'.join(p.git_remote_context(
+            ctx = '\n'.join(cx_git.git_remote_context(
                 'git remote add n https://github.com/other/y.git && git push n main', repo, time.monotonic() + 4))
             check('context: origin is the developer\'s', 'Remote origin github.com/devowner is the developer\'s.' in ctx, True)
             check('context: stranger named', 'Remote mirror github.com/stranger matches none' in ctx, True)
             check('context: URL in the command', 'URL in the command: github.com/other matches none' in ctx, True)
             check('context: no credentials', 's3cret' in ctx, False)
             check('context: refspec is not a URL',
-                  'head' in '\n'.join(p.git_remote_context('git push origin HEAD:main', repo, time.monotonic() + 4)), False)
+                  'head' in '\n'.join(cx_git.git_remote_context('git push origin HEAD:main', repo, time.monotonic() + 4)), False)
 
             for cmd, want in (
                     ('git remote add m https://github.com/x/y && git push m --all', True),
@@ -5962,6 +5964,7 @@ def test_session_provenance_and_loss_evidence():
     print('\n--- Deletes and resets: session provenance and loss evidence for the judge ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions.context import loss as cx_loss, provenance as cx_prov
     rmrf = d('cm0gLXJm')
     # The system temp folder: deletes there reach the judge (/tmp ones don't).
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-prov-'))
@@ -5999,7 +6002,7 @@ def test_session_provenance_and_loss_evidence():
 
     # ---- which deletes and resets are named ----
     def targets(cmd, here=cwd):
-        return [(k, path, label, br) for k, path, label, br in p.destructive_targets(cmd, here)]
+        return [(k, path, label, br) for k, path, label, br in cx_loss.destructive_targets(cmd, here)]
 
     t = targets(f'git -C {ours} reset --hard')
     check('discard: git -C folder', [(k, path) for k, path, _, _ in t], [('discard', ours)])
@@ -6059,7 +6062,7 @@ def test_session_provenance_and_loss_evidence():
                'tool_name': 'Bash', 'tool_input': {'command': current}}
 
     def provenance(data=payload, cmd=current, deadline=5.0):
-        blocks, status = p.session_provenance(data, p.destructive_targets(cmd, data.get('cwd')),
+        blocks, status = cx_prov.session_provenance(data, cx_loss.destructive_targets(cmd, data.get('cwd')),
                                               data.get('cwd'), time.monotonic() + deadline)
         return '\n'.join(blocks), status
 
@@ -6095,12 +6098,12 @@ def test_session_provenance_and_loss_evidence():
     same, _ = provenance(dict(payload, tool_use_id=None))
     check('provenance: without a tool_use_id the pending identical call is skipped', same, text)
     check('provenance: whole transcripts read, no cut note', 'Only the newest part' in text, False)
-    old = p.PROVENANCE_TAIL_BYTES
-    p.PROVENANCE_TAIL_BYTES = 900
+    old = cx_prov.PROVENANCE_TAIL_BYTES
+    cx_prov.PROVENANCE_TAIL_BYTES = 900
     try:
         cut, _ = provenance()
     finally:
-        p.PROVENANCE_TAIL_BYTES = old
+        cx_prov.PROVENANCE_TAIL_BYTES = old
     check('provenance: tail cut is said', 'Only the newest part' in cut, True)
     late, _ = provenance(deadline=-1)
     check('provenance: out of time → cut note, no matches',
@@ -6173,11 +6176,11 @@ def test_session_provenance_and_loss_evidence():
     check("quoted ~: no target", targets(f"{rmrf} '~/x' \"~\"/y \\~/z"), [])
     check("quoted ~ in a name's value: no target", targets(f"D='~/x'; {rmrf} \"$D\""), [])
     check('quoted ~: an earlier command names no home path',
-          p._named_paths(f"ls '~/x' \"~\"/y; cd '~/z' && ls w", {'x', 'y', 'w'}), set())
+          cx_prov._named_paths(f"ls '~/x' \"~\"/y; cd '~/z' && ls w", {'x', 'y', 'w'}), set())
 
     # ---- what a delete or branch deletion would lose ----
     deadline = time.monotonic() + 8
-    loss = '\n'.join(p.loss_context(p.destructive_targets(
+    loss = '\n'.join(cx_loss.loss_context(cx_loss.destructive_targets(
         f'{rmrf} {arms} {os.path.join(ours, "sub")} {plain}', cwd), set(), deadline))
     check('loss: repos inside the folder listed', f'Git repositories inside {arms}' in loss
           and '- ours:' in loss and '- brain:' in loss, True)
@@ -6189,7 +6192,7 @@ def test_session_provenance_and_loss_evidence():
     check('loss: folder inside a repo gets that repo\'s status of it',
           f'is inside the git repository {ours}' in loss and '?? sub/' in loss, True)
     check('loss: plain folder said to hold no repo', f'No git repository inside {plain}' in loss, True)
-    branch = '\n'.join(p._branch_loss(ours, ('exp', 'main', 'nosuch'), 'git branch -D', deadline))
+    branch = '\n'.join(cx_loss._branch_loss(ours, ('exp', 'main', 'nosuch'), 'git branch -D', deadline))
     check('loss: branch with one commit of its own, unmerged',
           'Branch exp' in branch and 'holds (no other branch or remote-tracking ref): 1. Not merged' in branch, True)
     check('loss: checked-out branch said so',
@@ -6201,7 +6204,7 @@ def test_session_provenance_and_loss_evidence():
     _git('-C', det, 'commit', '-q', '--allow-empty', '-m', 'one')
     _git('-C', det, 'checkout', '-q', '--detach')
     _git('-C', det, 'commit', '-q', '--allow-empty', '-m', 'detached work')
-    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {det} {remote}', cwd), set(),
+    loss = '\n'.join(cx_loss.loss_context(cx_loss.destructive_targets(f'{rmrf} {det} {remote}', cwd), set(),
                                     time.monotonic() + 8))
     check('loss: detached HEAD commits counted',
           'HEAD is detached, with 1 commit no branch or remote-tracking ref holds' in loss, True)
@@ -6353,6 +6356,8 @@ def test_phase1b_fewer_judge_calls():
     print('\n--- 1.6.0: Python heredocs, tighter inline reads, conditional names, CLIs, log, learner ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions import context as sp_ctx
+    from smart_permissions.context import notes as cx_notes
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p16-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -6739,13 +6744,13 @@ def test_phase1b_fewer_judge_calls():
         check('learner: an MCP tool with that suffix is judged', (out, os.path.exists(reqs)), ('allow', True))
 
         # ---- h. the judge is told which copy of the guard is live ----
-        note = p.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
+        note = cx_notes.live_hook_note({'file_path': '/src/wt/smart-permissions/scripts/pretool_safety.py'})
         check('judge note: names the live copy',
               (p.PLUGIN_ROOT in note, 'until that copy is installed' in note), (True, True))
         check('judge note: a relative path into the package names the live copy',
-              p.PLUGIN_ROOT in p.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
-        check('judge note: none for other calls', p.live_hook_note({'command': 'ls'}), '')
-        ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
+              p.PLUGIN_ROOT in cx_notes.live_hook_note({'file_path': 'scripts/smart_permissions/core.py'}), True)
+        check('judge note: none for other calls', cx_notes.live_hook_note({'command': 'ls'}), '')
+        ctx = sp_ctx.build_llm_context({'cwd': base, 'tool_name': 'Edit', 'tool_input': {
             'file_path': '/src/wt/smart-permissions/scripts/permission_learner.py'}}, call_state)
         check('judge note: in the context', p.PLUGIN_ROOT in ctx, True)
 
@@ -6754,6 +6759,8 @@ def test_phase1_evidence_and_rule_fixes():
     print('\n--- 1.5.0: judge key file, clones, brief, scripts, stashes, /tmp, MCP notes, rule fixes ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions import context as sp_ctx
+    from smart_permissions.context import loss as cx_loss, notes as cx_notes, provenance as cx_prov, scripts as cx_scripts
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p15-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -6803,38 +6810,38 @@ def test_phase1_evidence_and_rule_fixes():
     _git('clone', '-q', '--bare', src, bare)
     _git('clone', '-q', '--mirror', src, mirror)
     later = time.monotonic() + 8
-    loss = p._repo_loss(bare, later, bare=True)
+    loss = cx_loss._repo_loss(bare, later, bare=True)
     check('clone: commits counted without claiming they are unique',
           'Commits on local branches: 3. There are no remote-tracking refs' in loss
           and 'no remote-tracking ref holds' not in loss, True)
     check('clone: packed-refs only, nothing newer', 'Local branches: 1; 0 loose refs' in loss
           and 'no loose ref or reflog is newer than packed-refs' in loss, True)
     check('clone: never says recoverable', 'recoverable' in loss.lower(), False)
-    check('clone: mirror setting named', 'set up as a mirror' in p._repo_loss(mirror, later, bare=True), True)
+    check('clone: mirror setting named', 'set up as a mirror' in cx_loss._repo_loss(mirror, later, bare=True), True)
     _git('-C', mirror, 'tag', 'late')
     old = time.time() - 3600
     os.utime(os.path.join(mirror, 'packed-refs'), (old, old))
     check('clone: a loose tag newer than packed-refs counted',
-          '1 loose ref or reflog file newer than packed-refs' in p._repo_loss(mirror, later, bare=True), True)
+          '1 loose ref or reflog file newer than packed-refs' in cx_loss._repo_loss(mirror, later, bare=True), True)
     _git('-C', bare, 'update-ref', 'refs/heads/side', 'main')
     old = time.time() - 3600
     os.utime(os.path.join(bare, 'packed-refs'), (old, old))
     check('clone: a loose ref newer than packed-refs counted',
-          '1 loose ref or reflog file newer than packed-refs' in p._repo_loss(bare, later, bare=True), True)
-    saved = p._CACHE_ROOTS
-    p._CACHE_ROOTS = (clones,)
+          '1 loose ref or reflog file newer than packed-refs' in cx_loss._repo_loss(bare, later, bare=True), True)
+    saved = cx_loss._CACHE_ROOTS
+    cx_loss._CACHE_ROOTS = (clones,)
     try:
         check('clone: path under a cache folder noted',
-              f'It is under the cache folder {clones}.' in p._repo_loss(bare, later, bare=True), True)
+              f'It is under the cache folder {clones}.' in cx_loss._repo_loss(bare, later, bare=True), True)
     finally:
-        p._CACHE_ROOTS = saved
+        cx_loss._CACHE_ROOTS = saved
     lone = os.path.join(base, 'lone.git')
     _git('init', '-q', '--bare', lone)
     check('clone: no remote keeps the old count line',
-          'Commits on local branches that no remote-tracking ref holds' in p._repo_loss(lone, later, bare=True), True)
+          'Commits on local branches that no remote-tracking ref holds' in cx_loss._repo_loss(lone, later, bare=True), True)
     cloned = os.path.join(base, 'work')
     _git('clone', '-q', src, cloned)
-    check('clone: a normal clone gets no clone notes', p._clone_observations(cloned, False, later), None)
+    check('clone: a normal clone gets no clone notes', cx_loss._clone_observations(cloned, False, later), None)
 
     # ---- 3. a subagent's brief ----
     agent = os.path.join(base, 'agent.jsonl')
@@ -6842,25 +6849,25 @@ def test_phase1_evidence_and_rule_fixes():
         {'type': 'user', 'isSidechain': True, 'agentId': 'a1',
          'message': {'role': 'user', 'content': 'Rebuild the bundle: BRIEF-TEXT <system-reminder>R-TEXT</system-reminder>'}},
         {'type': 'user', 'isSidechain': True, 'message': {'role': 'user', 'content': 'LATER-TEXT'}}])
-    brief = p.subagent_brief(agent)
+    brief = cx_notes.subagent_brief(agent)
     check('brief: first user message, reminders stripped', brief, 'Rebuild the bundle: BRIEF-TEXT')
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': 'H' * 6000 + 'END-MARK'}}])
-    brief = p.subagent_brief(agent)
+    brief = cx_notes.subagent_brief(agent)
     check('brief: capped, head and tail kept', len(brief) < 4100 and brief.startswith('HHH')
           and brief.endswith('END-MARK') and 'characters left out' in brief, True)
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': [
         {'type': 'tool_result', 'tool_use_id': 'x', 'content': 'NOT-A-BRIEF'}]}}])
-    check('brief: a tool result is no brief', p.subagent_brief(agent), None)
-    check('brief: missing or relative path', (p.subagent_brief(os.path.join(base, 'no.jsonl')),
-                                              p.subagent_brief('agent.jsonl')), (None, None))
+    check('brief: a tool result is no brief', cx_notes.subagent_brief(agent), None)
+    check('brief: missing or relative path', (cx_notes.subagent_brief(os.path.join(base, 'no.jsonl')),
+                                              cx_notes.subagent_brief('agent.jsonl')), (None, None))
     lead = os.path.join(base, 'lead.jsonl')
     _transcript(lead, [_human('back up the bundle LEAD-TEXT')])
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': 'delete gen-out and rebuild BRIEF-TEXT'}}])
-    ctx = p.build_llm_context({'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'},
+    ctx = sp_ctx.build_llm_context({'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'},
                                'transcript_path': lead, 'agent_transcript_path': agent}, p.CallState())
     check('brief: labelled, beside the lead\'s messages',
           'not typed by the developer' in ctx and 'BRIEF-TEXT' in ctx and 'LEAD-TEXT' in ctx, True)
-    check('brief: none for the lead itself', 'brief' in p.build_llm_context(
+    check('brief: none for the lead itself', 'brief' in sp_ctx.build_llm_context(
         {'cwd': base, 'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'transcript_path': lead},
         p.CallState()), False)
 
@@ -6876,7 +6883,7 @@ def test_phase1_evidence_and_rule_fixes():
         f.write(b'\x00\x01binary')
 
     def shown(cmd, cwd=proj):
-        return p.script_context(cmd, cwd)
+        return cx_scripts.script_context(cmd, cwd)
     check('scripts: bash file shown', 'RUN-BODY' in shown('bash run.sh'), True)
     check('scripts: helper it names is flagged unseen', 'names other local scripts not shown here: ./tools/helper.sh' in shown('bash run.sh'), True)
     check('scripts: sourced file shown', 'ENV_BODY' in shown('. ./env.sh && make'), True)
@@ -6914,7 +6921,7 @@ def test_phase1_evidence_and_rule_fixes():
     sess = os.path.join(base, 'sess.jsonl')
     made = dict(_bash_use('toolu_s1', f'cd {repo} && git stash push -m try-alt-parser', 5), cwd=base)
     _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60)), made, _bash_result('toolu_s1', 5)])
-    stash = '\n'.join(p.stash_context('git stash drop stash@{0}', repo,
+    stash = '\n'.join(cx_prov.stash_context('git stash drop stash@{0}', repo,
                                       {'transcript_path': sess}, time.monotonic() + 8))
     check('stash: listed with its message', 'stash@{0}' in stash and 'try-alt-parser' in stash, True)
     check('stash: made after the session started', '(after this session started)' in stash, True)
@@ -6928,15 +6935,15 @@ def test_phase1_evidence_and_rule_fixes():
                        dict(_bash_use('toolu_n', f'cd {nested} && git stash', 7), cwd=base),
                        dict(_bash_use('toolu_f', f'cd {repo} && git stash', 6), cwd=base),
                        _bash_result('toolu_f', 6, error=True)])
-    stash = '\n'.join(p.stash_context(f'git -C {repo} stash --quiet drop', base, {'transcript_path': sess},
+    stash = '\n'.join(cx_prov.stash_context(f'git -C {repo} stash --quiet drop', base, {'transcript_path': sess},
                                       time.monotonic() + 8))
     check('stash: only real stash calls in that repo, failures said',
           '1 time(s), 1 of them failed' in stash and '(failed)' in stash, True)
     _transcript(sess, [dict(_human('go'), timestamp=_iso_ago(60))])
-    stash = '\n'.join(p.stash_context(f'git -C {repo} stash clear', base, {'transcript_path': sess},
+    stash = '\n'.join(cx_prov.stash_context(f'git -C {repo} stash clear', base, {'transcript_path': sess},
                                       time.monotonic() + 8))
     check('stash: none made by this session said so', 'show no Bash call that ran a stash-making' in stash, True)
-    check('stash: list and show are not discards', p.stash_context('git stash list', repo, {}, time.monotonic() + 8), [])
+    check('stash: list and show are not discards', cx_prov.stash_context('git stash list', repo, {}, time.monotonic() + 8), [])
 
     # ---- 6. a private folder under /tmp, and a clone rooted there ----
     tmpdir = os.path.realpath(tempfile.mkdtemp(prefix='sp-p15-', dir='/tmp'))
@@ -6944,24 +6951,24 @@ def test_phase1_evidence_and_rule_fixes():
     tmpname = os.path.basename(tmpdir)
     reason = p.evaluate_bash(f'PYTHONPATH=/tmp/{tmpname}/old/src python3 -m pytest -q', log_unknowns=False)
     check('tmp: private folder said not world-writable', reason[0] == 'ask' and 'not world-writable' in reason[1], True)
-    check('tmp: context names the owner and mode', 'mode 700 (private' in p.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
+    check('tmp: context names the owner and mode', 'mode 700 (private' in cx_notes.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
     os.chmod(tmpdir, 0o777)
     check('tmp: a world-writable folder gets no such note',
           'not world-writable' in p.evaluate_bash(f'PYTHONPATH=/tmp/{tmpname}/src python3 x.py', log_unknowns=False)[1], False)
-    check('tmp: world-writable said so', 'world-writable)' in p.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
+    check('tmp: world-writable said so', 'world-writable)' in cx_notes.temp_privacy_context([f'/tmp/{tmpname}/x']), True)
     os.chmod(tmpdir, 0o700)
     check('tmp: mixed entries get no note', 'not world-writable' in p.evaluate_bash(
         f'PYTHONPATH=/tmp/{tmpname}/src:/opt/x python3 x.py', log_unknowns=False)[1], False)
     tclone = os.path.join(tmpdir, 'repo')
     _git('clone', '-q', src, tclone)
     os.makedirs(os.path.join(tclone, 'docs', 'evidence'))
-    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {tclone}/docs/evidence', tmpdir),
+    loss = '\n'.join(cx_loss.loss_context(cx_loss.destructive_targets(f'{rmrf} {tclone}/docs/evidence', tmpdir),
                                     set(), time.monotonic() + 8))
     check('tmp: a target in a clone rooted under /tmp names its remotes',
           "The repository's root is under /tmp; its remotes: origin" in loss, True)
     with open(os.path.join(tclone, 'docs', 'evidence', 'run.json'), 'w') as f:
         f.write('{}\n')
-    loss = '\n'.join(p.loss_context(p.destructive_targets(f'{rmrf} {tclone}/docs/evidence/*', tmpdir),
+    loss = '\n'.join(cx_loss.loss_context(cx_loss.destructive_targets(f'{rmrf} {tclone}/docs/evidence/*', tmpdir),
                                     set(), time.monotonic() + 8))
     check('tmp: a file a glob names gets git\'s view too', 'run.json' in loss and '?? docs/evidence/run.json' in loss, True)
 
@@ -7034,9 +7041,9 @@ def test_phase1_evidence_and_rule_fixes():
     check('key file: a FIFO is refused without blocking',
           p._load_llm_env_file(fifo)[0] == {} and time.monotonic() - t0 < 2, True)
     check('brief: a FIFO or a NUL in the path is no brief',
-          (p.subagent_brief(fifo), p.subagent_brief(base + '/a\0b')), (None, None))
+          (cx_notes.subagent_brief(fifo), cx_notes.subagent_brief(base + '/a\0b')), (None, None))
     _transcript(agent, [{'type': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': 7}]}}])
-    check('brief: a malformed text block is no brief', p.subagent_brief(agent), None)
+    check('brief: a malformed text block is no brief', cx_notes.subagent_brief(agent), None)
     with open(os.path.join(proj, '.env'), 'w') as f:
         f.write('#!/bin/sh\nexport TOKEN=SECRET-BODY\n')
     check('scripts: a sensitive file is never shown', 'SECRET-BODY' in shown('ssh host sh < .env') + shown('bash .env'), False)
@@ -7083,7 +7090,7 @@ def test_phase1_evidence_and_rule_fixes():
                        dict(_bash_use('toolu_o', f'git -C {src} stash', 5), cwd=repo),
                        {'type': 'user', 'message': {'role': 'user', 'content': [
                            {'type': 'tool_result', 'tool_use_id': ['x'], 'content': 'x'}]}}])
-    stash = '\n'.join(p.stash_context(f'git -C {repo} stash drop', base, {'transcript_path': sess},
+    stash = '\n'.join(cx_prov.stash_context(f'git -C {repo} stash drop', base, {'transcript_path': sess},
                                       time.monotonic() + 8))
     check('stash: a call in another repo is not credited, a malformed result is skipped',
           'stash@{0}' in stash and 'show no Bash call that ran a stash-making' in stash, True)
@@ -7094,10 +7101,10 @@ def test_phase1_evidence_and_rule_fixes():
     check('wrapper: script FILE naming a config path asks the human',
           p.human_required_reason('Bash', {'command': f"script -t -c 'printf x' {settings}"}) is not None, True)
     check('stash: credited where the stash ran, not where the call ended',
-          (p._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(src)),
-           p._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(repo))),
+          (cx_prov._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(src)),
+           cx_prov._stash_made_in(f'cd {repo} && git stash push; cd {src}', base, os.path.realpath(repo))),
           (False, True))
-    check('stash: a malformed Bash id is skipped, not fatal', list(p._bash_inputs(
+    check('stash: a malformed Bash id is skipped, not fatal', list(cx_prov._bash_inputs(
         {'type': 'assistant', 'wireToolInputs': {'a': {}}, 'message': {'content': [
             {'type': 'tool_use', 'name': 'Bash', 'id': ['x'], 'input': {'command': 'ls'}}]}})), [(['x'], ['ls'])])
     # ---- review round 4 ----
@@ -7106,7 +7113,7 @@ def test_phase1_evidence_and_rule_fixes():
     check('steer: a brace holding an expansion may still make an empty word',
           p.unguarded_delete_check('for S in {${X},abc}; do ' + rmrf + ' "/tmp/q/$S"; done') is not None, True)
     check('stash: an earlier git -C elsewhere leaves the stash uncredited',
-          p._stash_made_in(f'git -C {src} status; git stash push', repo, os.path.realpath(src)), False)
+          cx_prov._stash_made_in(f'git -C {src} status; git stash push', repo, os.path.realpath(src)), False)
     probes = []
     real_evidence = p._evidence_path
     p._evidence_path = lambda *a: probes.append(a) or real_evidence(*a)
@@ -7121,7 +7128,7 @@ def test_phase1_evidence_and_rule_fixes():
               'script -q "$OUT" printf fixture', 'script -q "$@" printf fixture', 'script -q -O "$L" -c ls')],
           ['ask'] * 3)
     check('stash: git stash inside quoted text is no stash call',
-          p._stash_made_in("printf 'note; git stash push; end'", repo, os.path.realpath(repo)), False)
+          cx_prov._stash_made_in("printf 'note; git stash push; end'", repo, os.path.realpath(repo)), False)
     from smart_permissions import flags as pflags  # the module whose code reads it
     saved_flag = pflags.LLM_FLAG_PATH
     pflags.LLM_FLAG_PATH = os.path.join(base, 'flags.json')
@@ -7708,6 +7715,7 @@ def test_phase2_remote_exec():
 def test_review_fixes_1_7_0():
     print('\n--- 1.7.0 branch review fixes ---')
     p = _pretool_module()
+    from smart_permissions.context import provenance as cx_prov
     # C4: a def or class bound over an imported Path is a rebinding too.
     settings = os.path.join(os.path.expanduser('~'), '.claude', 'settings.json')
     for kind, binding in (('def', 'def Path(x):\n    return CFG\n'),
@@ -7792,9 +7800,9 @@ def test_review_fixes_1_7_0():
     for text in (f'echo "note; git stash push"; git -C {other} stash',
                  f'git commit -m "x; git stash push" && git -C {other} stash',
                  f"printf 'a; git stash'; cd {other} && git stash"):
-        check(f'stash: quoted mention not credited: {text[:30]}', p._stash_made_in(text, repo, top), False)
+        check(f'stash: quoted mention not credited: {text[:30]}', cx_prov._stash_made_in(text, repo, top), False)
     check('stash: a real one still credited',
-          p._stash_made_in('echo "a; b" && git stash push -m wip', repo, top), True)
+          cx_prov._stash_made_in('echo "a; b" && git stash push -m wip', repo, top), True)
 
 
 def _wait_patch(timeout_s, sleeps):
@@ -8178,6 +8186,7 @@ def test_remote_provenance_1_8_1():
     print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')
     sys.path.insert(0, SCRIPT_DIR)
     from smart_permissions import core as p
+    from smart_permissions.context import loss as cx_loss, provenance as cx_prov
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-remote-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -8222,19 +8231,19 @@ def test_remote_provenance_1_8_1():
     wt = 'C:\\Lab\\proj-wt\\s4'
     ps = (f"& {{ $main = 'C:\\Lab\\proj'; $wt = '{wt}'; git -C $main worktree remove --force $wt; "
           "if (Test-Path $wt) { Remove-Item -Recurse -Force $wt } }")
-    key, paths = p._remote_targets('mcp__bench__run', {'command': ps, 'timeout_s': 300})
+    key, paths = cx_prov._remote_targets('mcp__bench__run', {'command': ps, 'timeout_s': 300})
     check('remote: an MCP cleanup is keyed by its server, paths most specific first',
           (key, [n for _, n in paths]), ('mcp__bench__', ['c:/lab/proj-wt/s4', 'c:/lab/proj']))
     check('remote: an MCP command that deletes nothing → no lookup',
-          p._remote_targets('mcp__bench__run', {'command': f'dir {wt}'}), None)
+          cx_prov._remote_targets('mcp__bench__run', {'command': f'dir {wt}'}), None)
     check('remote: an MCP tool without a command → no lookup',
-          p._remote_targets('mcp__bench__read_file', {'path': wt}), None)
+          cx_prov._remote_targets('mcp__bench__read_file', {'path': wt}), None)
     ssh = "ssh -p 2222 dev@runner 'cd ~/Dev/repo && git worktree remove --force ~/scratch/lead-1'"
-    check('remote: ssh gets no history block', p._remote_targets('Bash', {'command': ssh}), None)
+    check('remote: ssh gets no history block', cx_prov._remote_targets('Bash', {'command': ssh}), None)
     check('paths: Windows case and slashes, trailing slash, roots and .. dropped',
-          [n for _, n in p._remote_paths("C:\\Lab\\X\\ C:/lab/x/ / ~ C:\\ /srv/a/../b ~/k/ /srv/$v")],
+          [n for _, n in cx_prov._remote_paths("C:\\Lab\\X\\ C:/lab/x/ / ~ C:\\ /srv/a/../b ~/k/ /srv/$v")],
           ['c:/lab/x', 'c:/lab/x', '~/k'])
-    check('paths: a URL is not a path', p._remote_paths('git clone https://example.com/a/b /srv/b'),
+    check('paths: a URL is not a path', cx_prov._remote_paths('git clone https://example.com/a/b /srv/b'),
           [('/srv/b', '/srv/b')])
 
     # ---- 3. this session's earlier calls there, main and subagent ----
@@ -8261,7 +8270,7 @@ def test_remote_provenance_1_8_1():
                'tool_name': 'mcp__bench__run', 'tool_input': {'command': ps}}
 
     def remote(data=payload):
-        blocks, status = p.remote_provenance(data, data['tool_name'], data['tool_input'],
+        blocks, status = cx_prov.remote_provenance(data, data['tool_name'], data['tool_input'],
                                              time.monotonic() + 5)
         return '\n'.join(blocks), status
 
@@ -8328,11 +8337,11 @@ def test_remote_provenance_1_8_1():
     # cut at a space is left out
     pf = 'C:\\Program Files\\Build'
     check('C4: an MCP cwd with a space is one path',
-          [n for _, n in p._remote_targets('mcp__bench__run', {'command': 'git clean -fdx', 'cwd': pf})[1]],
+          [n for _, n in cx_prov._remote_targets('mcp__bench__run', {'command': 'git clean -fdx', 'cwd': pf})[1]],
           ['c:/program files/build'])
-    check('C4: a POSIX path with a backslash is not folded', p._remote_norm('/srv/A\\b'), '/srv/A\\b')
+    check('C4: a POSIX path with a backslash is not folded', cx_prov._remote_norm('/srv/A\\b'), '/srv/A\\b')
     check('C4: a quoted path cut at a space is left out',
-          [n for _, n in p._remote_paths(f'{rmrf} "/srv/my dir" \'/srv/ok\'')], ['/srv/ok'])
+          [n for _, n in cx_prov._remote_paths(f'{rmrf} "/srv/my dir" \'/srv/ok\'')], ['/srv/ok'])
     cmd_pf = {'command': 'git clean -fdx', 'cwd': pf}
     pft = os.path.join(proj, 'sess-pf.jsonl')
     _transcript(pft, [_tool_use('q1', 'mcp__bench__run', {'command': 'dir', 'cwd': 'C:\\Program'}, 20),
@@ -8343,32 +8352,32 @@ def test_remote_provenance_1_8_1():
           ('1 earlier call names it' in text, 'run: git status' in text, 'run: dir' in text), (True, True, False))
     # C4 (round 2): a path is a whole word, bare or in one closed pair of quotes
     check('C4: a quote inside a word, a path cut at a space, or a quote left open names nothing',
-          [n for _, n in p._remote_paths('git --work-tree="/srv/a b" clean -fdx; ls --dir=/srv/c '
+          [n for _, n in cx_prov._remote_paths('git --work-tree="/srv/a b" clean -fdx; ls --dir=/srv/c '
                                          '"/srv/d" \'/srv/e\'; x"/srv/f" "/srv/g\' /srv/h')],
           ['/srv/d', '/srv/e'])
     # C21: whole words of plain characters only; a quoted span with whitespace names nothing
     check('C21: a comma, a glob, or a path inside a spaced quote names nothing',
-          [n for _, n in p._remote_paths(f"{rmrf} /srv/build,old /srv/[ab] '/srv/my /scratch/build data' "
+          [n for _, n in cx_prov._remote_paths(f"{rmrf} /srv/build,old /srv/[ab] '/srv/my /scratch/build data' "
                                          "/srv/ok; 'C:\\Lab\\w';")], ['/srv/ok', 'c:/lab/w'])
     # C23: a spaced quote spoils its word; an open quote hides the rest
     check("C23: /srv/build' old' names nothing; an open quote hides what follows",
-          ([n for _, n in p._remote_paths(f"{rmrf} /srv/build' old' /srv/ok")],
-           [n for _, n in p._remote_paths(f"{rmrf} /srv/ok 'never closed /srv/hidden")]),
+          ([n for _, n in cx_prov._remote_paths(f"{rmrf} /srv/build' old' /srv/ok")],
+           [n for _, n in cx_prov._remote_paths(f"{rmrf} /srv/ok 'never closed /srv/hidden")]),
           (['/srv/ok'], ['/srv/ok']))
-    capped = f"{rmrf} /srv/ok '" + 'x' * p.REMOTE_SCAN_CHARS + "' /srv/after"
+    capped = f"{rmrf} /srv/ok '" + 'x' * cx_prov.REMOTE_SCAN_CHARS + "' /srv/after"
     check('C23: a quote opened before the scan cap hides the paths after it',
-          [n for _, n in p._remote_paths(capped)], ['/srv/ok'])
+          [n for _, n in cx_prov._remote_paths(capped)], ['/srv/ok'])
     # C24: one pass over the quotes
     quoted = "ls " + "'/srv/q a' " * 1500 + '"/srv/r" ' * 1500
     t0 = time.monotonic()
     for _ in range(20):
-        p._remote_paths(quoted[:p.REMOTE_SCAN_CHARS])
+        cx_prov._remote_paths(quoted[:cx_prov.REMOTE_SCAN_CHARS])
     check('C24: 20 reads of 16 KB of quoted words in under 0.2 s', time.monotonic() - t0 < 0.2, True)
     slow = os.path.join(proj, 'sess-c24.jsonl')
     heavy = {'command': '/srv/build ' + "'a b' \"c\" " * 300}
     _transcript(slow, [_tool_use(f'q{i}', 'mcp__bench__run', heavy, 30) for i in range(600)])
     t0 = time.monotonic()
-    _, status = p.remote_provenance(dict(payload, transcript_path=slow, tool_input={'command': f'{rmrf} /srv/build'}),
+    _, status = cx_prov.remote_provenance(dict(payload, transcript_path=slow, tool_input={'command': f'{rmrf} /srv/build'}),
                                     'mcp__bench__run', {'command': f'{rmrf} /srv/build'}, time.monotonic() + 0.1)
     check('C24: heavy quoted records stop within a few ms of the deadline',
           (status, time.monotonic() - t0 < 0.15), ('found', True))
@@ -8383,8 +8392,8 @@ def test_remote_provenance_1_8_1():
     # C22: a long word costs little
     longw = {'command': f'{rmrf} /srv/' + 'a' * 40000}
     t0 = time.monotonic()
-    p._remote_paths(longw['command'])
-    p._remote_targets('mcp__bench__run', longw)
+    cx_prov._remote_paths(longw['command'])
+    cx_prov._remote_targets('mcp__bench__run', longw)
     check('C22: a 40 KB word is read in under 0.1 s', time.monotonic() - t0 < 0.1, True)
     # C20: an earlier call is shown field by field redacted, as the log
     c20 = os.path.join(proj, 'sess-c20.jsonl')
@@ -8401,19 +8410,19 @@ def test_remote_provenance_1_8_1():
                                                              'pwd': 'p', 'n': 1}, None, redact=True)),
           {'credentials': '[REDACTED]', 'client_key': '[REDACTED]', 'pwd': '[REDACTED]', 'n': 1})
     # C14: the word the scan limit cuts through is no path
-    pad = 'x' * (p.REMOTE_SCAN_CHARS - len(f' {rmrf} /srv/build'))
+    pad = 'x' * (cx_prov.REMOTE_SCAN_CHARS - len(f' {rmrf} /srv/build'))
     cutcmd = f'{pad} {rmrf} /srv/build-other /srv/z'
     check('C14: a path cut at the scan limit names nothing',
-          ([n for _, n in p._remote_paths(cutcmd)], [n for _, n in p._remote_paths(cutcmd[:p.REMOTE_SCAN_CHARS])]),
+          ([n for _, n in cx_prov._remote_paths(cutcmd)], [n for _, n in cx_prov._remote_paths(cutcmd[:cx_prov.REMOTE_SCAN_CHARS])]),
           ([], ['/srv/build']))
     hist = os.path.join(proj, 'sess-c14.jsonl')
-    _transcript(hist, [_tool_use('h1', 'mcp__bench__run', {'command': 'x' * (p.REMOTE_SCAN_CHARS - len(' ls /srv/build')) + ' ls /srv/build-other'}, 20),
+    _transcript(hist, [_tool_use('h1', 'mcp__bench__run', {'command': 'x' * (cx_prov.REMOTE_SCAN_CHARS - len(' ls /srv/build')) + ' ls /srv/build-other'}, 20),
                        _bash_result('h1', 20)])
     text, status = remote(dict(payload, transcript_path=hist, tool_input={'command': f'{rmrf} /srv/build'}))
     check('C14: an earlier call cut at the limit is no evidence', status, 'none')
     # C15: a share (//) is not a rooted path
-    check('C15: // kept apart from /', (p._remote_norm('//fileserver/share/s'), p._remote_norm('/fileserver/share/s'),
-                                         p._remote_norm('//')), ('//fileserver/share/s', '/fileserver/share/s', None))
+    check('C15: // kept apart from /', (cx_prov._remote_norm('//fileserver/share/s'), cx_prov._remote_norm('/fileserver/share/s'),
+                                         cx_prov._remote_norm('//')), ('//fileserver/share/s', '/fileserver/share/s', None))
     # C18: the tool name shows even when the snippet is clipped
     longt = os.path.join(proj, 'sess-c18.jsonl')
     _transcript(longt, [_tool_use('l1', 'mcp__bench__read_file', {'note_path': '/srv/' + 'n' * 400,
@@ -8449,7 +8458,7 @@ def test_remote_provenance_1_8_1():
     text, _ = remote(dict(payload, transcript_path=c6, tool_use_id='r2', tool_input=reordered))
     check('C6: with its id, a call after it is dropped', ('w\\a' in text, 'later' in text), (True, False))
     # C16: the cut-off holds when the byte budget runs out before the next transcript
-    old = p.PROVENANCE_TOTAL_BYTES
+    old = cx_prov.PROVENANCE_TOTAL_BYTES
     try:
         later = os.path.join(proj, 'sess-c16.jsonl')
         os.makedirs(os.path.join(proj, 'sess-c16', 'subagents'))
@@ -8457,22 +8466,22 @@ def test_remote_provenance_1_8_1():
                             _bash_result('y1', 1),
                             _tool_use('y2', 'mcp__bench__run', reordered, 5)])
         _transcript(os.path.join(proj, 'sess-c16', 'subagents', 'agent-q.jsonl'), [])
-        p.PROVENANCE_TOTAL_BYTES = os.path.getsize(later)  # gone after the main transcript
+        cx_prov.PROVENANCE_TOTAL_BYTES = os.path.getsize(later)  # gone after the main transcript
         text, _ = remote(dict(payload, transcript_path=later, tool_use_id='y2', tool_input=reordered))
     finally:
-        p.PROVENANCE_TOTAL_BYTES = old
+        cx_prov.PROVENANCE_TOTAL_BYTES = old
     check('C16: budget out before the next transcript: a later call is still dropped',
           ('after' in text, 'Only the newest part' in text), (False, True))
     # C9: a long command stays within the budget
     big = {'command': ('git status; echo ' + 'x' * 60 + ' ') * 400 + f'git reset reset --hard; {rmrf} /srv/w'}
     check('C9: the input is over 30 KB', len(big['command']) > 30000, True)
     t0 = time.monotonic()
-    p._remote_targets('mcp__bench__run', big)
-    p._REMOTE_RESET_HINT_RE.search(('git reset ' * 3000)[:p.REMOTE_SCAN_CHARS])
-    blocks, status = p.remote_provenance(dict(payload, tool_input=big), 'mcp__bench__run', big,
+    cx_prov._remote_targets('mcp__bench__run', big)
+    cx_prov._REMOTE_RESET_HINT_RE.search(('git reset ' * 3000)[:cx_prov.REMOTE_SCAN_CHARS])
+    blocks, status = cx_prov.remote_provenance(dict(payload, tool_input=big), 'mcp__bench__run', big,
                                          time.monotonic() + 1.0)
     check('C9: classifying a 33 KB input and its lookup stay within a second', time.monotonic() - t0 < 1.0, True)
-    check('C9: past the deadline: no lookup', p.remote_provenance(payload, 'mcp__bench__run', payload['tool_input'],
+    check('C9: past the deadline: no lookup', cx_prov.remote_provenance(payload, 'mcp__bench__run', payload['tool_input'],
                                                                   time.monotonic() - 1), ([], None))
 
     # ---- 5. local Bash provenance is unchanged by any of this ----
@@ -8482,8 +8491,8 @@ def test_remote_provenance_1_8_1():
     _transcript(lt, [_bash_use('l1', f'mkdir -p {local}/a', 30), _bash_result('l1', 30)])
     data = {'cwd': base, 'transcript_path': lt, 'tool_name': 'Bash', 'tool_input': {'command': f'{rmrf} {local}'}}
     check('local: Bash delete has no remote lookup',
-          p.remote_provenance(data, 'Bash', data['tool_input'], time.monotonic() + 5), ([], None))
-    blocks, status = p.session_provenance(data, p.destructive_targets(f'{rmrf} {local}', base), base,
+          cx_prov.remote_provenance(data, 'Bash', data['tool_input'], time.monotonic() + 5), ([], None))
+    blocks, status = cx_prov.session_provenance(data, cx_loss.destructive_targets(f'{rmrf} {local}', base), base,
                                           time.monotonic() + 5)
     check('local: provenance as before', (status, 'ok, names a path inside it: mkdir' in '\n'.join(blocks)),
           ('found', True))
