@@ -2007,7 +2007,9 @@ class _BrokenPackage(Exception):
 def main():
     """The hook. Any failure inside (a RecursionError on a deeply nested
     command, a parser bug) puts the call in front of the human: never an
-    allow, never a crash with no verdict. The call's state (see CallState)
+    allow, never a crash with no verdict. The exception is a package module
+    that fails to load on the judged path: that blocks the call, as a broken
+    startup does (see _BrokenPackage). The call's state (see CallState)
     is created here and is the active one throughout."""
     state = CallState()
     with using_state(state):
