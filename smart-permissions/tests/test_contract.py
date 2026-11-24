@@ -59,6 +59,10 @@ import time
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOKS_JSON = os.path.join(PLUGIN_ROOT, 'hooks', 'hooks.json')
 GOLDEN_PATH = os.path.join(PLUGIN_ROOT, 'tests', 'contract_golden.json')
+# Every log record carries the release version. The snapshot holds '<version>'
+# instead, so a version bump alone is no diff (a record with any other version is).
+with open(os.path.join(os.path.dirname(PLUGIN_ROOT), '.claude-plugin', 'marketplace.json')) as f:
+    RELEASE_VERSION = json.load(f)['metadata']['version']
 
 passed = 0
 failed = 0
@@ -308,8 +312,8 @@ class Sandbox:
         out = {}
         for base, dirs, names in os.walk(self.claude):
             rel_base = os.path.relpath(base, self.claude)
-            if rel_base.split(os.sep)[0] == 'projects':
-                continue
+            if rel_base.split(os.sep)[0] == 'projects' or '__pycache__' in rel_base.split(os.sep):
+                continue  # bytecode caches (a manual install's) are named per interpreter
             for n in names:
                 p = os.path.join(base, n)
                 rel = re.sub(r'[0-9a-f]{64}', '<hold>', os.path.relpath(p, self.claude))
@@ -492,6 +496,8 @@ def run(sb, hook, payload=None, raw=None, judge=None, provider='openai', env=Non
             rec.pop(k, None)
         if 'llm_ms' in rec:
             rec['llm_ms'] = '<ms>'
+        if rec.get('v') == RELEASE_VERSION:
+            rec['v'] = '<version>'
         if rec.get('input_len') == len(rec.get('input') or '') and not rec.get('truncated'):
             rec['input_len'] = '=len(input)'  # the sandbox path length is not the contract
         log.append(rec)
@@ -1326,26 +1332,30 @@ def seq_hold_developer_only_category(c):
 
 @case
 def p_manual_install_layout(c):
-    """README §Manual setup: both scripts and config/ into
-    ~/.claude/hooks/smart-permissions/. KNOWN BUG (recorded, not fixed in
-    phase 0): the hook looks for config/ one level above its own folder
-    (~/.claude/hooks/config/), so a manual install fails closed."""
+    """README §Manual setup: the two entry scripts, the smart_permissions
+    package and config/ into ~/.claude/hooks/smart-permissions/. Both hooks
+    find config/ beside the scripts (1.8.1 looked one level up, in
+    ~/.claude/hooks/config/, and failed closed)."""
     sb = Sandbox()
     dest = os.path.join(sb.claude, 'hooks', 'smart-permissions')
     os.makedirs(dest)
     for n in ('pretool_safety.py', 'permission_learner.py'):
         shutil.copy(os.path.join(PLUGIN_ROOT, 'scripts', n), dest)
+    shutil.copytree(os.path.join(PLUGIN_ROOT, 'scripts', 'smart_permissions'),
+                    os.path.join(dest, 'smart_permissions'),
+                    ignore=shutil.ignore_patterns('__pycache__'))
     shutil.copytree(os.path.join(PLUGIN_ROOT, 'config'), os.path.join(dest, 'config'))
-    cmd = f'python3 {dest}/pretool_safety.py'
-    old = HOOK_COMMANDS['pretool']
-    HOOK_COMMANDS['pretool'] = cmd
+    old = dict(HOOK_COMMANDS)
+    HOOK_COMMANDS['pretool'] = f'python3 {dest}/pretool_safety.py'
+    HOOK_COMMANDS['learner'] = f'python3 {dest}/permission_learner.py'
     try:
-        s = run(sb, 'pretool', sb.bash('git status'))
+        s1 = run(sb, 'pretool', sb.bash('git status'))
+        s2 = run(sb, 'learner', lcall(sb, 'git status'), judge=[SAFE])
     finally:
-        HOOK_COMMANDS['pretool'] = old
-    expect(c, 1, s, out=None, judge=0, events=[('pretool', 'ask', 'llm')],
-           stderr='re:^Warning: Could not load defaults: .*hooks/config/defaults.json')
-    return [s]
+        HOOK_COMMANDS.update(old)
+    expect(c, 1, s1, out='allow', judge=0, events=[('pretool', 'allow', 'rule')], stderr='')
+    expect(c, 2, s2, out='allow', judge=1, events=[('permission_request', 'allow', 'llm')], stderr='')
+    return [s1, s2]
 
 
 # =====================================================================

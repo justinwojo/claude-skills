@@ -598,13 +598,16 @@ Tools like `git`, `dotnet`, `make`, and `brew` remain single-word (all subcomman
 
 If you prefer not to use the plugin system:
 
-1. Copy **both** scripts and the config (the learner imports shared logic from
-   `pretool_safety.py`, so they must sit in the same directory):
+1. From this folder, copy **both** entry scripts, the `smart_permissions` package
+   they run (it holds the code of both hooks) and the config into one directory:
    ```bash
    mkdir -p ~/.claude/hooks/smart-permissions
    cp scripts/pretool_safety.py scripts/permission_learner.py ~/.claude/hooks/smart-permissions/
+   cp -r scripts/smart_permissions ~/.claude/hooks/smart-permissions/
    cp -r config/ ~/.claude/hooks/smart-permissions/config/
    ```
+   When you update, copy all three again: the entry scripts and the package
+   must come from the same version.
 
 2. Register **both** hooks in `~/.claude/settings.json`:
    ```json
@@ -652,7 +655,7 @@ python3 tests/test_hooks.py
 Covers all decision paths: safe commands, dangerous patterns, risky patterns, file paths, web domains, MCP tools, compound commands, the no-LLM prompt path, and edge cases. Dangerous test payloads are base64-encoded so they don't trigger live safety hooks.
 
 ```bash
-python3 tests/test_contract.py            # about 15 s
+python3 tests/test_contract.py            # about 6 s (about 20 s on Python 3.9)
 ```
 
 The hook-contract suite runs both hooks exactly as `hooks/hooks.json` invokes them, each in a sandbox with its own `HOME` and a local fake judge, and checks what they do as seen from outside: exit status, output or silence, stderr, every judge request and the evidence in it, the decision-log records in order, and the flag and hold files, including PreToolUse → PermissionRequest and hold → retry sequences. It compares all of that with the snapshot in `tests/contract_golden.json` (`--update` rewrites it; review the diff), so a restructuring can be shown to change nothing observable. `-k <text>` runs the matching cases; `SP_CONTRACT_PYTHON=/path/to/python3` runs the hooks on another interpreter.
@@ -690,11 +693,16 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 
 ## Requirements
 
-- Python 3.6+ (stdlib only — no pip dependencies)
+- Python 3.9+ (stdlib only — no pip dependencies)
 - Claude Code
 - macOS, Linux, or Windows
 
 ## Changelog
+
+- **1.8.2 (2026-11-23) — the hook code is a package.**
+  - The code of both hooks moved, unchanged, into `scripts/smart_permissions/` (`core.py` and `learner.py`). `scripts/pretool_safety.py` and `scripts/permission_learner.py` are now short entry scripts that import it, so Python runs it from cached bytecode instead of compiling 13,000 lines on every tool call: about half the per-call startup time. `urllib.request` is loaded only when the judge is called.
+  - Manual setup: the hooks find `config/` beside the scripts, where the instructions put it. Before, they looked one folder up and every call failed closed. Copy the `smart_permissions` folder too (see [Manual setup](#manual-setup)).
+  - The hook timeouts in the marketplace entry match `hooks/hooks.json` (45 s and 3660 s; it had 30 s and 45 s). The Python floor in Requirements is 3.9 (it said 3.6).
 
 - **1.8.1 (2026-11-23) — provenance for cleanups on another machine.**
   - An MCP tool's `command` that looks like it deletes or resets something on another machine gets this session's earlier calls to the same MCP server (any of its tools) that name an absolute path the command names or its `cwd`, or one inside it: the first two and last three, each with the tool's name, what the tool call returned and its redacted text. The hook doesn't parse the remote shell and never says a command ran or created anything; the judge reads the calls. `ssh` calls go to the judge as before, without this history. Logged as `provenance` like a local target. See [How the LLM judges a call](#how-the-llm-judges-a-call).

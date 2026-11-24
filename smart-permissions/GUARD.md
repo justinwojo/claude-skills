@@ -1,6 +1,6 @@
 # Recursive-delete guard: details
 
-How the protected-delete guard in `scripts/pretool_safety.py` reads a recursive
+How the protected-delete guard in `scripts/smart_permissions/core.py` reads a recursive
 delete. The [README](README.md#recursive-deletes) has the summary: what is
 denied, what is allowed by rule, and what goes to the LLM. This page is the
 detail behind it, for anyone checking a verdict or changing the guard.

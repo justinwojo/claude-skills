@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "Personal collection of Claude skills",
-    "version": "1.8.1"
+    "version": "1.8.2"
   },
   "plugins": [
     {
@@ -34,7 +34,7 @@
               {
                 "type": "command",
                 "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/pretool_safety.py",
-                "timeout": 30
+                "timeout": 45
               }
             ]
           }
@@ -46,7 +46,7 @@
               {
                 "type": "command",
                 "command": "python3 ${CLAUDE_PLUGIN_ROOT}/scripts/permission_learner.py",
-                "timeout": 45
+                "timeout": 3660
               }
             ]
           }

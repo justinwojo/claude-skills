@@ -142,6 +142,83 @@ def test_harness_exit_status():
           .startswith('hook exited 3'), True)
 
 
+def test_entry_shims():
+    """The two entry scripts are thin shims over the smart_permissions package:
+    importing one gives the package module itself, the hooks find config/ in
+    both install layouts, and both manifests register the same hooks."""
+    print('\n--- Entry shims and package layout ---')
+    _, cp = _fresh_cfg()
+    env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
+    env['SMART_PERMISSIONS_CONFIG'] = cp
+    probe = (
+        'import sys, json\nsys.path.insert(0, %r)\n'
+        'import pretool_safety, permission_learner\n'
+        'from smart_permissions import core, learner\n'
+        'pretool_safety.HOOK_CWD = "/x/rebound"\n'
+        'core.evaluate("Read", {"file_path": "/etc/hosts"})\n'
+        'print(json.dumps([pretool_safety is core, permission_learner is learner,\n'
+        '                  core.HOOK_CWD, learner.evaluate_bash is core.evaluate_bash,\n'
+        '                  "urllib.request" in sys.modules, core.SCRIPT_DIR, core.PLUGIN_ROOT]))\n'
+    ) % SCRIPT_DIR
+    r = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True, env=env)
+    try:
+        got = json.loads(r.stdout)
+    except ValueError:
+        got = [r.stderr.strip()[-200:]]
+    plugin = os.path.realpath(os.path.join(SCRIPT_DIR, '..'))
+    check('import pretool_safety is smart_permissions.core', got[:1], [True])
+    check('import permission_learner is smart_permissions.learner', got[1:2], [True])
+    check('a global rebound through the shim name reaches the code', got[2:3], ['/x/rebound'])
+    check('the learner shares the core functions', got[3:4], [True])
+    check('urllib.request is not loaded until the judge is called', got[4:5], [False])
+    check('SCRIPT_DIR is the scripts folder, PLUGIN_ROOT the plugin',
+          [os.path.realpath(x) for x in got[5:7]], [os.path.realpath(SCRIPT_DIR), plugin])
+    for shim in (PRETOOL, LEARNER):
+        with open(shim) as f:
+            text = f.read()
+        check(f'{os.path.basename(shim)} is a thin shim',
+              (len(text.splitlines()) <= 20, 'def ' in text), (True, False))
+
+    # Manual-install layout (README): config/ beside the scripts. An
+    # unwritable folder (no __pycache__ can be written) still runs.
+    base = tempfile.mkdtemp(prefix='sp-shim-')
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    dest = os.path.join(base, 'hooks', 'smart-permissions')
+    os.makedirs(dest)
+    for n in (PRETOOL, LEARNER):
+        shutil.copy(n, dest)
+    shutil.copytree(os.path.join(SCRIPT_DIR, 'smart_permissions'), os.path.join(dest, 'smart_permissions'),
+                    ignore=shutil.ignore_patterns('__pycache__'))
+    shutil.copytree(os.path.join(SCRIPT_DIR, '..', 'config'), os.path.join(dest, 'config'))
+    pkg = os.path.join(dest, 'smart_permissions')
+    os.chmod(pkg, 0o555)
+    os.chmod(dest, 0o555)
+    try:
+        _manual_install_checks(dest, pkg, env)
+    finally:
+        os.chmod(dest, 0o755)
+        os.chmod(pkg, 0o755)
+
+    # The marketplace entry declares the same hooks as hooks/hooks.json (both load)
+    with open(os.path.join(SCRIPT_DIR, '..', 'hooks', 'hooks.json')) as f:
+        hooks_json = json.load(f)['hooks']
+    with open(os.path.join(SCRIPT_DIR, '..', '..', '.claude-plugin', 'marketplace.json')) as f:
+        entry = [e for e in json.load(f)['plugins'] if e['name'] == 'smart-permissions'][0]
+    check('marketplace entry hooks match hooks/hooks.json (commands and timeouts)', entry.get('hooks'), hooks_json)
+
+
+def _manual_install_checks(dest, pkg, env):
+    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import pretool_safety as p; '
+                        'print(p.PLUGIN_ROOT); print(p.DEFAULTS_PATH)' % dest],
+                       capture_output=True, text=True, env=env)
+    check('manual install: PLUGIN_ROOT is the install folder',
+          r.stdout.split(), [dest, os.path.join(dest, 'config', 'defaults.json')])
+    check('manual install, unwritable bytecode cache: Read → allow',
+          run_hook(os.path.join(dest, 'pretool_safety.py'), {'tool_name': 'Read', 'tool_input': {'file_path': '/etc/hosts'}}),
+          'allow')
+    check('manual install: no bytecode cache could be written', os.path.exists(os.path.join(pkg, '__pycache__')), False)
+
+
 # =====================================================================
 #  PreToolUse Tests
 # =====================================================================
@@ -762,7 +839,7 @@ def test_multiword_command_matching():
 import sys, os, json
 sys.path.insert(0, {SCRIPT_DIR!r})
 
-import pretool_safety
+from smart_permissions import core as pretool_safety
 
 # Run PreToolUse evaluation
 input_data = json.loads(sys.stdin.read())
@@ -1374,7 +1451,7 @@ def _run_cfg(script, payload, config_path, llm=None, legacy_auto_learn=False,
                 "    return _R(body)\n"
                 "urllib.request.urlopen = _f\n" % (resps, requests_log))
 
-    module = 'pretool_safety' if script == PRETOOL else 'permission_learner'
+    module = 'smart_permissions.core' if script == PRETOOL else 'smart_permissions.learner'
     wrapper = (
         "import sys, json\n"
         "sys.path.insert(0, %r)\n"
@@ -1706,7 +1783,7 @@ def test_learner_classification_unchanged():
     for k in ('SAFETY_HOOK_API_KEY', 'ANTHROPIC_API_KEY', 'SAFETY_HOOK_MODEL', 'SAFETY_HOOK_API_URL'):
         env.pop(k, None)
     env['SMART_PERMISSIONS_CONFIG'] = cp
-    code = ("import sys, json\nsys.path.insert(0, %r)\nimport permission_learner as l\n"
+    code = ("import sys, json\nsys.path.insert(0, %r)\nfrom smart_permissions import learner as l\n"
             "rows = json.loads(sys.stdin.read())\n"
             "print(json.dumps([list(l.classify_request(t, ti)) for t, ti in rows]))\n") % SCRIPT_DIR
     r = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, env=env,
@@ -1861,7 +1938,7 @@ def _pretool_module():
     _, cp = _fresh_cfg()
     os.environ['SMART_PERMISSIONS_CONFIG'] = cp
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety
+    from smart_permissions import core as pretool_safety
     return pretool_safety
 
 
@@ -1952,9 +2029,10 @@ def test_llm_wall_clock_deadline():
         def __exit__(self, *a): return False
         def read(self): return json.dumps({'v': self.v}).encode()
 
-    orig = pretool.urllib.request.urlopen
+    import urllib.request  # the hook imports it only when it calls the judge
+    orig = urllib.request.urlopen
     try:
-        pretool.urllib.request.urlopen = lambda req, timeout=None: _Ctx(hang_then_answer(req, timeout))
+        urllib.request.urlopen = lambda req, timeout=None: _Ctx(hang_then_answer(req, timeout))
         t0 = time.monotonic()
         try:
             pretool._llm_post_once(None, 0.3)
@@ -1975,7 +2053,7 @@ def test_llm_wall_clock_deadline():
         check('hung first attempt → retry succeeds', result, {'v': 'ok'})
         check('retry made exactly two attempts', len(calls), 2)
     finally:
-        pretool.urllib.request.urlopen = orig
+        urllib.request.urlopen = orig
 
 
 # ---- M3: relocated state paths covered by C9 ---------------------------
@@ -2222,7 +2300,7 @@ def test_fix3_evaluate_nondict_tool_input():
     code = (
         "import sys, json\n"
         "sys.path.insert(0, %r)\n"
-        "import pretool_safety as p, permission_learner as l\n"
+        "from smart_permissions import core as p, learner as l\n"
         "out = [p.evaluate('Bash', None)[0],\n"
         "       l.classify_request('Bash', None)[0],\n"
         "       p.evaluate('Bash', 'not-a-dict')[0],\n"
@@ -3435,7 +3513,7 @@ def _run_anthropic(payload, config_path, responses, requests_log, extra_env=None
         "    return _R(json.dumps(r))\n"
         "urllib.request.urlopen = _f\n" % (responses, requests_log))
     wrapper = ("import sys, json\nsys.path.insert(0, %r)\nimport urllib.request\n%s"
-               "import pretool_safety as _m\n_m.main()\n") % (SCRIPT_DIR, mock)
+               "from smart_permissions import core as _m\n_m.main()\n") % (SCRIPT_DIR, mock)
     r = subprocess.run([sys.executable, '-c', wrapper], input=json.dumps(payload),
                        capture_output=True, text=True, env=env)
     out = r.stdout.strip()
@@ -3525,7 +3603,7 @@ def _both_hooks(cmds, files=()):
     env['SMART_PERMISSIONS_CONFIG'] = cp
     env['HOME'] = home
     code = ("import sys, json\nsys.path.insert(0, %r)\n"
-            "import pretool_safety as p, permission_learner as l\n"
+            "from smart_permissions import core as p, learner as l\n"
             "p.log_unknown = lambda *a: None\n"
             "p.HOOK_CWD = %r\n"
             "out = []\n"
@@ -4211,7 +4289,7 @@ def test_git_status_snapshot_for_discards():
 
     # GIT_DIR in the environment reaches the command, so the context follows it
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-    import pretool_safety
+    from smart_permissions import core as pretool_safety
     saved = {k: os.environ.get(k) for k in ('GIT_DIR', 'GIT_WORK_TREE')}
     os.environ.update(GIT_DIR=os.path.join(repo, '.git'), GIT_WORK_TREE=repo)
     try:
@@ -4249,7 +4327,7 @@ def test_git_remote_owners():
         subprocess.run(git + ['remote', 'add', name, url], check=True)
 
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-    import pretool_safety as p
+    from smart_permissions import core as p
     real_probe = p._probe
     # No gh login unless a check asks for one, whatever this machine has
     p._probe = lambda argv, path, deadline: None if argv[0] == 'gh' else real_probe(argv, path, deadline)
@@ -4537,8 +4615,8 @@ def test_prefix_groups_and_deep_nesting():
         check(f'deep nesting → ask, no crash: {cmd[:12]!r}…',
               (r[0], r[2] in ('ask', 'consult')), ('ask', True))
     # End to end: both hooks survive an internal error without allowing.
-    for script, mod, fn in ((PRETOOL, 'pretool_safety', 'evaluate'),
-                            (LEARNER, 'permission_learner', 'classify_request')):
+    for script, mod, fn in ((PRETOOL, 'smart_permissions.core', 'evaluate'),
+                            (LEARNER, 'smart_permissions.learner', 'classify_request')):
         code = ('import sys\nsys.path.insert(0, %r)\nimport %s as m\n'
                 'def boom(*a, **k): raise RuntimeError("x")\n'
                 'm.%s = boom\nm.main()\n') % (SCRIPT_DIR, mod, fn)
@@ -4964,7 +5042,7 @@ def test_phase3_constant_command_word():
           'D=~/.claude; dart compile exe bin/main.dart -o "$D/settings.json"']
     for cmd, r in zip(c9, _both_hooks(c9)):
         check(f'C9 through a constant command word: {cmd!r}', r, ['ask', _C9, 'ask', _C9])
-    code = ('import sys\nsys.path.insert(0, %r)\nimport pretool_safety as p\n'
+    code = ('import sys\nsys.path.insert(0, %r)\nfrom smart_permissions import core as p\n'
             'print(p.human_required_reason("Bash", {"command": %r}))\n') % (SCRIPT_DIR, c9[0])
     env = dict(os.environ, SMART_PERMISSIONS_CONFIG=_fresh_cfg()[1])
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
@@ -5038,7 +5116,7 @@ def test_phase4_bodies_built_words_env():
     check('a built git word names its reason', res[1][1],
           'Risky git with a word built at run time where it decides the verdict ($S) — LLM review')
     check('a loader variable names its reason', res[2][1], 'Sets LD_PRELOAD to run other code (/tmp/x.so)')
-    code = ('import sys, json\nsys.path.insert(0, %r)\nimport pretool_safety as p\n'
+    code = ('import sys, json\nsys.path.insert(0, %r)\nfrom smart_permissions import core as p\n'
             'print(json.dumps([p._extract_json_decision(c) for c in json.loads(sys.stdin.read())]))\n'
             ) % SCRIPT_DIR
     texts = ['Sure:\n```json\n{"safe": true, "reason": "ok"}\n```',
@@ -5402,7 +5480,7 @@ def _git(*args):
 def test_friction_batch():
     print('\n--- Fewer round trips: constants, scratchpad, git -c, PYTHONPATH, branch -D ---')
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts'))
-    import pretool_safety as p
+    from smart_permissions import core as p
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-friction-', dir='/tmp'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -5726,7 +5804,7 @@ def _bash_result(tid, minutes, error=False, text='(output)'):
 def test_session_provenance_and_loss_evidence():
     print('\n--- Deletes and resets: session provenance and loss evidence for the judge ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
     rmrf = d('cm0gLXJm')
     # The system temp folder: deletes there reach the judge (/tmp ones don't).
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-prov-'))
@@ -6031,7 +6109,7 @@ def test_session_provenance_and_loss_evidence():
 def test_dir_options_leave_the_project():
     print('\n--- A relative import path under an option that moves the program elsewhere ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
     proj = os.path.realpath(tempfile.mkdtemp(prefix='sp-dirs-'))
     atexit.register(shutil.rmtree, proj, ignore_errors=True)
     os.makedirs(os.path.join(proj, 'sub'))
@@ -6084,7 +6162,7 @@ def test_dir_options_leave_the_project():
 def test_special_names_from_shells():
     print('\n--- Names the shells set or tie are never constants ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
 
     def special(name):
         return name in p._SPECIAL_NAMES or bool(p._SPECIAL_NAME_RE.fullmatch(name))
@@ -6124,7 +6202,7 @@ def test_special_names_from_shells():
 def test_phase1b_fewer_judge_calls():
     print('\n--- 1.6.0: Python heredocs, tighter inline reads, conditional names, CLIs, log, learner ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p16-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -6520,7 +6598,7 @@ def test_phase1b_fewer_judge_calls():
 def test_phase1_evidence_and_rule_fixes():
     print('\n--- 1.5.0: judge key file, clones, brief, scripts, stashes, /tmp, MCP notes, rule fixes ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-p15-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -6547,7 +6625,7 @@ def test_phase1_evidence_and_rule_fixes():
     shutil.copy(keyfile, os.path.join(cfg, 'smart-permissions-llm.env'))
     os.chmod(os.path.join(cfg, 'smart-permissions-llm.env'), 0o600)
     env = {k: v for k, v in os.environ.items() if not k.startswith('SAFETY_HOOK_')}
-    probe = ('import sys; sys.path.insert(0, %r); import pretool_safety as p; '
+    probe = ('import sys; sys.path.insert(0, %r); from smart_permissions import core as p; '
              'print(p.llm_is_configured(), p.LLM_MODEL, p.LLM_API_URL)' % SCRIPT_DIR)
     out = subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
                          env=dict(env, SMART_PERMISSIONS_CONFIG=cp)).stdout.split()
@@ -6741,7 +6819,7 @@ def test_phase1_evidence_and_rule_fixes():
     user = sent[0]['messages'][1]['content'] if sent else ''
     check('mcp: matching note given', 'BENCH-NOTE' in user and 'OTHER-NOTE' not in user, True)
     cfg, cp = _fresh_cfg({'mcp_context': ['not', 'a', 'dict']})
-    probe = 'import sys; sys.path.insert(0, %r); import pretool_safety as p; print(p.MCP_CONTEXT)' % SCRIPT_DIR
+    probe = 'import sys; sys.path.insert(0, %r); from smart_permissions import core as p; print(p.MCP_CONTEXT)' % SCRIPT_DIR
     check('mcp: wrong type ignored', subprocess.run([sys.executable, '-c', probe], capture_output=True, text=True,
                                                     env=dict(os.environ, SMART_PERMISSIONS_CONFIG=cp)).stdout.strip(), '{}')
     with open(os.path.join(SCRIPT_DIR, '..', 'config', 'defaults.json')) as f:
@@ -7753,7 +7831,7 @@ def test_prompt_timeout_1_8_0():
 
     # The parked message: judge words that quote a script shown to it are scrubbed.
     sys.path.insert(0, SCRIPT_DIR)
-    import permission_learner as pl
+    from smart_permissions import learner as pl
     p.SCRIPT_CONTEXT_TEXTS[:] = ['az group delete -n rg-example --yes\n']
     try:
         msg = pl.parked_message(p.scrub_script_text('LLM: category 4: runs `az group delete -n rg-example --yes`'), 10)
@@ -7766,7 +7844,7 @@ def test_prompt_timeout_1_8_0():
 def _learner_module_attr(name, config_path):
     """An attribute of the learner module imported fresh against config_path."""
     env = dict(os.environ, SMART_PERMISSIONS_CONFIG=config_path)
-    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); import permission_learner as m; '
+    r = subprocess.run([sys.executable, '-c', 'import sys; sys.path.insert(0, %r); from smart_permissions import learner as m; '
                         'print(repr(m.%s))' % (SCRIPT_DIR, name)], capture_output=True, text=True, env=env)
     try:
         return eval(r.stdout.strip())
@@ -7949,7 +8027,7 @@ def _tool_use(tid, name, inp, minutes):
 def test_remote_provenance_1_8_1():
     print('\n--- 1.8.1: MCP inputs logged; cleanups on another machine get the session\'s calls there ---')
     sys.path.insert(0, SCRIPT_DIR)
-    import pretool_safety as p
+    from smart_permissions import core as p
     rmrf = d('cm0gLXJm')
     base = os.path.realpath(tempfile.mkdtemp(prefix='sp-remote-'))
     atexit.register(shutil.rmtree, base, ignore_errors=True)
@@ -8271,6 +8349,7 @@ if __name__ == '__main__':
     print('=' * 50)
 
     test_harness_exit_status()
+    test_entry_shims()
 
     test_pretool_readonly_tools()
     test_pretool_internal_tools()

@@ -20,7 +20,7 @@ eval prints SKIP and exits 0. Rule verdicts use the same config files as
 the hook (SMART_PERMISSIONS_CONFIG / ~/.claude/smart-permissions-config.json).
 
 Variants monkeypatch the module in this process only (prompt, recheck
-note, model, efforts); scripts/pretool_safety.py is never edited.
+note, model, efforts); scripts/smart_permissions/core.py is never edited.
 
 Usage:
     python3 tests/llm_eval.py                     # baseline, 3 runs per case
@@ -132,7 +132,7 @@ def apply_variant(p, base, name):
 
 def import_hook():
     sys.path.insert(0, os.path.abspath(SCRIPTS))
-    import pretool_safety as p
+    from smart_permissions import core as p
     # Never touch the owner's logs from an eval run.
     p.log_unknown = lambda *a, **k: None
     p.DECISION_LOG_ENABLED = False
