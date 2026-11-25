@@ -17,8 +17,9 @@ import threading
 import time
 
 from .config import LLM_ENV_FILE
-from .util import _elapsed_ms
+from .util import _elapsed_ms, fenced, text_marker
 from .holds import LLM_HOLD_RETRY_NOTE
+from .log import compose_reason
 
 
 # ============================================================
@@ -716,7 +717,7 @@ def remote_exec_verdict(decision, reason, info, label):
             return ("ask", f"{head}: the judge was not confident it does only what it should — "
                     "confirm it yourself", True)
         return "allow", reason, False
-    return "ask", f"{head}: {reason}", True
+    return "ask", compose_reason(f"{head}: ", reason), True  # the judge's reason, logged as one
 
 
 def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGET_S, context="",
@@ -729,8 +730,10 @@ def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGE
     if not llm_is_configured():
         return "ask", llm_not_configured_reason(), {"source": "hold-retry", "llm_ms": None,
                                                     "flagged": True, "verdict": None}
+    marker = text_marker([answer])
     prompt = _llm_user_prompt(tool, tool_input, context, rule_reason) + LLM_HOLD_RETRY_NOTE.format(
-        reason=hold["reason"], question=hold["question"], answer=answer)
+        reason=hold["reason"], question=hold["question"], marker=marker,
+        answer=fenced("agent's answer", answer, "end of agent's answer", marker))
     t0 = time.monotonic()
 
     def info(verdict=None, flagged=True):

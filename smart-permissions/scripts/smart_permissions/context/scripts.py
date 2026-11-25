@@ -4,9 +4,9 @@ _read_script): script_hazard, a gate, scans the same files under its own,
 larger limits."""
 import os
 import re
-import secrets
 import time
 
+from ..util import fenced, text_marker
 from ..core import (
     GIT_CONTEXT_BUDGET_S, SCRIPT_CONTEXT_MAX_BYTES, SCRIPT_CONTEXT_TOTAL_BYTES, _SCRIPT_EXT,
     _evidence_path, _read_script, _written_files, script_files,
@@ -17,23 +17,12 @@ _SCRIPT_NAME_RE = re.compile(r"(?<![\w$%s])(?:~/|\.{1,2}/|/)?[\w@%%+,.:/-]*?[\w-
                              % (re.escape("{"), _SCRIPT_EXT))
 
 
-def text_marker(bodies):
-    """A random token, new for each block, that none of `bodies` holds. A
-    file's text shown to the judge sits between an opening and an end line
-    both marked with it, so text inside the file can't fake its end."""
-    while True:
-        token = "sp-" + secrets.token_hex(6)
-        if not any(token in body for body in bodies):
-            return token
-
-
 def script_context(command, cwd, deadline=None, shown_texts=None):
     """A block with the text of the local scripts `command` runs or feeds
     (see script_files), or ''. It says when a file is truncated, unreadable
     or not shown, and which other local scripts a shown one names: those the
-    judge has not seen. Each text is between lines marked with text_marker's
-    token. `shown_texts`, a list, gets the text of each script
-    shown, so a reason quoting it can be scrubbed (see scrub_script_text)."""
+    judge has not seen. Each text is fenced (util.fenced). `shown_texts`,
+    a list, gets the text of each script shown, so a reason quoting it can be scrubbed (see scrub_script_text)."""
     deadline = deadline or time.monotonic() + GIT_CONTEXT_BUDGET_S
     try:
         files = script_files(command, cwd, deadline)
@@ -61,8 +50,7 @@ def script_context(command, cwd, deadline=None, shown_texts=None):
         if text is None:
             out.append(f"--- {path} ({how}): {note} ---")
             continue
-        out.append(f"--- {path} ({how}; {note}) [{marker}] ---\n{text.rstrip()}\n"
-                   f"--- end of {os.path.basename(path)} [{marker}] ---")
+        out.append(fenced(f"{path} ({how}; {note})", text, f"end of {os.path.basename(path)}", marker))
         others = []
         for m in _SCRIPT_NAME_RE.finditer(text):
             other = _evidence_path(m.group(0), os.path.dirname(path))

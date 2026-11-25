@@ -1,8 +1,27 @@
 """Small helpers with no state of their own: elapsed milliseconds, running a
-context block so an exception never fails the hook, and the per-process memo
-for readers whose answer depends only on their arguments and the loaded config."""
+context block so an exception never fails the hook, the per-process memo
+for readers whose answer depends only on their arguments and the loaded
+config, and the marked lines around a text shown to the judge."""
 import functools
+import secrets
 import time
+
+
+def text_marker(texts):
+    """A random token, new for each block, that none of `texts` holds."""
+    while True:
+        token = "sp-" + secrets.token_hex(6)
+        if not any(token in text for text in texts):
+            return token
+
+
+def fenced(opening, text, end, marker):
+    """`text` as the judge is shown it: between an opening and an end line
+    both marked with `marker` (text_marker over every text of its block), so
+    nothing inside can fake its end. Every text an agent wrote, or that is
+    read from a transcript, is shown this way; the block's header names the
+    marker and says the text is data."""
+    return f"--- {opening} [{marker}] ---\n{text.rstrip()}\n--- {end} [{marker}] ---"
 
 
 def _elapsed_ms(start):

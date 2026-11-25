@@ -8,7 +8,7 @@ import re
 import time
 
 from .util import _elapsed_ms
-from .log import _loggable_reason, log_decision
+from .log import compose_reason, log_decision
 from .holds import (
     HOLD_CAP_WINDOW_S, HOLD_CLAIM_CHARS, HOLD_QUESTION_CHARS, HOLD_SESSION_CAP,
     _HOLD_DEFAULT_QUESTION, acting_transcript, hold_claim, hold_count, hold_create, hold_finish,
@@ -33,15 +33,17 @@ def hold_retry_ask(hold, now, answer, script_texts):
     """The prompt reason after a held call's retry: the hold reason in the
     hook's words, what happened on the retry (`now`), and the agent's answer
     labelled as its claim (`answer` None: not shown), scrubbed of the script
-    texts the judge was shown."""
-    text = (f"smart-permissions held this call and asked the agent: {hold['question']} "
-            f"Held because: {hold['reason'].rstrip('.')}. On the retry: {now.rstrip('.')}.")
+    texts the judge was shown. The hold's flag and question are the judge's
+    words, and so is `now` when it is a verdict ("LLM…"): the log keeps them
+    only when the judge was shown no script (compose_reason)."""
+    parts = ["smart-permissions held this call and asked the agent: ", (hold["question"],),
+             " Held because: ", (hold["reason"].rstrip("."),), ". On the retry: ", now.rstrip("."), "."]
     if answer:
         claim = scrub_script_text(" ".join(answer.split()), script_texts)
         if len(claim) > HOLD_CLAIM_CHARS:
             claim = claim[:HOLD_CLAIM_CHARS] + " […]"
-        text += f" The agent's explanation (its claim, not verified): \"{claim}\""
-    return text
+        parts.append(f" The agent's explanation (its claim, not verified): \"{claim}\"")
+    return compose_reason(*parts)
 
 
 def _hold_retry(state, input_data, tool, tool_input, context, rule_reason, start, wall_start):
@@ -85,7 +87,7 @@ def _hold_retry(state, input_data, tool, tool_input, context, rule_reason, start
         return True
     hold_finish(key, hold, "asked")
     shown = hold_retry_ask(hold, reason, answer, texts)
-    logged = hold_retry_ask(hold, _loggable_reason(reason, texts), None, texts)  # no claim, no script words
+    logged = hold_retry_ask(hold, reason, None, texts)  # no claim
     _ask_developer(state, tool, tool_input, shown, logged, start, "hold-retry", info.get("llm_ms"),
                    rule_reason, hold="asked")
     return True

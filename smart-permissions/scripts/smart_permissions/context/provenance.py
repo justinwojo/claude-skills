@@ -20,7 +20,8 @@ from ..core import (
     _spell_names, _tilde_masked, split_compound_command,
 )
 from .git import _git_context_dirs
-from .scripts import text_marker
+from ..holds import acting_transcript
+from ..util import fenced, text_marker
 
 
 # ============================================================
@@ -172,8 +173,9 @@ def _relation(named, target):
 
 def _snippet(text, mark, fold=False):
     """`text` on one line, secrets redacted, cut to a window around the first
-    `mark` (`fold`: found without case)."""
-    flat = re.sub(r"[ \t]+", " ", re.sub(r"\s*\n\s*", " / ", _redact_secrets(text.strip())[0]))
+    `mark` (`fold`: found without case): a line feed is ` / `, any other
+    line break, control character or run of space one space."""
+    flat = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", re.sub(r"\s*\n\s*", " / ", _redact_secrets(text.strip())[0]))
     if len(flat) <= PROVENANCE_SNIPPET_CHARS:
         return flat
     at = max(0, (flat.lower().find(mark.lower()) if fold else flat.find(mark))) if mark else 0
@@ -499,16 +501,17 @@ def _remote_targets(tool, tool_input):
 
 def _remote_calls(files, key, needles, skip_id, deadline):
     """(this session's calls to the MCP server `key` (`mcp__<server>__`,
-    any of its tools) in the order they were made, whether some transcript
-    wasn't read whole), from the main and subagent transcripts. A call is
-    kept when its record names one of `needles` (lowercase) or holds
-    `skip_id`. Order: its message's time, then its place in the message
-    (a message's blocks may be split over records), so calls of one message
-    keep the order they were sent in. A call is a dict: tid, name, inp, ts,
-    at (file, line, ts), order, named (the paths it names); status ("ok",
-    "error", "no result" while it has none, "result unknown" when a line
-    with its id can't be read) and result_at (where its result was read, or
-    None). Raises OSError when no transcript could be read."""
+    any of its tools), whether some transcript wasn't read whole), from the
+    main and subagent transcripts. A call is kept when its record names one
+    of `needles` (lowercase) or holds `skip_id`. In order of its record's own
+    time, then transcript, line and place in the record (a record with no
+    time of its own sorts at the one before it in its transcript); which
+    call is surely before another is _surely_before's. A call is a dict:
+    tid, name, inp, mid (its message id), ts, at (file, line, ts, place),
+    named (the paths it names); status ("ok", "error", "no result" while it
+    has none, "result unknown" when a line with its id can't be read) and
+    result_at (where its result was read, or None). Raises OSError when no
+    transcript could be read."""
     mark = f'"{key}'
     calls, budget, cut, failed = [], PROVENANCE_TOTAL_BYTES, False, 0
     for fi, path in enumerate(files):
@@ -522,7 +525,7 @@ def _remote_calls(files, key, needles, skip_id, deadline):
             continue
         budget -= size
         cut = cut or partial
-        pending, messages, last_ts = {}, {}, 0.0  # pending: id → call, until its result
+        pending, last_ts = {}, 0.0  # pending: id → call, until its result
         for li, line in enumerate(lines):  # a long record can take a millisecond: the clock, every line
             if time.monotonic() > deadline:
                 cut = True
@@ -533,7 +536,7 @@ def _remote_calls(files, key, needles, skip_id, deadline):
                     results, ts = _results(line)
                     for i in ids:
                         if i in results:
-                            pending.pop(i).update(status=results[i], result_at=(fi, li, ts))
+                            pending.pop(i).update(status=results[i], result_at=(fi, li, ts, 0))
                         else:  # unread, it stays pending: its real result may come later
                             pending[i]["status"] = "result unknown"
                     continue
@@ -554,20 +557,14 @@ def _remote_calls(files, key, needles, skip_id, deadline):
             ts = _ts_seconds(record.get("timestamp") or "")
             last_ts = ts if ts is not None else last_ts
             mid = message.get("id") if isinstance(message.get("id"), str) else None
-            group = messages.get(mid) if mid else None
-            if group is None:  # [its time, its first line, blocks so far]
-                group = [last_ts, li, 0]
-                if mid:
-                    messages[mid] = group
-            for block in content:
-                pos, group[2] = group[2], group[2] + 1
+            for pos, block in enumerate(content):
                 name = block.get("name") if isinstance(block, dict) and block.get("type") == "tool_use" else None
                 if not (isinstance(name, str) and name.startswith(key) and "__" not in name[len(key):]):
                     continue
                 tid = block.get("id") if isinstance(block.get("id"), str) else None
                 inp = block.get("input") if isinstance(block.get("input"), dict) else {}
-                call = {"tid": tid, "name": name, "inp": inp, "ts": ts, "at": (fi, li, ts),
-                        "order": (group[0], fi, group[1], pos), "status": "no result", "result_at": None,
+                call = {"tid": tid, "name": name, "inp": inp, "mid": mid, "ts": ts, "at": (fi, li, ts, pos),
+                        "order": (last_ts, fi, li, pos), "status": "no result", "result_at": None,
                         "named": {n for _, n in _mcp_named(inp, _mcp_fields(inp))}}  # here, under the clock
                 calls.append(call)
                 if tid:
@@ -592,15 +589,26 @@ def _results(line):
             if isinstance(b, dict) and isinstance(b.get("tool_use_id"), str)}, ts
 
 
-def _judged_index(calls, skip_id, tool, tool_input):
-    """Where the call being judged is in `calls`: by its tool_use id, else
-    the last call with no result yet whose tool and input are its; None
-    when it isn't there (every call then counts as earlier)."""
+def _judged_index(calls, skip_id, tool, tool_input, acting):
+    """Where the call being judged is in `calls`, among those of the acting
+    agent's transcript (`acting`, its index in the files read): by its
+    tool_use id, else the last there with no result yet whose tool and
+    input are its. None when it isn't there."""
+    mine = [i for i, c in enumerate(calls) if c["at"][0] == acting and (
+        c["tid"] == skip_id if skip_id else
+        c["result_at"] is None and c["name"] == tool and c["inp"] == tool_input)]
+    return max(mine, key=lambda i: calls[i]["at"], default=None)
+
+
+def _unlocated_earlier(calls, skip_id, tool, tool_input):
+    """Which of `calls` count as earlier when the call being judged can't be
+    found (_judged_index): as 1.8.3 counted them, all but the call itself:
+    the one with its id and every call from that call's time on, or, with
+    no id, a call with no result yet whose tool and input are its."""
     if skip_id:
-        return next((i for i, c in enumerate(calls) if c["tid"] == skip_id), None)
-    return next((i for i in range(len(calls) - 1, -1, -1)
-                 if calls[i]["result_at"] is None and calls[i]["name"] == tool and calls[i]["inp"] == tool_input),
-                None)
+        now = next((c["ts"] for c in calls if c["tid"] == skip_id), None)
+        return [c["tid"] != skip_id and not (now and c["ts"] and c["ts"] >= now) for c in calls]
+    return [not (c["result_at"] is None and c["name"] == tool and c["inp"] == tool_input) for c in calls]
 
 
 def _call_relation(call, target):
@@ -610,12 +618,10 @@ def _call_relation(call, target):
 
 def _call_text(inp):
     """A call's command and path fields, redacted like the log, as the
-    judge is shown them; a long value is cut before redaction (only a
-    window around the path is shown)."""
+    judge is shown them: only string values are read, and a long one is
+    cut before redaction (only a window around the path is shown)."""
     command = inp.get("command") if isinstance(inp.get("command"), str) else ""
-    picked = {k: v[:REMOTE_SCAN_CHARS] if isinstance(v, str) else v for k, v in inp.items()
-              if isinstance(k, str) and k != "command" and (k == "cwd" or _MCP_PATH_KEY_RE.search(k))}
-    fields = _mcp_fields(_redact_values(picked))
+    fields = _mcp_fields(_redact_values({k: v[:REMOTE_SCAN_CHARS] for k, v in _mcp_fields(inp)}))
     return _redact_secrets(command[:REMOTE_SCAN_CHARS + 1024])[0] + (
         f"  ({'; '.join(f'{k}: {v}' for k, v in fields)})" if fields else "")
 
@@ -634,7 +640,10 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
     """(provenance blocks, CallState.provenance value, script blocks,
     CallState.remote_scripts value) for an MCP call that runs a `command`
     on another machine, from one ordered list of this session's calls to
-    that server (_remote_calls); earlier means before this call in it:
+    that server (_remote_calls); earlier means surely before this call
+    (_surely_before), which is found among the acting agent's own calls
+    (_judged_index; when it isn't there, earlier is as _unlocated_earlier
+    says, and no script text is shown):
     - when it may delete or reset something there (_remote_targets), per
       path its command names, the first and last of this session's earlier
       calls to that server that name it or a path inside it, with what each
@@ -668,31 +677,34 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
                             "needles": {p.rsplit("/", 1)[-1].lower() for p in parents | {norm}}})
         skip_id = input_data.get("tool_use_id") if isinstance(input_data.get("tool_use_id"), str) else None
         calls, cut = _remote_calls(files, key, set().union(*(t["needles"] for t in targets)), skip_id, deadline)
-        at = _judged_index(calls, skip_id, tool, tool_input)
+        acting = acting_transcript(input_data)
+        at = _judged_index(calls, skip_id, tool, tool_input, files.index(acting) if acting in files else None)
+        earlier = [_surely_before(c["at"], calls[at]["at"]) for c in calls] if at is not None \
+            else _unlocated_earlier(calls, skip_id, tool, tool_input)
     except Exception:
         return unavailable
     prov, prov_status, script, script_status = none
     n = len(paths)
     if found:
         try:
-            prov, prov_status = _remote_provenance_blocks(key, targets[:n], calls, at, cut)
+            prov, prov_status = _remote_provenance_blocks(key, targets[:n], calls, earlier, cut)
         except Exception:
             prov, prov_status = [], "unavailable"
-    if scripts:
+    if scripts and at is not None:  # no place for the call: no text is surely from before it
         try:
-            script, script_status = _remote_script_blocks(key, tool_input, targets[n:], calls, at, cut,
-                                                          shown_texts)
+            script, script_status = _remote_script_blocks(key, tool_input, targets[n:], calls, at, earlier,
+                                                          cut, shown_texts)
         except Exception:
             script, script_status = [], "unavailable"
     return prov, prov_status, script, script_status
 
 
-def _remote_provenance_blocks(key, targets, calls, at, cut):
+def _remote_provenance_blocks(key, targets, calls, earlier, cut):
     """remote_context's provenance part: per target, the calls before this
-    one (`at`, its place in `calls`) that name it or a path inside it."""
+    one (`earlier`, one flag per call) that name it or a path inside it."""
     out, found = [_REMOTE_PROVENANCE_HEAD.format(server=key[5:-2], key=key)], False
     show = REMOTE_PROVENANCE_SHOW_FIRST + REMOTE_PROVENANCE_SHOW_LAST
-    earlier = calls[:at] if at is not None else calls
+    earlier = [c for c, before in zip(calls, earlier) if before]
     for target in targets:
         ms = [(c, hit) for c in earlier for hit in [_call_relation(c, target)] if hit]
         if not ms:
@@ -770,36 +782,43 @@ def _remote_write(name, inp, norm):
 
 
 def _surely_before(a, b):
-    """Whether transcript position `a` (file, line, time) is surely before
-    `b`: in one file by line, across files by time."""
+    """Whether transcript position `a` (file, line, time, place in the
+    record) is surely before `b`: by time, then (in one file) line and
+    place. A record with no time of its own is ordered only in its file,
+    by line."""
     if a is None or b is None:
         return False
-    if a[0] == b[0]:
-        return a[1] < b[1]
-    return a[2] is not None and b[2] is not None and a[2] < b[2]
+    if a[2] is None or b[2] is None:
+        return a[0] == b[0] and (a[1], a[3]) < (b[1], b[3])
+    if a[0] != b[0]:
+        return a[2] < b[2]
+    return (a[2], a[1], a[3]) < (b[2], b[1], b[3])
 
 
-def _settled(first, then):
-    """Whether write call `first` surely finished before write call `then`:
-    its result came before `then` was sent, or before `then`'s result."""
-    return _surely_before(first["result_at"], then["at"]) or _surely_before(first["result_at"], then["result_at"])
+def _unsettled(writes, k):
+    """Whether write `writes[k]` was sent in the same message as an earlier
+    one of `writes`, or before its result was in the transcript: which of
+    them took effect last is then not known."""
+    then = writes[k][1]
+    return any(c["mid"] and c["mid"] == then["mid"] and c["at"][0] == then["at"][0]
+               or not _surely_before(c["result_at"], then["at"]) for _, c, _, _ in writes[:k])
 
 
-def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts):
+def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, shown_texts):
     """(blocks, CallState.remote_scripts value) for remote_context's script
     files: per file, the text of this session's latest whole write to it
-    before this call (`at`, its place in `calls`) with the appends after
-    that, bounded and redacted like script_context, between lines marked
-    with a token no text holds, and which later calls there name it or its
-    folder. No block when this session wrote none of them ("none");
-    "found" when it wrote one but no text could be shown, else "shown"."""
+    before this call (`at`, its place in `calls`; `earlier`, one flag per
+    call) with the appends after that, bounded and redacted like
+    script_context, fenced (util.fenced), and which later calls there name
+    it or its folder. No block when this session wrote none of them
+    ("none"); "found" when it wrote one but no text could be shown, else
+    "shown"."""
     server, command = key[5:-2], tool_input.get("command")
-    end = at if at is not None else len(calls)
     out, bodies = [], []  # out: lines, or (opening, body, base) for a text shown
     budget, written_any = SCRIPT_CONTEXT_TOTAL_BYTES, False
     for target in targets:
         norm = next(iter(target["keys"]))
-        writes = [(i, c, *w) for i, c in enumerate(calls[:end])
+        writes = [(i, c, *w) for i, c in enumerate(calls) if earlier[i]
                   for w in [_remote_write(c["name"][len(key):], c["inp"], norm)] if w]
         if not writes:
             out.append(f"--- {target['path']}: this session wrote nothing to it through {server}: "
@@ -807,13 +826,15 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts)
             continue
         written_any = True
         full = [k for k, (_, _, _, appended) in enumerate(writes) if not appended]
-        chain = writes[full[-1]:] if full else writes
+        start = full[-1] if full else 0
+        chain = writes[start:]
         in_chain = {i for i, *_ in chain}
-        later = [(i, c, hit) for i, c in enumerate(calls) if i > chain[0][0] and i != at and i not in in_chain
+        later = [(i, c, hit) for i, c in enumerate(calls)
+                 if (i > chain[0][0] or not earlier[i]) and i != at and i not in in_chain
                  for hit in [_call_relation(c, target)] if hit
                  and not _REMOTE_READ_TOOL_RE.fullmatch(c["name"][len(key):])
                  # an earlier try of this same command runs the text shown
-                 and not (i < end and isinstance(command, str) and c["inp"].get("command") == command)]
+                 and not (earlier[i] and isinstance(command, str) and c["inp"].get("command") == command)]
         first, last = chain[0][1], chain[-1][1]
         appends, writer = len(chain) - (1 if full else 0), first["name"][len(key):]
         times = f"{appends} time{'s' if appends != 1 else ''}" + (
@@ -828,10 +849,9 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts)
         if odd:
             how += "; " + ", ".join(f"a write: {_REMOTE_STATUS.get(s, s)}" for s in odd) \
                    + ", so the file may not hold this text"
-        unsettled = [k for k in full[:-1] if not _settled(writes[k][1], first)]
-        if unsettled:
-            how += (f"; {len(unsettled) + 1} whole writes to it have no settled order (their results are "
-                    "missing or came out of order): the last sent is shown, which one took effect is not known")
+        if any(_unsettled(writes, k) for k in range(start, len(writes))):
+            how += ("; a write to it was sent in the same message as an earlier one or before its "
+                    "result: which write took effect last is not known")
         pieces = [t for _, _, t, _ in chain]
         size = sum(len(t.encode("utf-8", "replace")) for t in pieces)
         limit = min(SCRIPT_CONTEXT_MAX_BYTES, max(budget, 0))
@@ -841,22 +861,28 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts)
         elif limit <= 0:
             out.append(f"--- {target['path']} ({how}): not shown: the script text budget is used up ---")
         else:
-            # bounded before it is redacted: what is shown and a margin past it
+            # bounded before it is redacted: what is shown and a margin past it, back to a
+            # line break, so a secret the cut runs through is left out whole
             raw = ""
             for t in pieces:
                 raw += t[:limit + REMOTE_SCRIPT_MARGIN_CHARS - len(raw)]
                 if len(raw) >= limit + REMOTE_SCRIPT_MARGIN_CHARS:
                     break
-            data = _redact_secrets(raw)[0].encode("utf-8", "replace")
-            note = f"{size} bytes"
-            if len(data) > limit or len(raw) < sum(map(len, pieces)):
-                data, note = data[:limit], note + f"; TRUNCATED: only the first {limit} bytes are shown"
+            whole = len(raw) == sum(map(len, pieces))
+            if not whole and "\n" in raw:
+                raw = raw[:raw.rindex("\n") + 1]
+            text, redacted = _redact_secrets(raw)
+            data = text.encode("utf-8", "replace")
+            note = f"{size} bytes" + ("; secrets redacted" if redacted else "")
+            if len(data) > limit or not whole:
+                data = data[:limit]
+                note += f"; TRUNCATED: only the first {len(data)} bytes are shown"
             body = data.decode("utf-8", "ignore")
             budget -= len(data)
             bodies.append(body)
             if shown_texts is not None:
                 shown_texts.append(body)
-            out.append((f"--- {target['path']} ({how}; {note})", body, base))
+            out.append((f"{target['path']} ({how}; {note})", body, base))
         if not later:
             out.append(f"{base}: no later call of this session to {server} names this path or its folder.")
             continue
@@ -866,7 +892,7 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts)
                    "may not hold what is shown (the hook can't tell: read "
                    f"{'the last ' + str(REMOTE_SCRIPT_SHOW_LATER) if more else 'them'}):"
                    + "".join("\n  " + _remote_call_line(c, key, hit)
-                             + (" (made after this call)" if at is not None and i > at else "")
+                             + ("" if earlier[i] else " (made after this call)")
                              for i, c, hit in later[-REMOTE_SCRIPT_SHOW_LATER:]))
     if not written_any:
         return [], "none"
@@ -875,7 +901,7 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, cut, shown_texts)
     for item in out:
         if isinstance(item, tuple):
             opening, body, base = item
-            item = f"{opening} [{marker}] ---\n{body.rstrip()}\n--- end of {base} [{marker}] ---"
+            item = fenced(opening, body, f"end of {base}", marker)
         lines.append(item)
     if cut:
         lines.append("(Only the newest part of the session's transcripts was read: an older call may "
