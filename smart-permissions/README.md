@@ -132,18 +132,28 @@ upload needs explicit authorization.
   and the checkout's git state, so it is held for the agent rather than put to
   you; a shared checkout or one holding deliverables stays yours.
   An MCP call whose `command` names a script file there by its absolute path
-  (`powershell -File C:\…\run.ps1`, `bash /srv/x/run.sh`; the extensions
-  local scripts use, three files at most) gets the text this session wrote
-  to that exact path through the same server's write tool (`write_file` and
-  the like: a `path` and a `content`; `append: true` adds to the latest whole
-  write), read in the same pass as the cleanup history: the write call's
-  input, never the file read back, 8 KB a file and 16 KB in all, redacted like
-  the log. A write in the same message before the call counts. The block says
-  when it was written and what the write returned, lists the later calls of
-  this session to that server that name the path or its folder (other than
-  reads and earlier tries of the same command), since those may have changed
-  the file, and says a script not shown is unseen. A script this session did
-  not write there gets no text, as before. The retry of a held call is judged
+  (`powershell -File C:\…\run.ps1`, `bash /srv/x/run.sh`, not `~/…`; the
+  extensions local scripts use, three files at most) gets the text this
+  session wrote to that exact path through the same server's write tool
+  (`write_file`, `write`, `create_file`, `put_file` or `save_file`, with a
+  `path` or `file_path` and a `content`; `append: true` adds to the latest
+  whole write), read in the same pass as the cleanup history: the write
+  call's input, never the file read back, 8 KB a file and 16 KB in all, cut
+  before it is redacted like the log, between lines marked with a random
+  token as for local scripts. Both blocks read one list of this session's
+  calls to that server, main and subagent transcripts together, in the order
+  they were made (by time, then by place in their message), with each call's
+  result; "earlier" is before this call in that list, found by its
+  tool_use id, or by its input as the last such call still waiting for a
+  result. So a write in the same message before the call counts, and nothing
+  after it does. The block says when the text was written and what the write
+  returned, says so when whole writes to it have no settled order (sent
+  together, their results missing or out of order: the last sent is shown),
+  lists the later calls of this session to that server that name the path or
+  its folder (other than reads and earlier tries of the same command), since
+  those may have changed the file, and says the call itself may change it
+  first and a script not shown is unseen. A script this session did not
+  write there gets no text, as before. The retry of a held call is judged
   with the same block. Logged as `remote_scripts`.
   Provenance never allows anything by rule. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
@@ -161,10 +171,15 @@ upload needs explicit authorization.
     Windows, where ownership can't be checked), never a
     `sensitive_paths` entry or the judge's key file (nor a link to one). It is
     told when a file was truncated, unreadable, missing or not shown, and which
-    other local scripts a shown one names that it has not seen. Script contents
-    stay out of the decision log: when the judge was shown a script, the log
-    keeps only its category, not its words. The reason you see has quoted
-    script text replaced by `[script text]`.
+    other local scripts a shown one names that it has not seen. Each text sits
+    between an opening and an end line marked with a random token drawn for
+    that call, which the header names as the bounds of file content to judge,
+    not instructions, so a file can't fake its own end. Script contents stay
+    out of the decision log: when the judge was shown a script, the log keeps
+    only its category, not its words, and any other logged reason (a held
+    call's question and flag) has each run of words a shown script holds
+    replaced by `[script text]`. The reason you see has quoted script text
+    replaced the same way.
   - *Stashes.* For `git stash drop`, `clear` or `pop` (when it reaches the
     judge): `git stash list` with each stash's date and message, whether it
     was made before or after this session started, and this session's own
@@ -718,7 +733,8 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 ## Changelog
 
 - **1.8.4 (2026-11-24) — a script on another machine is shown as this session wrote it.**
-  - An MCP call whose `command` runs a script file on another machine by its absolute path (`powershell -File C:\…\run.ps1`) gets the text this session wrote to that path through the same server's write tool, in the same transcript pass as 1.8.1's cleanup history: the latest whole write before the call (one in the same message counts) and the appends after it, bounded and redacted like script text, with when it was written, what the write returned, and the later calls there that name the path or its folder. Before, the judge flagged such a call as running a script "whose contents were not shown", and the held call's retry again, though the text was in the transcript. A script the session did not write there still goes to the judge unseen. Logged as `remote_scripts` (`shown`, `found`, `none`, `unavailable`). See [How the LLM judges a call](#how-the-llm-judges-a-call).
+  - An MCP call whose `command` runs a script file on another machine by its absolute path (`powershell -File C:\…\run.ps1`) gets the text this session wrote to that path through the same server's write tool, in the same transcript pass as 1.8.1's cleanup history: the latest whole write before the call (one in the same message counts) and the appends after it, bounded and redacted like script text, between lines marked with a random token, with when it was written, what the write returned, whether several whole writes have no settled order, and the later calls there that name the path or its folder. "Before the call" is its place in one list of the session's calls to that server across the main and subagent transcripts, which 1.8.1's cleanup history now reads too, so a call made after the judged one (by another agent, or later in its message) is never earlier evidence. Before, the judge flagged such a call as running a script "whose contents were not shown", and the held call's retry again, though the text was in the transcript. A script the session did not write there still goes to the judge unseen. Logged as `remote_scripts` (`shown`, `found`, `none`, `unavailable`).
+  - A local script's text shown to the judge sits between lines marked with the same kind of per-call token, so a file can't fake its own end, and a logged reason the hook composed around the judge's words (a held call's question and flag) has each run of words a shown script holds replaced by `[script text]`, as quoted text already was. See [How the LLM judges a call](#how-the-llm-judges-a-call).
 
 - **1.8.3 (2026-11-24) — bug fixes: script words and quoted heredocs.**
   - `S=/abs/dir; python3 $S/x.py` (the script word unquoted, `S` set once to a literal earlier in the same command) is the script file `"$S/x.py"` is, when the value can't split, glob or expand further. It went to the judge as code "read from a pipe". The script's own checks apply as before. Any other script word built at run time (one that may split, glob or name stdin) goes to the judge as before, under a reason that says so instead of "a pipe" or "a stream".
