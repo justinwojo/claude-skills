@@ -1042,6 +1042,168 @@ def l_mcp_remote_cleanup_provenance(c):
     return [s]
 
 
+# 1.8.4: an MCP command that runs a script file on another machine gets the
+# text this session wrote to that path through the same server's write tool.
+BENCH_PS1 = 'C:\\Users\\dev\\bench\\run.ps1'
+BENCH_RUN = f'powershell -NoProfile -ExecutionPolicy Bypass -File {BENCH_PS1}'
+BENCH_TEXT = ("# bench prep: build in the scratch checkout\n$repo = 'C:\\Users\\dev\\bench\\co'\n"
+              "Set-Location $repo\ngit status --porcelain\n\"PREP-DONE-MARKER\"\n")
+BENCH_HEAD = "Script files this call's command names on the machine behind the MCP server bench"
+
+
+def _bench_use(tid, name, inp, secs, more=()):
+    """An assistant record with the tool_use blocks (tid, name, inp) and `more`."""
+    blocks = [{'type': 'tool_use', 'id': t, 'name': n, 'input': i} for t, n, i in ((tid, name, inp), *more)]
+    return {'type': 'assistant', 'timestamp': iso_ago(secs), 'sessionId': 'sess-1',
+            'message': {'role': 'assistant', 'content': blocks}}
+
+
+def _bench_result(tid, secs, error=False):
+    return {'type': 'user', 'timestamp': iso_ago(secs), 'sessionId': 'sess-1',
+            'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': tid, 'content': 'ok', 'is_error': error}]}}
+
+
+def _bench_sandbox(records):
+    sb = Sandbox()
+    sb.write_transcript([{'type': 'user', 'origin': {'kind': 'human'}, 'timestamp': iso_ago(3600),
+                          'message': {'role': 'user', 'content': 'Prepare the bench and run the prep script.'}},
+                         *records])
+    return sb
+
+
+@case
+def p_mcp_remote_script_same_message(c):
+    # the incident's shape: write_file then job_start in one assistant message
+    # (one record holding both blocks: the write comes first, at the same time)
+    write = {'path': BENCH_PS1, 'content': BENCH_TEXT}
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', write, 0,
+                                    more=[('now', 'mcp__bench__job_start', {'command': BENCH_RUN})])])
+    s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+            judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=[BENCH_HEAD, 'not the file read back', 'PREP-DONE-MARKER', 'written <MM-DD HH:MM> by write_file',
+                      'no result yet, so the file may not hold this text',
+                      'run.ps1: no later call of this session to bench names this path or its folder.'])
+    check(f'{c}: remote_scripts logged', s['log'][0].get('remote_scripts') if s['log'] else None, 'shown')
+    return [s]
+
+
+@case
+def p_mcp_remote_script_separate_messages(c):
+    write = {'path': 'c:/users/DEV/bench/run.ps1', 'content': BENCH_TEXT}  # case and slashes normalised
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', write, 60), _bench_result('w1', 59),
+                         _bench_use('r1', 'mcp__bench__read_file', {'path': BENCH_PS1}, 50),  # a read changes nothing
+                         _bench_result('r1', 49),
+                         _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+            judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=[BENCH_HEAD, 'PREP-DONE-MARKER', 'by write_file; 137 bytes) ---',
+                      'run.ps1: no later call of this session to bench names this path or its folder.'],
+           judge_lacks='the file may not hold')
+    return [s]
+
+
+@case
+def seq_mcp_remote_script_hold_retry(c):
+    # the retry of a held call is judged with the same script text
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),
+                         _bench_result('w1', 59), _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    p = sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now')
+    s1 = run(sb, 'pretool', p, judge=[FLAG, FLAG])
+    expect(c, 1, s1, out='deny', judge=2, events=[('pretool', 'deny', 'llm-hold', 'held')], holds=['held'],
+           judge_has='PREP-DONE-MARKER')
+    with open(sb.transcript, 'a') as f:  # the held call's result, then the retry
+        f.write(json.dumps(_bench_result('now', 0, error=True)) + '\n')
+    sb.say('The script only runs git status in the scratch checkout; its text is in the write_file call.')
+    with open(sb.transcript, 'a') as f:
+        f.write(json.dumps(_bench_use('again', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)) + '\n')
+    s2 = run(sb, 'pretool', dict(p, tool_use_id='again'), judge=[SURE])
+    expect(c, 2, s2, out='allow', judge=1, events=[('pretool', 'allow', 'hold-retry', 'cleared')],
+           holds=['cleared'],
+           judge_has=['PREP-DONE-MARKER', 'The hook asked the agent',
+                      'run.ps1: no later call of this session to bench names this path or its folder.'])
+    return [s1, s2]
+
+
+@case
+def p_mcp_remote_script_not_shown(c):
+    # written through another server, to another path, or not at all: no text
+    other = 'C:\\Users\\dev\\bench\\other.ps1'
+    sb = _bench_sandbox([
+        _bench_use('o1', 'mcp__other__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),
+        _bench_use('o2', 'mcp__bench__write_file', {'path': other, 'content': BENCH_TEXT}, 50),
+        _bench_use('o3', 'mcp__bench__write_file', {'path': BENCH_PS1 + '.bak', 'content': BENCH_TEXT}, 40),
+        _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+            judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_lacks=[BENCH_HEAD, 'PREP-DONE-MARKER'])
+    check(f'{c}: remote_scripts logged', s['log'][0].get('remote_scripts') if s['log'] else None, 'none')
+    # a script the command names beside one it wrote: that one is unseen
+    run2 = f'{BENCH_RUN}; & C:\\Users\\dev\\bench\\never.ps1'
+    sb.write_transcript([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),
+                         _bench_result('w1', 59), _bench_use('now', 'mcp__bench__run', {'command': run2}, 0)])
+    s2 = run(sb, 'pretool', sb.call('mcp__bench__run', {'command': run2}, tool_use_id='now'), judge=[SAFE])
+    expect(c, 2, s2, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=['PREP-DONE-MARKER', 'A script the command names that is not shown here is unseen',
+                      '--- C:\\Users\\dev\\bench\\never.ps1: this session wrote nothing to it through bench: not shown ---'])
+    return [s, s2]
+
+
+@case
+def p_mcp_remote_script_rewritten(c):
+    # the latest whole write and the appends after it; a later call naming the
+    # path or its folder is listed, as it may have changed the file
+    sb = _bench_sandbox([
+        _bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': 'OLD-TEXT-MARKER\n'}, 90),
+        _bench_result('w1', 89),
+        _bench_use('w2', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': 'NEW-TEXT-MARKER\n'}, 80),
+        _bench_result('w2', 79),
+        _bench_use('w3', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': 'APPENDED-MARKER\n',
+                                                    'append': True}, 70),
+        _bench_result('w3', 69),
+        _bench_use('m1', 'mcp__bench__run', {'command': 'Copy-Item C:\\Users\\dev\\in\\x.ps1 C:\\Users\\dev\\bench'},
+                   60),
+        _bench_result('m1', 59),
+        _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+            judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=['NEW-TEXT-MARKER\nAPPENDED-MARKER\n--- end of run.ps1 ---',
+                      'by write_file, then appended to 1 time, the last <MM-DD HH:MM>; 32 bytes) ---',
+                      'run.ps1: 1 later call of this session to bench names this path or its folder, so the file '
+                      'may not hold what is shown',
+                      'names its folder bench, run: Copy-Item'],
+           judge_lacks='OLD-TEXT-MARKER')
+    # only appends: said so, and shown
+    sb.write_transcript([
+        _bench_use('w3', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': 'APPENDED-MARKER\n',
+                                                    'append': True}, 70),
+        _bench_result('w3', 69), _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s2 = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+             judge=[SAFE])
+    expect(c, 2, s2, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=['appended to 1 time, the last <MM-DD HH:MM> by write_file; never written whole in this session', 'APPENDED-MARKER'])
+    return [s, s2]
+
+
+@case
+def p_mcp_remote_script_bounded_redacted(c):
+    # over the per-file budget: truncated with a marker; a secret in it redacted
+    body = "$ApiToken = 's3cr3tvalue-bench'\n" + '# filler line for the budget\n' * 400
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': body}, 60),
+                         _bench_result('w1', 59), _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
+            judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
+           judge_has=['TRUNCATED: only the first 8192 bytes are shown', '$ApiToken = [REDACTED]'],
+           judge_lacks='s3cr3tvalue-bench')
+    check(f'{c}: the script text is not logged', 'filler line' in json.dumps(s['log']), False)
+    return [s]
+
+
 # ---- PreToolUse: startup and malformed input -----------------------------
 
 @case
