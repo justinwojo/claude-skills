@@ -7237,32 +7237,23 @@ def _script_word(raw, command):
     """How _stream_path reads `raw`, an interpreter's script word written
     `$S/fit.py` or `"$S/fit.py"`: as the quoted scalar (a script file) when
     the value is known to make a plain path, unquoted (built at run time)
-    otherwise; any other word as it is. The value is known when `command`
-    binds S to one literal (_command_constants: it can't split, glob or
-    expand) that makes neither an option (`S=-Wx` makes `-Wx/fit.py`, and
-    Python then reads its code from stdin) nor a sensitive path. A quoted
-    word whose S `command` never sets reads the session's environment, which
-    the agent's command does not choose: a script file, as before."""
+    otherwise; any other word as it is. The value is known only when
+    `command` binds S to one literal (_command_constants: it can't split,
+    glob or expand) that makes neither an option (`S=-Wx` makes
+    `-Wx/fit.py`, and Python then reads its code from stdin) nor a sensitive
+    path. A value the hook can't see (`${S:=…}`, `read $n`, the environment)
+    may be either, so that word goes to the judge."""
     m = re.fullmatch(r'(")?%s(?(1)")' % _SCALAR_SCRIPT_WORD, raw)
     if not m:
         return raw
-    word, name = raw.strip('"'), m.group(2) or m.group(3)
-    value = _command_constants(command).get(name) if command is not None else None
-    if value is not None:
-        path = value + word[word.index("/"):]
-        plain = (re.fullmatch(r"[\w./@%+,:-]+", value) and not path.startswith("-")
-                 and not _sensitive_operand(path))
-        return f'"{word}"' if plain else word
-    if m.group(1) and not (command is not None and _sets_name(command, name)):
-        return raw
-    return word
-
-
-def _sets_name(command, name):
-    """True if `name` stands in `command` other than as a read (`$S`,
-    `${S}`): an assignment, `read S`, `for S in`, `export S`, … — or any
-    other text, which only costs an ask."""
-    return bool(re.search(r"(?<![\w$])(?<!\$\{)%s(?!\w)" % re.escape(name), command))
+    word = raw.strip('"')
+    value = _command_constants(command).get(m.group(2) or m.group(3)) if command is not None else None
+    if value is None:
+        return word
+    path = value + word[word.index("/"):]
+    plain = (re.fullmatch(r"[\w./@%+,:-]+", value) and not path.startswith("-")
+             and not _sensitive_operand(path))
+    return f'"{word}"' if plain else word
 
 
 def _stays_one_word(raw):

@@ -8369,9 +8369,11 @@ def test_script_word_and_quoted_heredoc_1_8_3():
             'S=$(pwd); echo x | python3 "$S/fit.py"', 'read S; python3 "$S/fit.py"',
             'S=/tmp/a; S=/tmp/b; python3 "$S/fit.py"',
             # a value that makes a sensitive path, as the literal path does
-            'S=~/.ssh; python3 $S/fit.py', 'S=~/.ssh; python3 "$S/fit.py"']
-    # a quoted word whose value is the session's environment: a script file, as before
-    allows += ['python3 "$S/fit.py"', 'echo x | python3 "${S}/sub/fit.py"']
+            'S=~/.ssh; python3 $S/fit.py', 'S=~/.ssh; python3 "$S/fit.py"',
+            # a value the hook can't see, quoted or not: it may be an option
+            ": ${S:=-Wx}; echo 'import os' | python3 \"$S/fit.py\"",
+            "x=$'\\123'; read $x <<< -Wx; echo 'import os' | python3 \"$S/fit.py\"",
+            'python3 "$S/fit.py"', 'echo x | python3 "${S}/sub/fit.py"']
     _phase3_check('1.8.3 script word', [], asks, allows)
     res = _both_hooks(asks + ["echo 'import os' | python3", "echo 'import os' | python3 -",
                               "echo 'import os' | python3 /dev/stdin"])
