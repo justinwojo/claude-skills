@@ -131,6 +131,20 @@ upload needs explicit authorization.
   that holds nothing unique is a flag the agent can settle from those calls
   and the checkout's git state, so it is held for the agent rather than put to
   you; a shared checkout or one holding deliverables stays yours.
+  An MCP call whose `command` names a script file there by its absolute path
+  (`powershell -File C:\…\run.ps1`, `bash /srv/x/run.sh`; the extensions
+  local scripts use, three files at most) gets the text this session wrote
+  to that exact path through the same server's write tool (`write_file` and
+  the like: a `path` and a `content`; `append: true` adds to the latest whole
+  write), read in the same pass as the cleanup history: the write call's
+  input, never the file read back, 8 KB a file and 16 KB in all, redacted like
+  the log. A write in the same message before the call counts. The block says
+  when it was written and what the write returned, lists the later calls of
+  this session to that server that name the path or its folder (other than
+  reads and earlier tries of the same command), since those may have changed
+  the file, and says a script not shown is unseen. A script this session did
+  not write there gets no text, as before. The retry of a held call is judged
+  with the same block. Logged as `remote_scripts`.
   Provenance never allows anything by rule. It also sees why the local rules sent the call (`Unknown
   command(s): flyctl`, `Risky: … appears only in text passed on as data`), as
   a hint about what to check.
@@ -702,6 +716,9 @@ Windows is supported with automatic loading of `config/defaults-windows.json` (P
 - macOS, Linux, or Windows
 
 ## Changelog
+
+- **1.8.4 (2026-11-24) — a script on another machine is shown as this session wrote it.**
+  - An MCP call whose `command` runs a script file on another machine by its absolute path (`powershell -File C:\…\run.ps1`) gets the text this session wrote to that path through the same server's write tool, in the same transcript pass as 1.8.1's cleanup history: the latest whole write before the call (one in the same message counts) and the appends after it, bounded and redacted like script text, with when it was written, what the write returned, and the later calls there that name the path or its folder. Before, the judge flagged such a call as running a script "whose contents were not shown", and the held call's retry again, though the text was in the transcript. A script the session did not write there still goes to the judge unseen. Logged as `remote_scripts` (`shown`, `found`, `none`, `unavailable`). See [How the LLM judges a call](#how-the-llm-judges-a-call).
 
 - **1.8.3 (2026-11-24) — bug fixes: script words and quoted heredocs.**
   - `S=/abs/dir; python3 $S/x.py` (the script word unquoted, `S` set once to a literal earlier in the same command) is the script file `"$S/x.py"` is, when the value can't split, glob or expand further. It went to the judge as code "read from a pipe". The script's own checks apply as before. Any other script word built at run time (one that may split, glob or name stdin) goes to the judge as before, under a reason that says so instead of "a pipe" or "a stream".
