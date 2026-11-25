@@ -234,6 +234,8 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
         # (see build_llm_context), so its effect on verdicts can be measured.
         if state.provenance:
             record["provenance"] = state.provenance
+        if state.remote_scripts:  # whether it saw a script's text as written on another machine
+            record["remote_scripts"] = state.remote_scripts
         os.makedirs(os.path.dirname(DECISION_LOG_PATH), exist_ok=True)
         _append_log_line(DECISION_LOG_PATH, json.dumps(record) + "\n", DECISION_LOG_MAX_BYTES)
     except Exception:

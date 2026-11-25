@@ -34,13 +34,18 @@ class CallState:
     earlier command of this session names a target, or the target was
     created after the session started; on another machine, an earlier call
     there names it), "none", "unavailable" (no transcript to read), or None
-    when the call deletes or resets nothing it can name; and `script_texts`,
-    the local script text the judge was shown, so a reason quoting it is
-    scrubbed before it is logged or stored (see scrub_script_text);
+    when the call deletes or resets nothing it can name; `remote_scripts`,
+    for an MCP command that names script files on another machine:
+    "shown" (the text this session wrote to one through that server was
+    shown), "found" (written, but no text could be shown), "none" (this
+    session wrote none of them there), "unavailable", or None; and
+    `script_texts`, the script text the judge was shown (local, or as
+    written on another machine), so a reason quoting it is scrubbed before
+    it is logged or stored (see scrub_script_text);
     `reading_words`, True while _commands_words runs (reading a command can
     evaluate code inside it, which comes back there)."""
     __slots__ = ("cwd", "scratchpad", "client_tool", "top_command", "provenance",
-                 "script_texts", "reading_words")
+                 "remote_scripts", "script_texts", "reading_words")
 
     def __init__(self, cwd=None, scratchpad=None, client_tool=None):
         self.cwd = cwd
@@ -48,6 +53,7 @@ class CallState:
         self.client_tool = client_tool
         self.top_command = ""
         self.provenance = None
+        self.remote_scripts = None
         self.script_texts = []
         self.reading_words = False
 

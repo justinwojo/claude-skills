@@ -3,7 +3,8 @@ one entry point, joins the blocks its submodules build.
 
 git         the repository: status before a discard, linked worktree, remote owners
 loss        delete and reset targets, and what deleting them would lose
-provenance  who made a target: this session's commands, MCP calls, stashes
+provenance  who made a target: this session's commands, MCP calls, stashes;
+            and a script on another machine as this session wrote it there
 scripts     the text of the local scripts a call runs
 notes       a subagent's brief, /tmp privacy, MCP notes, the live hook note
 
@@ -22,7 +23,7 @@ from .git import (
     git_discard_context, git_remote_context,
 )
 from .provenance import (
-    PROVENANCE_BUDGET_S, _STASH_DISCARD_RE, remote_provenance, session_provenance, stash_context,
+    PROVENANCE_BUDGET_S, _STASH_DISCARD_RE, remote_context, session_provenance, stash_context,
 )
 from .loss import destructive_targets, loss_context
 from .scripts import script_context
@@ -35,7 +36,7 @@ def build_llm_context(input_data, state):
     """Context block for the LLM from the hook input ('' when none). It
     records on `state`, the hook call's (see CallState), the provenance it
     found and the script texts it showed."""
-    state.provenance = None
+    state.provenance = state.remote_scripts = None
     state.script_texts.clear()
     if not isinstance(input_data, dict):
         return ""
@@ -82,9 +83,11 @@ def build_llm_context(input_data, state):
             parts.extend(_quietly(stash_context, command, cwd, input_data, deadline) or [])
         if targets:
             parts.extend(loss_context(targets, covered, deadline))
-    if isinstance(tool, str) and tool.startswith("mcp__"):  # a cleanup on another machine
-        provenance, state.provenance = remote_provenance(
-            input_data, tool, tool_input, min(context_deadline, time.monotonic() + PROVENANCE_BUDGET_S))
+    if isinstance(tool, str) and tool.startswith("mcp__"):  # a cleanup or a script on another machine
+        provenance, state.provenance, remote_scripts, state.remote_scripts = remote_context(
+            input_data, tool, tool_input, min(context_deadline, time.monotonic() + PROVENANCE_BUDGET_S),
+            state.script_texts)
+        parts.extend(remote_scripts)
     parts.extend(provenance)
     agent = input_data.get("agent_transcript_path")
     if isinstance(agent, str) and agent != input_data.get("transcript_path"):

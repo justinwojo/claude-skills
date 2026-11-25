@@ -8736,6 +8736,139 @@ def test_remote_provenance_1_8_1():
           ('found', True))
 
 
+def test_remote_scripts_1_8_4():
+    print('\n--- 1.8.4: a script on another machine, as this session wrote it there ---')
+    sys.path.insert(0, SCRIPT_DIR)
+    from smart_permissions import judge as sp_judge
+    from smart_permissions.context import provenance as cx_prov
+    base = os.path.realpath(tempfile.mkdtemp(prefix='sp-rscript-'))
+    atexit.register(shutil.rmtree, base, ignore_errors=True)
+    ps1 = 'C:\\Users\\dev\\bench\\run.ps1'
+    run = f'powershell -NoProfile -ExecutionPolicy Bypass -File {ps1}'
+
+    # ---- 1. which script files a call names, and which calls write one ----
+    check('scripts: a command naming .ps1, .sh and .py files; other paths are not scripts',
+          [n for _, n in cx_prov._remote_scripts('mcp__bench__run', {
+              'command': f'{run}; bash /srv/a/b.sh; python3 /srv/a/c.PY; type C:\\Lab\\notes.txt'})],
+          ['c:/users/dev/bench/run.ps1', '/srv/a/b.sh', '/srv/a/c.PY'])
+    check('scripts: at most three, each once',
+          len(cx_prov._remote_scripts('mcp__bench__run', {'command': ' '.join(
+              f'/srv/x/{i}.sh /srv/x/{i}.sh' for i in range(6))})), 3)
+    check('scripts: a path field counts beside the command',
+          cx_prov._remote_scripts('mcp__bench__job_start', {'command': 'pwsh -File $f', 'file': '/srv/x/a.ps1'}),
+          [('/srv/x/a.ps1', '/srv/x/a.ps1')])
+    check('scripts: no command, or not an MCP tool → none',
+          (cx_prov._remote_scripts('mcp__bench__read_file', {'path': ps1}),
+           cx_prov._remote_scripts('Bash', {'command': run})), ([], []))
+    norm = 'c:/users/dev/bench/run.ps1'
+    check('write: write_file with path and content, case and slashes normalised',
+          cx_prov._remote_write('write_file', {'path': 'c:/USERS/dev/bench/run.ps1', 'content': 'x'}, norm), ('x', False))
+    check('write: append true', cx_prov._remote_write('write_file', {'path': ps1, 'content': 'x', 'append': True}, norm),
+          ('x', True))
+    check('write: other write-tool names', [bool(cx_prov._remote_write(n, {'path': ps1, 'content': 'x'}, norm))
+                                            for n in ('write', 'create_file', 'putFile', 'save_file')],
+          [True, True, True, True])
+    check('write: a read, another path, or no text is no write',
+          [cx_prov._remote_write('read_file', {'path': ps1, 'content': 'x'}, norm),
+           cx_prov._remote_write('write_file', {'path': ps1 + '.bak', 'content': 'x'}, norm),
+           cx_prov._remote_write('write_file', {'path': ps1, 'content': 7}, norm)], [None, None, None])
+
+    # ---- 2. this session's writes there ----
+    proj = os.path.join(base, 'claude-projects', '-slug')
+    os.makedirs(proj)
+    sess = os.path.join(proj, 'sess-1.jsonl')
+
+    def use(tid, name, inp, minutes, more=()):
+        rec = _tool_use(tid, name, inp, minutes)
+        rec['message']['content'] += [{'type': 'tool_use', 'id': t, 'name': n, 'input': i} for t, n, i in more]
+        return rec
+
+    def ctx(records, tool='mcp__bench__job_start', inp=None, tid='now', path=sess):
+        _transcript(path, records)
+        texts = []
+        out = cx_prov.remote_context({'transcript_path': sess, 'tool_use_id': tid}, tool,
+                                     inp or {'command': run}, time.monotonic() + 5, texts)
+        return '\n'.join(out[2]), out[3], texts, out
+
+    w = {'path': ps1, 'content': 'Write-Output SCRIPT-ONE\n'}
+    text, status, texts, _ = ctx([use('w1', 'mcp__bench__write_file', w, 0,
+                                      more=[('now', 'mcp__bench__job_start', {'command': run})])])
+    check('same record: the write before the call is shown, its text recorded for scrubbing',
+          ('SCRIPT-ONE' in text, status, texts), (True, 'shown', ['Write-Output SCRIPT-ONE\n']))
+    check('same record: a write after the call is not',
+          ctx([use('now', 'mcp__bench__job_start', {'command': run}, 0,
+                   more=[('w1', 'mcp__bench__write_file', w)])])[1], 'none')
+    check('reason scrubbing covers the shown text',
+          sp_judge.scrub_script_text('it runs "Write-Output SCRIPT-ONE" there', texts), 'it runs "[script text]" there')
+    text, status, _, _ = ctx([_tool_use('w1', 'mcp__bench__write_file', w, 5), _bash_result('w1', 5, error=True),
+                              _tool_use('now', 'mcp__bench__job_start', {'command': run}, 0)])
+    check('a write that returned an error: said so',
+          'a write: the tool call returned an error, so the file may not hold this text' in text, True)
+    text, status, _, _ = ctx([_tool_use('w1', 'mcp__other__write_file', w, 5),
+                              _tool_use('w2', 'mcp__bench__x__write_file', w, 5),
+                              _tool_use('now', 'mcp__bench__job_start', {'command': run}, 0)])
+    check('another server, or one sharing the prefix: nothing shown', (text, status), ('', 'none'))
+    # later calls: a run that names the file is listed; a read, and an earlier try of this
+    # same command, are not
+    text, status, _, _ = ctx([
+        _tool_use('w1', 'mcp__bench__write_file', w, 9), _bash_result('w1', 9),
+        _tool_use('r1', 'mcp__bench__read_file', {'path': ps1}, 8),
+        _tool_use('t1', 'mcp__bench__job_start', {'command': run}, 7), _bash_result('t1', 7, error=True),
+        _tool_use('g1', 'mcp__bench__run', {'command': f'(Get-Content {ps1}) -replace 1,2 | Set-Content {ps1}'}, 6),
+        _tool_use('now', 'mcp__bench__job_start', {'command': run}, 0)])
+    check('later calls: one listed, the read and the earlier try are not',
+          ('1 later call of this session to bench names this path' in text, 'Set-Content' in text,
+           'read_file' in text, 'job_start' in text), (True, True, False, False))
+    # another agent's write made after this call: not shown as the text, listed as later
+    agent = os.path.join(proj, 'sess-1', 'subagents', 'agent-a.jsonl')
+    os.makedirs(os.path.dirname(agent))
+    _transcript(agent, [_tool_use('a1', 'mcp__bench__write_file', dict(w, content='AGENT-TEXT\n'), -1)])
+    text, status, _, _ = ctx([_tool_use('w1', 'mcp__bench__write_file', w, 9), _bash_result('w1', 9),
+                              _tool_use('now', 'mcp__bench__job_start', {'command': run}, 0)])
+    check("another agent's write after this call: listed, not shown",
+          ('SCRIPT-ONE' in text, 'AGENT-TEXT' in text, '(made after this call)' in text), (True, False, True))
+    os.remove(agent)
+    # the text budget: 8 KB a file, 16 KB in all
+    three = f'{run}; & C:\\Users\\dev\\bench\\b.ps1; & C:\\Users\\dev\\bench\\c.ps1'
+    big = lambda p: {'path': p, 'content': 'x' * 9000}
+    text, status, texts, _ = ctx([_tool_use(f'w{i}', 'mcp__bench__write_file', big(p), 5)
+                                  for i, p in enumerate((ps1, 'C:\\Users\\dev\\bench\\b.ps1', 'C:\\Users\\dev\\bench\\c.ps1'))]
+                                 + [_tool_use('now', 'mcp__bench__run', {'command': three}, 0)],
+                                 tool='mcp__bench__run', inp={'command': three})
+    check('budget: two truncated at 8 KB, the third not shown',
+          (text.count('TRUNCATED: only the first 8192 bytes are shown'), 'not shown: the script text budget is used up' in text,
+           [len(t) for t in texts]), (2, True, [8192, 8192]))
+    # no tool_use_id: the call is known by its input
+    _transcript(sess, [_tool_use('w1', 'mcp__bench__write_file', w, 5), _tool_use('x', 'mcp__bench__job_start', {'command': run}, 0)])
+    out = cx_prov.remote_context({'transcript_path': sess}, 'mcp__bench__job_start', {'command': run}, time.monotonic() + 5)
+    check('no tool_use_id: still shown', (out[3], 'SCRIPT-ONE' in '\n'.join(out[2])), ('shown', True))
+    check('no transcript: unavailable',
+          cx_prov.remote_context({'transcript_path': os.path.join(base, 'nope.jsonl')}, 'mcp__bench__job_start',
+                                 {'command': run}, time.monotonic() + 5), ([], None, [], 'unavailable'))
+    check('past the deadline: nothing', cx_prov.remote_context({'transcript_path': sess}, 'mcp__bench__job_start',
+                                                               {'command': run}, time.monotonic() - 1), ([], None, [], None))
+
+    # ---- 3. a cleanup that names a script: both blocks, one reading ----
+    rmrf = d('cm0gLXJm')
+    both = {'command': f'{run}; {rmrf} C:\\Users\\dev\\bench\\out'}
+    _transcript(sess, [_tool_use('w1', 'mcp__bench__write_file', w, 5), _bash_result('w1', 5),
+                       _tool_use('m1', 'mcp__bench__run', {'command': 'mkdir C:\\Users\\dev\\bench\\out'}, 4),
+                       _bash_result('m1', 4), _tool_use('now', 'mcp__bench__run', both, 0)])
+    reads, real = [], cx_prov._tail_lines
+    cx_prov._tail_lines = lambda *a: reads.append(a) or real(*a)
+    try:
+        out = cx_prov.remote_context({'transcript_path': sess, 'tool_use_id': 'now'}, 'mcp__bench__run', both,
+                                     time.monotonic() + 5)
+    finally:
+        cx_prov._tail_lines = real
+    check('both: provenance and script text from one reading of the transcript',
+          (out[1], out[3], len(reads), 'mkdir' in '\n'.join(out[0]), 'SCRIPT-ONE' in '\n'.join(out[2])),
+          ('found', 'shown', 1, True, True))
+    check('both: remote_provenance still gives the provenance part alone',
+          cx_prov.remote_provenance({'transcript_path': sess, 'tool_use_id': 'now'}, 'mcp__bench__run', both,
+                                    time.monotonic() + 5), (out[0], 'found'))
+
+
 if __name__ == '__main__':
     # no docker config or endpoint of this machine's (a remote current context) in the results
     for name in ('DOCKER_HOST', 'DOCKER_CONTEXT', 'CONTAINER_HOST', 'CONTAINER_CONNECTION'):
@@ -8879,6 +9012,7 @@ if __name__ == '__main__':
     test_script_hazard_1_8_0()
     test_remote_provenance_1_8_1()
     test_script_word_and_quoted_heredoc_1_8_3()
+    test_remote_scripts_1_8_4()
 
     print('\n' + '=' * 50)
     print(f'Results: {passed} passed, {failed} failed')
