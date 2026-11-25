@@ -396,6 +396,7 @@ class Normaliser:
         s = re.sub(r'\[Errno -?\d+\]', '[Errno N]', s)
         s = re.sub(r'\b\d+ (min|minutes|seconds|s|h|hours) ago\b', r'<N> \1 ago', s)
         s = re.sub(r'\b\d{2}-\d{2} \d{2}:\d{2}\b', '<MM-DD HH:MM>', s)  # provenance call times
+        s = re.sub(r'\bsp-[0-9a-f]{12}\b', 'sp-<marker>', s)  # a shown script text's per-call marker
         return s
 
     def obj(self, o):
@@ -1099,7 +1100,7 @@ def p_mcp_remote_script_separate_messages(c):
     s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
             judge=[SAFE])
     expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
-           judge_has=[BENCH_HEAD, 'PREP-DONE-MARKER', 'by write_file; 137 bytes) ---',
+           judge_has=[BENCH_HEAD, 'PREP-DONE-MARKER', 'by write_file; 137 bytes) [sp-<marker>] ---',
                       'run.ps1: no later call of this session to bench names this path or its folder.'],
            judge_lacks='the file may not hold')
     return [s]
@@ -1171,8 +1172,8 @@ def p_mcp_remote_script_rewritten(c):
     s = run(sb, 'pretool', sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now'),
             judge=[SAFE])
     expect(c, 1, s, out='allow', judge=1, events=[('pretool', 'allow', 'llm')],
-           judge_has=['NEW-TEXT-MARKER\nAPPENDED-MARKER\n--- end of run.ps1 ---',
-                      'by write_file, then appended to 1 time, the last <MM-DD HH:MM>; 32 bytes) ---',
+           judge_has=['NEW-TEXT-MARKER\nAPPENDED-MARKER\n--- end of run.ps1 [sp-<marker>] ---',
+                      'by write_file, then appended to 1 time, the last <MM-DD HH:MM>; 32 bytes) [sp-<marker>] ---',
                       'run.ps1: 1 later call of this session to bench names this path or its folder, so the file '
                       'may not hold what is shown',
                       'names its folder bench, run: Copy-Item'],

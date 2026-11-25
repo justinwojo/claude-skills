@@ -159,14 +159,52 @@ def _append_log_line(path, line, max_bytes):
 
 def _loggable_reason(reason, script_texts):
     """`reason` for the decision log. When the judge was shown script
-    contents (`script_texts`, see CallState), its own words may echo them, so
-    only its category numbers are kept: script text never reaches the log."""
-    if not (script_texts and isinstance(reason, str) and reason.startswith("LLM")) \
-            or reason == "LLM approved":
+    contents (`script_texts`, see CallState), its own words may echo them:
+    a verdict ("LLM…") keeps only its category numbers, and any other reason
+    (one the hook composed around the judge's words, such as a held call's
+    question and flag) has each run of words a shown text holds
+    (_script_runs_scrubbed) replaced: script text never reaches the log."""
+    if not (script_texts and isinstance(reason, str)) or reason == "LLM approved":
         return reason
+    if not reason.startswith("LLM"):
+        return _script_runs_scrubbed(reason, script_texts)
     cats = sorted(set(re.findall(r"category ([1-9])(?!\d)", reason)))  # the prompt's 1-9, not free text
     return ("LLM verdict; its words are not logged, as it was shown script contents"
             + (f" (category {', '.join(cats)})" if cats else ""))
+
+
+# A run of a reason's words found in a shown script text: three words and
+# 12 characters, or one long word (quotes and end punctuation aside).
+SCRIPT_RUN_MIN_WORDS, SCRIPT_RUN_MIN_CHARS, SCRIPT_WORD_MIN_CHARS = 3, 12, 20
+_RUN_EDGE = "`'\"()[]{}<>,.;:!?"
+
+
+def _script_runs_scrubbed(reason, script_texts):
+    """`reason` with each longest run of its words that a script text
+    (whitespace collapsed) holds replaced by `[script text]`."""
+    flat = [" ".join(t.split()) for t in script_texts if isinstance(t, str) and t.strip()]
+    words = list(re.finditer(r"\S+", reason))
+    spans, i = [], 0
+    while i < len(words):
+        best, j = None, i
+        while j < len(words):
+            run = " ".join(w[0] for w in words[i:j + 1]).strip(_RUN_EDGE)
+            if not run or not any(run in text for text in flat):
+                break
+            if (j - i + 1 >= SCRIPT_RUN_MIN_WORDS and len(run) >= SCRIPT_RUN_MIN_CHARS) \
+                    or len(run) >= SCRIPT_WORD_MIN_CHARS:
+                best = j
+            j += 1
+        if best is None:
+            i += 1
+            continue
+        first, last = words[i][0], words[best][0]  # the quotes and end punctuation around it stay
+        spans.append((words[i].start() + len(first) - len(first.lstrip(_RUN_EDGE)),
+                      words[best].end() - len(last) + len(last.rstrip(_RUN_EDGE))))
+        i = best + 1
+    for start, end in reversed(spans):
+        reason = reason[:start] + "[script text]" + reason[end:]
+    return reason
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,
@@ -181,7 +219,7 @@ def log_decision(hook, tool, tool_input, decision, source, reason,
     rule|llm|llm-recheck|llm-hold|hold-retry|learner|prompt-timeout (older logs also hold
     llm-cache, from the cache since removed). `provenance`
     (found|none|unavailable) is there when the judge was asked about a delete
-    or reset it could name, here or on another machine (remote_provenance). `hold` says what a hold did: held, cleared,
+    or reset it could name, here or on another machine (remote_context). `hold` says what a hold did: held, cleared,
     asked (flagged again), no-answer, retry-busy, or why a flag was not held;
     prompt-timeout on the learner's deny of a prompt nobody answered.
     `state` is the hook call's (see CallState): its client tool name, the
