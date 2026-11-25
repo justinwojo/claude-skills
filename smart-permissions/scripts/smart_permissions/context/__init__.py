@@ -14,7 +14,7 @@ flows; core imports it only inside _main, on the judged path."""
 import os
 import time
 
-from ..util import _quietly, fenced, text_marker
+from ..util import _quietly, fenced, one_line, text_marker
 from ..payload import parse_hook_payload
 from ..transcript import recent_user_messages
 from ..core import GIT_CONTEXT_BUDGET_S
@@ -43,7 +43,7 @@ def build_llm_context(input_data, state):
     parts = []
     cwd = input_data.get("cwd")
     if isinstance(cwd, str) and cwd:
-        parts.append(f"Working directory: {cwd}")
+        parts.append(f"Working directory: {one_line(cwd)}")
     tool, tool_input, _client_tool = parse_hook_payload(input_data)
     command = tool_input.get("command") if tool == "Bash" else None
     absolute = isinstance(cwd, str) and os.path.isabs(cwd)

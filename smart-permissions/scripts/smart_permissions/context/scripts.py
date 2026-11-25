@@ -6,7 +6,7 @@ import os
 import re
 import time
 
-from ..util import fenced, text_marker
+from ..util import fenced, one_line, text_marker
 from ..core import (
     GIT_CONTEXT_BUDGET_S, SCRIPT_CONTEXT_MAX_BYTES, SCRIPT_CONTEXT_TOTAL_BYTES, _SCRIPT_EXT,
     _evidence_path, _read_script, _written_files, script_files,
@@ -48,7 +48,7 @@ def script_context(command, cwd, deadline=None, shown_texts=None):
         if path in written or os.path.basename(path) in written_names:
             note += "; THE CALL WRITES THIS FILE FIRST: what runs is not what is shown"
         if text is None:
-            out.append(f"--- {path} ({how}): {note} ---")
+            out.append(f"--- {one_line(path)} ({how}): {note} ---")
             continue
         out.append(fenced(f"{path} ({how}; {note})", text, f"end of {os.path.basename(path)}", marker))
         others = []
@@ -57,6 +57,6 @@ def script_context(command, cwd, deadline=None, shown_texts=None):
             if other and other not in shown and m.group(0) not in others:
                 others.append(m.group(0))
         if others:
-            out.append(f"{os.path.basename(path)} names other local scripts not shown here: "
+            out.append(f"{one_line(os.path.basename(path))} names other local scripts not shown here: "
                        + ", ".join(others[:8]) + ("" if len(others) <= 8 else ", …") + ".")
     return "\n".join(out)

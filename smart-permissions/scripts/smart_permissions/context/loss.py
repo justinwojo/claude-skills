@@ -8,6 +8,7 @@ import glob
 import itertools
 
 from ..config import HOME_DIR
+from ..util import one_line
 from ..core import (
     _CD_NAMES, _GIT_SHORT_VALUES, _GIT_VALUE_OPTS, _LITERAL_CHARS, _PLAIN_BRANCH_RE, _cd_in_scope,
     _commands_words, _evidence_cd, _evidence_path, _git_flags, _git_probe, _git_remotes, _git_risk,
@@ -296,11 +297,12 @@ def _delete_loss(path, label, deadline):
     if not folder and not os.path.isfile(path):
         return ""
     repos, complete = _repos_inside(path, deadline) if folder else ([], True)
+    shown, label = one_line(path), one_line(label)
     if repos:
-        out = [f"Git repositories inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
+        out = [f"Git repositories inside {shown} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
                + ("" if complete else "; the search stopped early, there may be more") + ":"]
         for repo, bare in repos:
-            out.append(f"- {os.path.relpath(repo, path) if repo != path else path}:")
+            out.append(f"- {one_line(os.path.relpath(repo, path)) if repo != path else shown}:")
             out.append(_repo_loss(repo, deadline, bare))
         return "\n".join(out)
     top = (_git_probe(path if folder else os.path.dirname(path), ["rev-parse", "--show-toplevel"],
@@ -319,11 +321,11 @@ def _delete_loss(path, label, deadline):
                 where = (f" The repository's root is under /tmp" + (
                     f"; its remotes: {', '.join(named)}." if named else
                     "; it has no remotes." if remotes is not None else "."))
-            return (f"{path} ({label}) is inside the git repository {top}.{where} Uncommitted, "
+            return (f"{shown} ({label}) is inside the git repository {one_line(top)}.{where} Uncommitted, "
                     f"untracked and ignored files there (`git status --short --ignored`):\n{body}")
     if not folder:
         return ""
-    return (f"No git repository inside {path} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
+    return (f"No git repository inside {shown} ({label}), up to {LOSS_REPO_DEPTH} levels deep"
             + ("" if complete else " (the search stopped early)") + ", and it is not inside one.")
 
 
@@ -336,7 +338,7 @@ def _branch_loss(path, branches, label, deadline):
                                  ref, "--"], deadline) or "").strip()
         if not tip:
             continue
-        line = f"Branch {b} in {path} ({label}): tip {tip[:100]}."
+        line = f"Branch {one_line(b)} in {one_line(path)} ({one_line(label)}): tip {tip[:100]}."
         unique = (_git_probe(path, ["rev-list", "--count", ref, "--not", f"--exclude={b}",
                                     "--branches", "--remotes", "--"], deadline) or "").strip()
         if unique.isdigit():

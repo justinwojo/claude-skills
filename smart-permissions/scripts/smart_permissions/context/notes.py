@@ -9,6 +9,7 @@ from fnmatch import fnmatch
 from ..config import MCP_CONTEXT, PLUGIN_ROOT
 from ..transcript import _SYSTEM_REMINDER_RE
 from ..core import _temp_top
+from ..util import one_line
 
 
 # ── Judge context: a subagent's brief, local scripts, stashes, /tmp, MCP ──
@@ -77,7 +78,7 @@ def _temp_privacy(top, st):
     """One sentence on who can write into `top`, a folder under /tmp."""
     import stat as _stat
     if _stat.S_ISLNK(st.st_mode):
-        return f"{top} is a symbolic link."
+        return f"{one_line(top)} is a symbolic link."
     if not _stat.S_ISDIR(st.st_mode):
         return None
     mine = hasattr(os, "getuid") and st.st_uid == os.getuid()
@@ -91,7 +92,7 @@ def _temp_privacy(top, st):
         kind = "no other user can create or change anything in it"
     else:
         kind = "writable by its group" if mode & 0o020 else "not world-writable"
-    return f"{top} is a folder owned by {owner}, mode {mode:o} ({kind})."
+    return f"{one_line(top)} is a folder owned by {owner}, mode {mode:o} ({kind})."
 
 
 def temp_privacy_context(paths):

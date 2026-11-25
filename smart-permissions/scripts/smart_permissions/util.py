@@ -1,8 +1,10 @@
 """Small helpers with no state of their own: elapsed milliseconds, running a
 context block so an exception never fails the hook, the per-process memo
 for readers whose answer depends only on their arguments and the loaded
-config, and the marked lines around a text shown to the judge."""
+config, the marked lines around a text shown to the judge, and the one
+line a value from the payload or a transcript is shown on outside them."""
 import functools
+import re
 import secrets
 import time
 
@@ -21,7 +23,15 @@ def fenced(opening, text, end, marker):
     nothing inside can fake its end. Every text an agent wrote, or that is
     read from a transcript, is shown this way; the block's header names the
     marker and says the text is data."""
-    return f"--- {opening} [{marker}] ---\n{text.rstrip()}\n--- {end} [{marker}] ---"
+    return f"--- {one_line(opening)} [{marker}] ---\n{text.rstrip()}\n--- {one_line(end)} [{marker}] ---"
+
+
+def one_line(text):
+    """`text` on one line, so a value from the payload or a transcript the
+    judge is shown outside a fenced block (a path, a tool name) can't start a
+    line of its own: a line feed is ` / `, any other line break, control
+    character or run of space one space."""
+    return re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", re.sub(r"\s*\n\s*", " / ", text))
 
 
 def _elapsed_ms(start):

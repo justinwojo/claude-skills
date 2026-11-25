@@ -6,6 +6,7 @@ import os
 import re
 import time
 
+from ..util import one_line
 from ..core import (
     GIT_CONTEXT_BUDGET_S, _commands_words, _developer_owners, _git_command_dirs, _git_probe,
     _git_remotes, _remote_owner,
@@ -34,7 +35,7 @@ def git_status_snapshot(cwd, deadline):
     if stdout is None:
         return ""
     lines = stdout.splitlines()
-    head = (f"`git status --short` in {cwd}, taken before the command runs (it does not "
+    head = (f"`git status --short` in {one_line(cwd)}, taken before the command runs (it does not "
             "cover a directory the command moves to that isn't shown here, and the "
             "command's own earlier steps can make it not apply; ignored files are not listed):")
     if not lines:
@@ -63,8 +64,8 @@ def git_linked_worktree_note(path, deadline):
     main = listing.split("\n\n", 1)[0].splitlines()
     if not main or not main[0].startswith("worktree ") or "bare" in main:
         return ""
-    return (f"{lines[2]} is a linked git worktree of the repository at "
-            f"{main[0][len('worktree '):]}, not its main checkout.")
+    return (f"{one_line(lines[2])} is a linked git worktree of the repository at "
+            f"{one_line(main[0][len('worktree '):])}, not its main checkout.")
 
 
 def _git_context_dirs(command, cwd):
@@ -115,6 +116,6 @@ def git_remote_context(command, cwd, deadline):
         checks = checks or ["No remote here or URL in the command has an owner to check "
                             "(local paths or hosts not known here)."]
         known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here)"
-        parts.append(f"Owner check in {path}, against origin's fetch URL and the gh login {known}:\n"
+        parts.append(f"Owner check in {one_line(path)}, against origin's fetch URL and the gh login {known}:\n"
                      + "\n".join(checks))
     return parts

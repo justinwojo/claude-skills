@@ -360,7 +360,8 @@ class Sandbox:
                 try:
                     with open(os.path.join(d_, n)) as f:
                         rec = json.load(f)
-                    entry.update({k: rec.get(k) for k in ('state', 'tool', 'session', 'reason', 'question', 'v')})
+                    entry.update({k: rec.get(k) for k in ('state', 'tool', 'session', 'reason', 'question', 'v',
+                                                          'scripts')})
                     entry['done'] = 'done' in rec
                 except (OSError, ValueError):
                     entry['unreadable'] = True
@@ -1125,6 +1126,29 @@ def seq_mcp_remote_script_hold_retry(c):
            holds=['cleared'],
            judge_has=['PREP-DONE-MARKER', 'The hook asked the agent',
                       'run.ps1: no later call of this session to bench names this path or its folder.'])
+    return [s1, s2]
+
+
+@case
+def seq_mcp_remote_script_hold_retry_unlisted(c):
+    # the retry comes before its record is in the transcript: its judge sees no script text, the
+    # hold's did, so the judge's words stay out of the log and the flag store all the same
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),
+                         _bench_result('w1', 59), _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    p = sb.call('mcp__bench__job_start', {'command': BENCH_RUN}, tool_use_id='now')
+    s1 = run(sb, 'pretool', p, judge=[FLAG, FLAG])
+    expect(c, 1, s1, out='deny', judge=2, events=[('pretool', 'deny', 'llm-hold', 'held')], holds=['held'],
+           judge_has='PREP-DONE-MARKER')
+    check(f'{c}: the hold records that its judge was shown a script', [h.get('scripts') for h in s1['holds'] or []],
+          [True])
+    with open(sb.transcript, 'a') as f:
+        f.write(json.dumps(_bench_result('now', 0, error=True)) + '\n')
+    sb.say('The script only runs git status in the scratch checkout.')
+    s2 = run(sb, 'pretool', dict(p, tool_use_id='again'), judge=[FLAG])
+    expect(c, 2, s2, out='ask', judge=1, events=[('pretool', 'ask', 'hold-retry', 'asked')],
+           judge_lacks='PREP-DONE-MARKER', reason_has='unpushed commits')
+    stored = json.dumps([s2['log'], s2['flags']])
+    check(f"{c}: the judge's words in neither the log nor the flag store", 'unpushed' in stored, False)
     return [s1, s2]
 
 

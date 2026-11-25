@@ -157,41 +157,42 @@ def _append_log_line(path, line, max_bytes):
         os.close(fd)
 
 
-def compose_reason(*parts):
-    """A reason the hook composes from its own text (a str) and the judge's
-    words (a one-item tuple: a held call's flag or question), shown whole.
-    It keeps its parts, so _loggable_reason logs the judge's as it logs a
-    verdict, and the hook's as written."""
-    reason = _Composed("".join(p if isinstance(p, str) else p[0] for p in parts))
-    reason.parts = parts
+def compose_reason(*parts, scripts=False):
+    """A reason from the hook's own text (a str) and the judge's words (a
+    one-item tuple: only text from the model's response), shown whole; a
+    composed part is spliced in. It keeps its parts, so _loggable_reason
+    logs the hook's as written and the judge's as their category numbers
+    when the judge was shown script contents: this call's, or (`scripts`)
+    the one whose words it quotes, a held call's (see _hold_new)."""
+    flat = []
+    for p in parts:
+        flat.extend(getattr(p, "parts", None) or [p])
+        scripts = scripts or getattr(p, "scripts", False)
+    reason = _Composed("".join(p if isinstance(p, str) else p[0] for p in flat))
+    reason.parts, reason.scripts = tuple(flat), scripts
     return reason
 
 
 class _Composed(str):
-    """A reason from compose_reason: the text, and its `parts`."""
+    """A reason from compose_reason: the text, its `parts` and `scripts`."""
 
 
 def _loggable_reason(reason, script_texts):
-    """`reason` for the decision log. When the judge was shown script
-    contents (`script_texts`, see CallState), its own words may echo them,
-    so they keep only their category numbers: a verdict ("LLM…"), and each
-    of the judge's parts of a reason the hook composed (compose_reason),
-    whose own parts are logged as written. Script text never reaches the log."""
-    if not (script_texts and isinstance(reason, str)) or reason == "LLM approved":
-        return reason
+    """`reason` for the decision log and the flag store. A plain str is the
+    hook's own and is logged as written. Of a composed one (compose_reason),
+    when a judge it quotes or this call's (`script_texts`, see CallState)
+    was shown script contents, the judge's words, which may echo them, keep
+    only their category numbers. Script text never reaches the log."""
     parts = getattr(reason, "parts", None)
-    if parts is not None:
-        return "".join(_loggable_reason(p, script_texts) if isinstance(p, str)
-                       else _withheld(p[0], part=True) for p in parts)
-    return _withheld(reason) if reason.startswith("LLM") else reason
+    if parts is None or not (script_texts or reason.scripts):
+        return reason
+    return "".join(p if isinstance(p, str) else _withheld(p[0]) for p in parts)
 
 
-def _withheld(text, part=False):
+def _withheld(text):
     cats = sorted(set(re.findall(r"category ([1-9])(?!\d)", text)))  # the prompt's 1-9, not free text
     cats = f" (category {', '.join(cats)})" if cats else ""
-    if part:
-        return f"[the judge's words, not logged as it was shown script contents{cats}]"
-    return f"LLM verdict; its words are not logged, as it was shown script contents{cats}"
+    return f"[the judge's words, not logged as it was shown script contents{cats}]"
 
 
 def log_decision(hook, tool, tool_input, decision, source, reason,

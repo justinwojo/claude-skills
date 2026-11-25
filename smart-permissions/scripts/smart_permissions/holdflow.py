@@ -34,16 +34,18 @@ def hold_retry_ask(hold, now, answer, script_texts):
     hook's words, what happened on the retry (`now`), and the agent's answer
     labelled as its claim (`answer` None: not shown), scrubbed of the script
     texts the judge was shown. The hold's flag and question are the judge's
-    words, and so is `now` when it is a verdict ("LLM…"): the log keeps them
-    only when the judge was shown no script (compose_reason)."""
+    words, and so are those `now` holds (compose_reason): the log keeps them
+    only when neither the hold's judge nor the retry's was shown a script."""
+    now = list(getattr(now, "parts", None) or [now])
+    now[-1] = now[-1].rstrip(".") if isinstance(now[-1], str) else (now[-1][0].rstrip("."),)
     parts = ["smart-permissions held this call and asked the agent: ", (hold["question"],),
-             " Held because: ", (hold["reason"].rstrip("."),), ". On the retry: ", now.rstrip("."), "."]
+             " Held because: ", (hold["reason"].rstrip("."),), ". On the retry: ", *now, "."]
     if answer:
         claim = scrub_script_text(" ".join(answer.split()), script_texts)
         if len(claim) > HOLD_CLAIM_CHARS:
             claim = claim[:HOLD_CLAIM_CHARS] + " […]"
         parts.append(f" The agent's explanation (its claim, not verified): \"{claim}\"")
-    return compose_reason(*parts)
+    return compose_reason(*parts, scripts=hold.get("scripts") is not False)  # a hold from before 1.8.4: unknown
 
 
 def _hold_retry(state, input_data, tool, tool_input, context, rule_reason, start, wall_start):
@@ -116,7 +118,7 @@ def _hold_new(state, input_data, tool, tool_input, reason, info, start, wall_sta
         flag = re.sub(r"^LLM:\s*", "", reason).strip().rstrip(".")
         hold = hold_create(key, {"v": 1, "ts": time.time(), "session": input_data["session_id"],
                                  "tool": tool, "reason": f"the judge flagged it ({flag})",
-                                 "question": question, "state": "held"})
+                                 "question": question, "state": "held", "scripts": bool(state.script_texts)})
         if hold is None:
             return "the hold could not be recorded"
     elif hold.get("state") != "held" or hold["ts"] < wall_start:

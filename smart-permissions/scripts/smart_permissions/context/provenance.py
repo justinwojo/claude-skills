@@ -21,7 +21,7 @@ from ..core import (
 )
 from .git import _git_context_dirs
 from ..holds import acting_transcript
-from ..util import fenced, text_marker
+from ..util import fenced, one_line, text_marker
 
 
 # ============================================================
@@ -71,14 +71,16 @@ def _span(seconds):
 
 
 def _session_transcripts(input_data):
-    """This session's transcripts, the main one first: Claude Code keeps each
-    subagent's in <session>/subagents/agent-*.jsonl beside it (newest first)."""
+    """This session's transcripts, the main one first, then the acting
+    agent's (holds.acting_transcript), whatever the cap: Claude Code keeps
+    each subagent's in <session>/subagents/agent-*.jsonl beside it (the
+    others newest first)."""
     main = input_data.get("transcript_path")
     if not (isinstance(main, str) and os.path.isabs(main) and os.path.isfile(main)):
         return []
     files = [main]
-    agent = input_data.get("agent_transcript_path")
-    if isinstance(agent, str) and os.path.isabs(agent) and agent != main and os.path.isfile(agent):
+    agent = acting_transcript(input_data)
+    if agent and agent != main:
         files.append(agent)
     try:
         with os.scandir(os.path.join(os.path.splitext(main)[0], "subagents")) as it:
@@ -175,7 +177,7 @@ def _snippet(text, mark, fold=False):
     """`text` on one line, secrets redacted, cut to a window around the first
     `mark` (`fold`: found without case): a line feed is ` / `, any other
     line break, control character or run of space one space."""
-    flat = re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", re.sub(r"\s*\n\s*", " / ", _redact_secrets(text.strip())[0]))
+    flat = one_line(_redact_secrets(text.strip())[0])
     if len(flat) <= PROVENANCE_SNIPPET_CHARS:
         return flat
     at = max(0, (flat.lower().find(mark.lower()) if fold else flat.find(mark))) if mark else 0
@@ -328,7 +330,7 @@ def session_provenance(input_data, targets, cwd, deadline):
                 continue
             seen.add(path)
             if cwd and (path == cwd or cwd.startswith(path + "/")):
-                lines.append(f"{path} ({label}) is the working directory or holds it: no "
+                lines.append(f"{one_line(path)} ({one_line(label)}) is the working directory or holds it: no "
                              "provenance is given for it.")
                 continue
             chosen.append(_provenance_target(path, label, cwd))
@@ -345,7 +347,7 @@ def session_provenance(input_data, targets, cwd, deadline):
         if start:
             out.append(f"This session's transcript starts {_local_time(start, '%Y-%m-%d %H:%M')}.")
         for i, target in enumerate(chosen):
-            line = f"{target['path']} ({target['label']}): "
+            line = f"{one_line(target['path'])} ({one_line(target['label'])}): "
             try:
                 born = os.stat(target["path"], follow_symlinks=False).st_birthtime
             except AttributeError:
@@ -592,11 +594,14 @@ def _results(line):
 def _judged_index(calls, skip_id, tool, tool_input, acting):
     """Where the call being judged is in `calls`, among those of the acting
     agent's transcript (`acting`, its index in the files read): by its
-    tool_use id, else the last there with no result yet whose tool and
-    input are its. None when it isn't there."""
+    tool_use id, else the one there with no result yet whose tool and input
+    are its. None when it isn't there, or, with no id, when more than one
+    call there could be it."""
     mine = [i for i, c in enumerate(calls) if c["at"][0] == acting and (
         c["tid"] == skip_id if skip_id else
         c["result_at"] is None and c["name"] == tool and c["inp"] == tool_input)]
+    if not skip_id and len(mine) > 1:
+        return None
     return max(mine, key=lambda i: calls[i]["at"], default=None)
 
 
@@ -632,8 +637,9 @@ def _remote_call_line(call, key, hit):
     redacted text."""
     relation, spot = hit
     when = _local_time(call["ts"]) if call["ts"] else "?"
+    snippet = _snippet(_call_text(call["inp"]), os.path.basename(spot) or spot, True)
     return (f"{when} {_REMOTE_STATUS.get(call['status'], call['status'])}, {relation}, "
-            f"{call['name'][len(key):]}: {_snippet(_call_text(call['inp']), os.path.basename(spot) or spot, True)}")
+            f"{one_line(call['name'][len(key):])}: {snippet}")
 
 
 def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
@@ -687,7 +693,7 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
     n = len(paths)
     if found:
         try:
-            prov, prov_status = _remote_provenance_blocks(key, targets[:n], calls, earlier, cut)
+            prov, prov_status = _remote_provenance_blocks(key, targets[:n], calls, earlier, cut, at is not None)
         except Exception:
             prov, prov_status = [], "unavailable"
     if scripts and at is not None:  # no place for the call: no text is surely from before it
@@ -699,12 +705,16 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
     return prov, prov_status, script, script_status
 
 
-def _remote_provenance_blocks(key, targets, calls, earlier, cut):
+def _remote_provenance_blocks(key, targets, calls, earlier, cut, located):
     """remote_context's provenance part: per target, the calls before this
-    one (`earlier`, one flag per call) that name it or a path inside it."""
-    out, found = [_REMOTE_PROVENANCE_HEAD.format(server=key[5:-2], key=key)], False
+    one (`earlier`, one flag per call) that name it or a path inside it, in
+    the order of `calls`; when the call isn't `located`, as 1.8.3 ordered
+    them: by time, a call with none first, then as read."""
+    out, found = [_REMOTE_PROVENANCE_HEAD.format(server=one_line(key[5:-2]), key=one_line(key))], False
     show = REMOTE_PROVENANCE_SHOW_FIRST + REMOTE_PROVENANCE_SHOW_LAST
     earlier = [c for c, before in zip(calls, earlier) if before]
+    if not located:
+        earlier.sort(key=lambda c: (c["ts"] or 0, c["at"][0], c["at"][1], c["at"][3]))
     for target in targets:
         ms = [(c, hit) for c in earlier for hit in [_call_relation(c, target)] if hit]
         if not ms:
@@ -795,13 +805,34 @@ def _surely_before(a, b):
     return (a[2], a[1], a[3]) < (b[2], b[1], b[3])
 
 
-def _unsettled(writes, k):
-    """Whether write `writes[k]` was sent in the same message as an earlier
-    one of `writes`, or before its result was in the transcript: which of
-    them took effect last is then not known."""
-    then = writes[k][1]
-    return any(c["mid"] and c["mid"] == then["mid"] and c["at"][0] == then["at"][0]
-               or not _surely_before(c["result_at"], then["at"]) for _, c, _, _ in writes[:k])
+def _unsettled(writes):
+    """Per write of `writes` (in order), whether it was sent in the same
+    message as an earlier one, or not surely after (_surely_before) every
+    earlier one's result: which of them took effect last is then not known.
+    One pass, keeping per transcript the latest place of a result read there:
+    of any (`lines`: line, place), of one with no time, and of a timed one."""
+    flags, mids, missing = [], set(), False
+    lines, untimed, timed = {}, {}, {}  # file → (line, place), (line, place), (time, line, place)
+    for _, c, _, _ in writes:
+        fi, li, ts, pos = c["at"]
+        if ts is None:  # only a result in its own file, on an earlier line, is surely before it
+            after = any(f != fi for f in lines) or lines.get(fi, (-1,)) >= (li, pos)
+        else:
+            after = any(f != fi for f in untimed) or untimed.get(fi, (-1,)) >= (li, pos) \
+                or any(t >= (ts, li, pos) if f == fi else t[0] >= ts for f, t in timed.items())
+        flags.append(missing or bool(c["mid"] and (c["mid"], fi) in mids) or after)
+        if c["mid"]:
+            mids.add((c["mid"], fi))
+        if c["result_at"] is None:
+            missing = True
+            continue
+        rf, rl, rts, rp = c["result_at"]
+        lines[rf] = max(lines.get(rf, (-1,)), (rl, rp))
+        if rts is None:
+            untimed[rf] = max(untimed.get(rf, (-1,)), (rl, rp))
+        else:
+            timed[rf] = max(timed.get(rf, (float("-inf"),)), (rts, rl, rp))
+    return flags
 
 
 def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, shown_texts):
@@ -813,7 +844,7 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
     it or its folder. No block when this session wrote none of them
     ("none"); "found" when it wrote one but no text could be shown, else
     "shown"."""
-    server, command = key[5:-2], tool_input.get("command")
+    server, command = one_line(key[5:-2]), tool_input.get("command")
     out, bodies = [], []  # out: lines, or (opening, body, base) for a text shown
     budget, written_any = SCRIPT_CONTEXT_TOTAL_BYTES, False
     for target in targets:
@@ -836,7 +867,7 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
                  # an earlier try of this same command runs the text shown
                  and not (earlier[i] and isinstance(command, str) and c["inp"].get("command") == command)]
         first, last = chain[0][1], chain[-1][1]
-        appends, writer = len(chain) - (1 if full else 0), first["name"][len(key):]
+        appends, writer = len(chain) - (1 if full else 0), one_line(first["name"][len(key):])
         times = f"{appends} time{'s' if appends != 1 else ''}" + (
             f", the last {_local_time(last['ts'])}" if last["ts"] else "")
         if full:
@@ -849,7 +880,7 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
         if odd:
             how += "; " + ", ".join(f"a write: {_REMOTE_STATUS.get(s, s)}" for s in odd) \
                    + ", so the file may not hold this text"
-        if any(_unsettled(writes, k) for k in range(start, len(writes))):
+        if any(_unsettled(writes)[start:]):
             how += ("; a write to it was sent in the same message as an earlier one or before its "
                     "result: which write took effect last is not known")
         pieces = [t for _, _, t, _ in chain]
@@ -862,15 +893,17 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
             out.append(f"--- {target['path']} ({how}): not shown: the script text budget is used up ---")
         else:
             # bounded before it is redacted: what is shown and a margin past it, back to a
-            # line break, so a secret the cut runs through is left out whole
+            # line break, else a space, so a secret the cut runs through is left out whole;
+            # with neither, nothing of that one token is shown
             raw = ""
             for t in pieces:
                 raw += t[:limit + REMOTE_SCRIPT_MARGIN_CHARS - len(raw)]
                 if len(raw) >= limit + REMOTE_SCRIPT_MARGIN_CHARS:
                     break
             whole = len(raw) == sum(map(len, pieces))
-            if not whole and "\n" in raw:
-                raw = raw[:raw.rindex("\n") + 1]
+            if not whole:
+                raw = raw[:raw.rindex("\n") + 1] if "\n" in raw else \
+                    raw[:len(raw) - re.match(r"\S*", raw[::-1]).end()]
             text, redacted = _redact_secrets(raw)
             data = text.encode("utf-8", "replace")
             note = f"{size} bytes" + ("; secrets redacted" if redacted else "")
@@ -879,10 +912,14 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
                 note += f"; TRUNCATED: only the first {len(data)} bytes are shown"
             body = data.decode("utf-8", "ignore")
             budget -= len(data)
-            bodies.append(body)
-            if shown_texts is not None:
-                shown_texts.append(body)
-            out.append((f"{target['path']} ({how}; {note})", body, base))
+            if not whole and not body.strip():  # nothing before the word that runs past the cut
+                out.append(f"--- {target['path']} ({how}): {size} bytes, not shown: its first word runs "
+                           "past the part read, and a word cut short could hide a secret ---")
+            else:
+                bodies.append(body)
+                if shown_texts is not None:
+                    shown_texts.append(body)
+                out.append((f"{target['path']} ({how}; {note})", body, base))
         if not later:
             out.append(f"{base}: no later call of this session to {server} names this path or its folder.")
             continue
@@ -891,13 +928,13 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
                    f"{server} name{'s' if len(later) == 1 else ''} this path or its folder, so the file "
                    "may not hold what is shown (the hook can't tell: read "
                    f"{'the last ' + str(REMOTE_SCRIPT_SHOW_LATER) if more else 'them'}):"
-                   + "".join("\n  " + _remote_call_line(c, key, hit)
-                             + ("" if earlier[i] else " (made after this call)")
-                             for i, c, hit in later[-REMOTE_SCRIPT_SHOW_LATER:]))
+                   + "".join("\n  " + _remote_call_line(c, key, hit) + (
+                       "" if earlier[i] else " (made after this call)" if _surely_before(calls[at]["at"], c["at"])
+                       else " (order unknown)") for i, c, hit in later[-REMOTE_SCRIPT_SHOW_LATER:]))
     if not written_any:
         return [], "none"
     marker = text_marker(bodies)
-    lines = [_REMOTE_SCRIPT_HEAD.format(server=server, key=key, marker=marker)]
+    lines = [_REMOTE_SCRIPT_HEAD.format(server=server, key=one_line(key), marker=marker)]
     for item in out:
         if isinstance(item, tuple):
             opening, body, base = item
@@ -1044,7 +1081,7 @@ def stash_context(command, cwd, input_data, deadline):
         if listing is None:
             continue
         lines = listing.splitlines()
-        out = [f"Stashes in {top} (`git stash list`, newest first): {len(lines) or 'none'}"]
+        out = [f"Stashes in {one_line(top)} (`git stash list`, newest first): {len(lines) or 'none'}"]
         for line in lines[:STASH_CONTEXT_MAX]:
             ref, _, rest = line.partition("\t")
             ct, _, subject = rest.partition("\t")

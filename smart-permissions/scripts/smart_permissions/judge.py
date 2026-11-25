@@ -17,7 +17,7 @@ import threading
 import time
 
 from .config import LLM_ENV_FILE
-from .util import _elapsed_ms, fenced, text_marker
+from .util import _elapsed_ms, fenced, one_line, text_marker
 from .holds import LLM_HOLD_RETRY_NOTE
 from .log import compose_reason
 
@@ -580,7 +580,8 @@ def _flag_text(decision):
 def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
                  rule_reason=None, *, script_texts):
     """_llm_evaluate, with any script text the context showed the judge
-    (`script_texts`) scrubbed from the reason (it is logged, stored and shown)."""
+    (`script_texts`) scrubbed from the judge's words in the reason (it is
+    logged, stored and shown)."""
     decision, reason, info = _llm_evaluate(tool, tool_input, timeout, context, rule_reason)
     return decision, scrub_script_text(reason, script_texts), info
 
@@ -588,9 +589,13 @@ def llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
 def scrub_script_text(reason, script_texts):
     """`reason` with each quote of a script this call showed the judge
     (`script_texts`: a whole line, or a quoted span of 6+ characters)
-    replaced by `[script text]`: script contents never reach the decision log."""
+    replaced by `[script text]`; of a composed reason (compose_reason), in
+    the judge's words only. Script contents never reach the decision log."""
     if not script_texts or not isinstance(reason, str):
         return reason
+    if hasattr(reason, "parts"):
+        return compose_reason(*(p if isinstance(p, str) else (scrub_script_text(p[0], script_texts),)
+                                for p in reason.parts), scripts=reason.scripts)
     spans = {line.strip() for text in script_texts for line in text.splitlines()
              if len(line.strip()) >= 8 and line.strip() in reason}
     for m in re.finditer(r"`([^`]{6,})`|'([^']{6,})'|\"([^\"]{6,})\"", reason):
@@ -604,9 +609,9 @@ def scrub_script_text(reason, script_texts):
 
 def _llm_user_prompt(tool, tool_input, context, rule_reason):
     """The judge's user message: the context, the call and the rule reason."""
-    prompt = f"Tool: {tool}\nParameters:\n{json.dumps(tool_input, indent=2)}"
+    prompt = f"Tool: {one_line(tool)}\nParameters:\n{json.dumps(tool_input, indent=2)}"
     if rule_reason:
-        prompt += f"\n\nLocal rules sent this call to you because: {rule_reason}"
+        prompt += f"\n\nLocal rules sent this call to you because: {one_line(rule_reason)}"
     if context:
         prompt = f"{context}\n\n{prompt}"
     return prompt
@@ -676,32 +681,35 @@ def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
     # (flagged, no verdict: never held).
     remaining = timeout - (time.monotonic() - _t0)
     if remaining < LLM_RECHECK_MIN_S:
-        return ("ask", f"LLM flagged ({flag}); no time left to recheck", info("llm", flagged=True))
+        return ("ask", compose_reason("LLM flagged (", (flag,), "); no time left to recheck"),
+                info("llm", flagged=True))
     try:
         second = _llm_request(prompt + LLM_RECHECK_NOTE.format(flag=flag),
                               LLM_RECHECK_REASONING_EFFORT, remaining)
     except Exception as e:
         print(f"LLM recheck error: {failure(e)}", file=sys.stderr)
-        return ("ask", f"LLM flagged ({flag}); recheck unavailable ({failure(e)})",
+        return ("ask", compose_reason("LLM flagged (", (flag,), f"); recheck unavailable ({failure(e)})"),
                 info("llm", flagged=True))
     if second is None:
-        return ("ask", f"LLM flagged ({flag}); recheck unparseable", info("llm", flagged=True))
+        return ("ask", compose_reason("LLM flagged (", (flag,), "); recheck unparseable"),
+                info("llm", flagged=True))
 
     if second["safe"] is True:
         if DEBUG:
             print(f"LLM RECHECK CLEARED: {tool}", file=sys.stderr)
-        return ("allow", f"LLM recheck cleared first-pass flag ({flag})",
+        return ("allow", compose_reason("LLM recheck cleared first-pass flag (", (flag,), ")"),
                 info("llm-recheck", verdict=second))
-    confirmed = flag if second.get("refused") else _flag_text(second)
+    confirmed = ["LLM: ", (flag if second.get("refused") else _flag_text(second),)]
     if not second.get("refused") and second.get("category") != first.get("category"):
-        confirmed += f" (first pass: {flag})"  # the developer sees both concerns
+        confirmed += [" (first pass: ", (flag,), ")"]  # the developer sees both concerns
+    confirmed = compose_reason(*confirmed)
     if DEBUG:
-        print(f"LLM RECHECK CONFIRMED: {tool} — {confirmed}", file=sys.stderr)
+        print(f"LLM RECHECK CONFIRMED: {tool} — {confirmed[len('LLM: '):]}", file=sys.stderr)
     if second.get("refused"):
         second = dict(first, refused=True)  # the first pass's words, never held
     flagged = info("llm-recheck", flagged=True, verdict=second)
     flagged["first"] = first  # a developer-only first flag stays one (_hold_new)
-    return ("ask", f"LLM: {confirmed}", flagged)
+    return ("ask", confirmed, flagged)
 
 
 def remote_exec_verdict(decision, reason, info, label):
@@ -717,7 +725,7 @@ def remote_exec_verdict(decision, reason, info, label):
             return ("ask", f"{head}: the judge was not confident it does only what it should — "
                     "confirm it yourself", True)
         return "allow", reason, False
-    return "ask", compose_reason(f"{head}: ", reason), True  # the judge's reason, logged as one
+    return "ask", compose_reason(f"{head}: ", reason), True
 
 
 def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGET_S, context="",
@@ -750,4 +758,4 @@ def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGE
         return "allow", "LLM cleared the held call on the agent's answer", info(verdict, False)
     if verdict.get("refused"):
         return "ask", "the judge refused to judge it", info(verdict)
-    return "ask", scrub_script_text(f"LLM: {_flag_text(verdict)}", script_texts), info(verdict)
+    return "ask", scrub_script_text(compose_reason("LLM: ", (_flag_text(verdict),)), script_texts), info(verdict)
