@@ -2,7 +2,8 @@
 context block so an exception never fails the hook, the per-process memo
 for readers whose answer depends only on their arguments and the loaded
 config, the marked lines around a text shown to the judge, and the one
-line a value from the payload or a transcript is shown on outside them."""
+line a value from the payload, a transcript or a repository is shown on
+outside them."""
 import functools
 import re
 import secrets
@@ -26,12 +27,20 @@ def fenced(opening, text, end, marker):
     return f"--- {one_line(opening)} [{marker}] ---\n{text.rstrip()}\n--- {one_line(end)} [{marker}] ---"
 
 
+# Every character that can end a line, and every other control character but tab
+_LINE_BREAK_RE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]")
+_ESCAPES = {"\n": "\\n", "\r": "\\r", "\x0b": "\\v", "\x0c": "\\f"}
+
+
 def one_line(text):
-    """`text` on one line, so a value from the payload or a transcript the
-    judge is shown outside a fenced block (a path, a tool name) can't start a
-    line of its own: a line feed is ` / `, any other line break, control
-    character or run of space one space."""
-    return re.sub(r"[\s\x00-\x1f\x7f-\x9f]+", " ", re.sub(r"\s*\n\s*", " / ", text))
+    """`text` on one line, so a value from the payload, a transcript or a
+    repository that the judge is shown outside a fenced block (a path, a
+    tool name, a commit subject) can't start a line of its own: each line
+    break or other control character is written as its escape (`\\n`,
+    `\\x85`, `\\u2028`), so it shows and two values stay apart. Spaces and
+    tabs are left as they are."""
+    return _LINE_BREAK_RE.sub(lambda m: _ESCAPES.get(m[0]) or (
+        f"\\x{ord(m[0]):02x}" if ord(m[0]) < 0x100 else f"\\u{ord(m[0]):04x}"), text)
 
 
 def _elapsed_ms(start):

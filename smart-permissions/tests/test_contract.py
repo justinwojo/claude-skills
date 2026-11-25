@@ -1108,6 +1108,19 @@ def p_mcp_remote_script_separate_messages(c):
 
 
 @case
+def l_mcp_remote_script_not_shown(c):
+    # a PermissionRequest carries no tool_use_id: the call can't be placed, so no script text
+    sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),
+                         _bench_result('w1', 59), _bench_use('now', 'mcp__bench__job_start', {'command': BENCH_RUN}, 0)])
+    s = run(sb, 'learner', dict(sb.call('mcp__bench__job_start', {'command': BENCH_RUN}),
+                                hook_event_name='PermissionRequest'), judge=[SAFE])
+    expect(c, 1, s, out='allow', judge=1, events=[('permission_request', 'allow', 'llm')],
+           judge_lacks=[BENCH_HEAD, 'PREP-DONE-MARKER'])
+    check(f'{c}: no remote_scripts logged', s['log'][0].get('remote_scripts') if s['log'] else 'no log', None)
+    return [s]
+
+
+@case
 def seq_mcp_remote_script_hold_retry(c):
     # the retry of a held call is judged with the same script text
     sb = _bench_sandbox([_bench_use('w1', 'mcp__bench__write_file', {'path': BENCH_PS1, 'content': BENCH_TEXT}, 60),

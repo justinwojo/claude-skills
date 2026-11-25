@@ -34,7 +34,7 @@ def git_status_snapshot(cwd, deadline):
                               "--ignore-submodules=none"], deadline)
     if stdout is None:
         return ""
-    lines = stdout.splitlines()
+    lines = [one_line(ln) for ln in stdout.split("\n") if ln]  # line feeds only: a name may hold U+2028
     head = (f"`git status --short` in {one_line(cwd)}, taken before the command runs (it does not "
             "cover a directory the command moves to that isn't shown here, and the "
             "command's own earlier steps can make it not apply; ignored files are not listed):")
@@ -101,11 +101,11 @@ def git_remote_context(command, cwd, deadline):
             continue
         mine = _developer_owners(remotes, path, deadline)
 
-        def verdict(label, owner):
+        def verdict(label, owner):  # a remote's name and a URL's host are the repository's or the command's
             if not mine:
-                return f"{label} {owner}."
+                return one_line(f"{label} {owner}.")
             whose = "is the developer's" if owner in mine else "matches none of the developer's owners"
-            return f"{label} {owner} {whose}."
+            return one_line(f"{label} {owner} {whose}.")
 
         checks = [verdict(f"Remote {name}", _remote_owner(url))
                   for name, urls in list(remotes.items())[:GIT_CONTEXT_MAX_DIRS * 4]
@@ -115,7 +115,7 @@ def git_remote_context(command, cwd, deadline):
         # leave the judge an empty block.
         checks = checks or ["No remote here or URL in the command has an owner to check "
                             "(local paths or hosts not known here)."]
-        known = f"({', '.join(sorted(mine))})" if mine else "(neither is known here)"
+        known = f"({one_line(', '.join(sorted(mine)))})" if mine else "(neither is known here)"
         parts.append(f"Owner check in {one_line(path)}, against origin's fetch URL and the gh login {known}:\n"
                      + "\n".join(checks))
     return parts

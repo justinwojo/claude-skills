@@ -654,15 +654,16 @@ def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
                 "verdict": verdict}
 
     def failure(e):
-        # The time across every attempt and the recheck, not the last one's
-        return f"{e}; {time.monotonic() - _t0:.1f}s in all"
+        # The time across every attempt and the recheck, not the last one's. The
+        # provider's error text is a judge part (compose_reason): it may echo the prompt.
+        return compose_reason((str(e),), f"; {time.monotonic() - _t0:.1f}s in all")
 
     try:
         first = _llm_request(prompt, LLM_REASONING_EFFORT, timeout)
     except Exception as e:
         # Always log — API failures need visibility
         print(f"LLM error: {failure(e)}", file=sys.stderr)
-        return ("ask", f"LLM unavailable ({failure(e)}) — manual approval required", info("llm"))
+        return ("ask", compose_reason("LLM unavailable (", failure(e), ") — manual approval required"), info("llm"))
     if first is None:  # malformed: the developer's call, never held
         return ("ask", "LLM response had no valid verdict (boolean `safe`)", info("llm", flagged=True))
 
@@ -684,11 +685,11 @@ def _llm_evaluate(tool, tool_input, timeout=LLM_PRETOOL_BUDGET_S, context="",
         return ("ask", compose_reason("LLM flagged (", (flag,), "); no time left to recheck"),
                 info("llm", flagged=True))
     try:
-        second = _llm_request(prompt + LLM_RECHECK_NOTE.format(flag=flag),
+        second = _llm_request(prompt + LLM_RECHECK_NOTE.format(flag=one_line(flag)),
                               LLM_RECHECK_REASONING_EFFORT, remaining)
     except Exception as e:
         print(f"LLM recheck error: {failure(e)}", file=sys.stderr)
-        return ("ask", compose_reason("LLM flagged (", (flag,), f"); recheck unavailable ({failure(e)})"),
+        return ("ask", compose_reason("LLM flagged (", (flag,), "); recheck unavailable (", failure(e), ")"),
                 info("llm", flagged=True))
     if second is None:
         return ("ask", compose_reason("LLM flagged (", (flag,), "); recheck unparseable"),
@@ -740,7 +741,7 @@ def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGE
                                                     "flagged": True, "verdict": None}
     marker = text_marker([answer])
     prompt = _llm_user_prompt(tool, tool_input, context, rule_reason) + LLM_HOLD_RETRY_NOTE.format(
-        reason=hold["reason"], question=hold["question"], marker=marker,
+        reason=one_line(hold["reason"]), question=one_line(hold["question"]), marker=marker,
         answer=fenced("agent's answer", answer, "end of agent's answer", marker))
     t0 = time.monotonic()
 
@@ -751,7 +752,8 @@ def llm_evaluate_retry(tool, tool_input, hold, answer, timeout=LLM_PRETOOL_BUDGE
         verdict = _llm_request(prompt, LLM_RECHECK_REASONING_EFFORT, timeout)
     except Exception as e:
         print(f"LLM retry error: {e}", file=sys.stderr)
-        return "ask", f"the judge was unavailable ({e}; {time.monotonic() - t0:.1f}s)", info()
+        return "ask", compose_reason("the judge was unavailable (", (str(e),), f"; {time.monotonic() - t0:.1f}s)"), \
+            info()
     if verdict is None:
         return "ask", "the judge gave no valid verdict", info()
     if verdict.get("safe") is True and not verdict.get("refused"):

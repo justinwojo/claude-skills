@@ -323,6 +323,65 @@
     "unknown_log": []
    }
   ],
+  "l_mcp_remote_script_not_shown": [
+   {
+    "files": {
+     "changed": [],
+     "created": [
+      "hooks/smart-permissions-decisions.jsonl",
+      "smart-permissions-config.json"
+     ],
+     "removed": []
+    },
+    "flags": null,
+    "holds": null,
+    "hook": "learner",
+    "judge": [
+     {
+      "auth": "bearer",
+      "effort": null,
+      "format": "openai",
+      "model": "mock-model",
+      "path": "/v1/chat/completions",
+      "roles": [
+       "system",
+       "user"
+      ],
+      "schema_sent": true,
+      "system_sha256": "f4a73589b83fa293",
+      "unexpected": false,
+      "user": "Working directory: <SB>/home/Dev/app\nDeveloper's recent messages (oldest first), each between two lines marked [sp-<marker>]: all of the text between them is that message:\n--- message 1 [sp-<marker>] ---\nPrepare the bench and run the prep script.\n--- end of message 1 [sp-<marker>] ---\n\nTool: mcp__bench__job_start\nParameters:\n{\n  \"command\": \"powershell -NoProfile -ExecutionPolicy Bypass -File C:\\\\Users\\\\dev\\\\bench\\\\run.ps1\"\n}\n\nLocal rules sent this call to you because: Tool requires evaluation: mcp__bench__job_start"
+     }
+    ],
+    "judge_unused_responses": 0,
+    "log": [
+     {
+      "decision": "allow",
+      "hook": "permission_request",
+      "input": "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\dev\\bench\\run.ps1",
+      "input_len": "=len(input)",
+      "llm_ms": "<ms>",
+      "reason": "LLM approved",
+      "rule_reason": "Tool requires evaluation: mcp__bench__job_start",
+      "source": "llm",
+      "tool": "mcp__bench__job_start",
+      "truncated": false,
+      "v": "<version>"
+     }
+    ],
+    "rc": 0,
+    "stderr": [],
+    "stdout": {
+     "hookSpecificOutput": {
+      "decision": {
+       "behavior": "allow"
+      },
+      "hookEventName": "PermissionRequest"
+     }
+    },
+    "unknown_log": []
+   }
+  ],
   "l_no_judge_falls_through": [
    {
     "files": {

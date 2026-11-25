@@ -169,15 +169,16 @@ def _relation(named, target):
         if any(p.startswith(k + "/") for k in target["keys"]):
             best = ("names a path inside it", p)
         elif best is None and p in target["parents"]:
-            best = (f"names its folder {os.path.basename(p)}", p)
+            best = (f"names its folder {one_line(os.path.basename(p))}", p)
     return best
 
 
 def _snippet(text, mark, fold=False):
     """`text` on one line, secrets redacted, cut to a window around the first
-    `mark` (`fold`: found without case): a line feed is ` / `, any other
-    line break, control character or run of space one space."""
-    flat = one_line(_redact_secrets(text.strip())[0])
+    `mark` (`fold`: found without case): a line feed is ` / ` and a run of
+    spaces and tabs one space (a command's layout is not kept); any other
+    line break or control character is escaped (one_line)."""
+    flat = re.sub(r"[ \t]+", " ", one_line(re.sub(r"\s*\n\s*", " / ", _redact_secrets(text.strip())[0])))
     if len(flat) <= PROVENANCE_SNIPPET_CHARS:
         return flat
     at = max(0, (flat.lower().find(mark.lower()) if fold else flat.find(mark))) if mark else 0
@@ -591,17 +592,12 @@ def _results(line):
             if isinstance(b, dict) and isinstance(b.get("tool_use_id"), str)}, ts
 
 
-def _judged_index(calls, skip_id, tool, tool_input, acting):
-    """Where the call being judged is in `calls`, among those of the acting
-    agent's transcript (`acting`, its index in the files read): by its
-    tool_use id, else the one there with no result yet whose tool and input
-    are its. None when it isn't there, or, with no id, when more than one
-    call there could be it."""
-    mine = [i for i, c in enumerate(calls) if c["at"][0] == acting and (
-        c["tid"] == skip_id if skip_id else
-        c["result_at"] is None and c["name"] == tool and c["inp"] == tool_input)]
-    if not skip_id and len(mine) > 1:
-        return None
+def _judged_index(calls, skip_id, acting):
+    """Where the call being judged is in `calls`: the call with its tool_use
+    id (`skip_id`) in the acting agent's transcript (`acting`, its index in
+    the files read). None when it has no id (a PermissionRequest) or isn't
+    there."""
+    mine = [i for i, c in enumerate(calls) if skip_id and c["at"][0] == acting and c["tid"] == skip_id]
     return max(mine, key=lambda i: calls[i]["at"], default=None)
 
 
@@ -621,13 +617,23 @@ def _call_relation(call, target):
     return _relation(call["named"], target)
 
 
+def _cut_back(text, limit):
+    """`text` cut to `limit` characters before it is redacted: when that cuts
+    it, back to its last line break, else its last space, so a secret the
+    cut runs through is left out whole ('' when neither comes before it)."""
+    if len(text) <= limit:
+        return text
+    text = text[:limit]
+    return text[:text.rindex("\n") + 1] if "\n" in text else text[:len(text) - re.match(r"\S*", text[::-1]).end()]
+
+
 def _call_text(inp):
     """A call's command and path fields, redacted like the log, as the
     judge is shown them: only string values are read, and a long one is
-    cut before redaction (only a window around the path is shown)."""
+    cut before redaction (_cut_back; only a window around the path is shown)."""
     command = inp.get("command") if isinstance(inp.get("command"), str) else ""
-    fields = _mcp_fields(_redact_values({k: v[:REMOTE_SCAN_CHARS] for k, v in _mcp_fields(inp)}))
-    return _redact_secrets(command[:REMOTE_SCAN_CHARS + 1024])[0] + (
+    fields = _mcp_fields(_redact_values({k: _cut_back(v, REMOTE_SCAN_CHARS) for k, v in _mcp_fields(inp)}))
+    return _redact_secrets(_cut_back(command, REMOTE_SCAN_CHARS + 1024))[0] + (
         f"  ({'; '.join(f'{k}: {v}' for k, v in fields)})" if fields else "")
 
 
@@ -647,9 +653,9 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
     CallState.remote_scripts value) for an MCP call that runs a `command`
     on another machine, from one ordered list of this session's calls to
     that server (_remote_calls); earlier means surely before this call
-    (_surely_before), which is found among the acting agent's own calls
-    (_judged_index; when it isn't there, earlier is as _unlocated_earlier
-    says, and no script text is shown):
+    (_surely_before), which is found by its tool_use id among the acting
+    agent's own calls (_judged_index; with no id or not there, earlier is as
+    _unlocated_earlier says, and no script text is shown):
     - when it may delete or reset something there (_remote_targets), per
       path its command names, the first and last of this session's earlier
       calls to that server that name it or a path inside it, with what each
@@ -662,7 +668,9 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
     try:
         if time.monotonic() > deadline or not isinstance(tool, str) or not isinstance(tool_input, dict):
             return none
-        found, scripts = _remote_targets(tool, tool_input), _remote_scripts(tool, tool_input)
+        skip_id = input_data.get("tool_use_id") if isinstance(input_data.get("tool_use_id"), str) else None
+        # with no id the call can't be placed: no text is surely from before it
+        found, scripts = _remote_targets(tool, tool_input), _remote_scripts(tool, tool_input) if skip_id else []
         if not found and not scripts:
             return none
     except Exception:
@@ -681,10 +689,9 @@ def remote_context(input_data, tool, tool_input, deadline, shown_texts=None):
             parents = set() if re.fullmatch(r"/*|//[^/]+|[a-z]:", folder) else {folder}
             targets.append({"path": raw, "keys": {norm}, "parents": parents,
                             "needles": {p.rsplit("/", 1)[-1].lower() for p in parents | {norm}}})
-        skip_id = input_data.get("tool_use_id") if isinstance(input_data.get("tool_use_id"), str) else None
         calls, cut = _remote_calls(files, key, set().union(*(t["needles"] for t in targets)), skip_id, deadline)
         acting = acting_transcript(input_data)
-        at = _judged_index(calls, skip_id, tool, tool_input, files.index(acting) if acting in files else None)
+        at = _judged_index(calls, skip_id, files.index(acting) if acting in files else None)
         earlier = [_surely_before(c["at"], calls[at]["at"]) for c in calls] if at is not None \
             else _unlocated_earlier(calls, skip_id, tool, tool_input)
     except Exception:
@@ -892,19 +899,14 @@ def _remote_script_blocks(key, tool_input, targets, calls, at, earlier, cut, sho
         elif limit <= 0:
             out.append(f"--- {target['path']} ({how}): not shown: the script text budget is used up ---")
         else:
-            # bounded before it is redacted: what is shown and a margin past it, back to a
-            # line break, else a space, so a secret the cut runs through is left out whole;
-            # with neither, nothing of that one token is shown
-            raw = ""
+            # bounded before it is redacted: what is shown and a margin past it (_cut_back)
+            raw, reach = "", limit + REMOTE_SCRIPT_MARGIN_CHARS
             for t in pieces:
-                raw += t[:limit + REMOTE_SCRIPT_MARGIN_CHARS - len(raw)]
-                if len(raw) >= limit + REMOTE_SCRIPT_MARGIN_CHARS:
+                raw += t[:reach + 1 - len(raw)]
+                if len(raw) > reach:
                     break
-            whole = len(raw) == sum(map(len, pieces))
-            if not whole:
-                raw = raw[:raw.rindex("\n") + 1] if "\n" in raw else \
-                    raw[:len(raw) - re.match(r"\S*", raw[::-1]).end()]
-            text, redacted = _redact_secrets(raw)
+            whole = len(raw) <= reach
+            text, redacted = _redact_secrets(_cut_back(raw, reach))
             data = text.encode("utf-8", "replace")
             note = f"{size} bytes" + ("; secrets redacted" if redacted else "")
             if len(data) > limit or not whole:
@@ -1080,7 +1082,7 @@ def stash_context(command, cwd, input_data, deadline):
         listing = _git_probe(top, ["stash", "list", "--format=%gd%x09%ct%x09%gs"], deadline)
         if listing is None:
             continue
-        lines = listing.splitlines()
+        lines = [ln for ln in listing.split("\n") if ln]  # line feeds only: a subject may hold U+2028
         out = [f"Stashes in {one_line(top)} (`git stash list`, newest first): {len(lines) or 'none'}"]
         for line in lines[:STASH_CONTEXT_MAX]:
             ref, _, rest = line.partition("\t")
@@ -1091,7 +1093,7 @@ def stash_context(command, cwd, input_data, deadline):
                 if start:
                     when += " (after this session started)" if int(ct) >= start \
                         else " (before this session started)"
-            out.append(f"- {ref} {when}: {subject[:120]}")
+            out.append(f"- {one_line(ref)} {when}: {one_line(subject[:120])}")
         if len(lines) > STASH_CONTEXT_MAX:
             out.append(f"- … {len(lines) - STASH_CONTEXT_MAX} more")
         if start:
@@ -1103,7 +1105,7 @@ def stash_context(command, cwd, input_data, deadline):
             out.append(f"This session's own Bash calls ran a stash-making `git stash` there {len(hits)} "
                        f"time(s)" + (f", {failed} of them failed" if failed else "") + "; the latest"
                        + (f" at {_local_time(ts, '%m-%d %H:%M')}" if ts else "")
-                       + f" ({outcome}): `{' '.join(text.split())[:PROVENANCE_SNIPPET_CHARS]}`."
+                       + f" ({outcome}): `{one_line(' '.join(text.split())[:PROVENANCE_SNIPPET_CHARS])}`."
                        " From the command text: a call that found nothing to stash made none.")
         elif _session_transcripts(input_data):
             out.append("This session's transcripts show no Bash call that ran a stash-making "

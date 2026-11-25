@@ -135,8 +135,8 @@ def _clean_url(url):
 
 
 def _indent(text, limit=LOSS_STATUS_LINES):
-    lines = text.splitlines()
-    shown = "\n".join("    " + x for x in lines[:limit])
+    lines = [ln for ln in text.split("\n") if ln]  # line feeds only: a name may hold U+2028
+    shown = "\n".join("    " + one_line(x) for x in lines[:limit])
     if len(lines) > limit:
         shown += f"\n    [… {len(lines) - limit} more entries not shown]"
     return shown
@@ -198,7 +198,7 @@ def _repo_loss(repo, deadline, bare=False):
         if unique != "0":
             latest = (_git_probe(repo, ["log", "-1", "--format=%h %cd %s", "--date=format-local:%Y-%m-%d %H:%M",
                                         "--branches", "--not", "--remotes"], deadline) or "").strip()
-            text += f" (newest: {latest[:100]})" if latest else ""
+            text += f" (newest: {one_line(latest[:100])})" if latest else ""
         text += "."
     if _git_probe(repo, ["symbolic-ref", "-q", "HEAD"], deadline) is None:
         detached = (_git_probe(repo, ["rev-list", "--count", "HEAD", "--not", "--branches", "--remotes", "--"],
@@ -207,7 +207,7 @@ def _repo_loss(repo, deadline, bare=False):
             text += (f" HEAD is detached, with {detached} commit{'s' if detached != '1' else ''}"
                      " no branch or remote-tracking ref holds.")
     if remotes is not None:
-        named = [f"{n} {_clean_url(r.get('fetch', ''))[:100]}" for n, r in list(remotes.items())[:4]]
+        named = [one_line(f"{n} {_clean_url(r.get('fetch', ''))[:100]}") for n, r in list(remotes.items())[:4]]
         text += f" Remotes: {', '.join(named) if named else 'none'}."
     stashes = _git_probe(repo, ["stash", "list", "--format=%gd"], deadline)
     if stashes is not None:
@@ -316,7 +316,7 @@ def _delete_loss(path, label, deadline):
             where = ""
             if re.match(r"(?:/private)?/tmp/", top):
                 remotes = _git_remotes(top, deadline)
-                named = [f"{n} {_clean_url(r.get('fetch', ''))[:100]}"
+                named = [one_line(f"{n} {_clean_url(r.get('fetch', ''))[:100]}")
                          for n, r in list((remotes or {}).items())[:3]]
                 where = (f" The repository's root is under /tmp" + (
                     f"; its remotes: {', '.join(named)}." if named else
@@ -338,7 +338,7 @@ def _branch_loss(path, branches, label, deadline):
                                  ref, "--"], deadline) or "").strip()
         if not tip:
             continue
-        line = f"Branch {one_line(b)} in {one_line(path)} ({one_line(label)}): tip {tip[:100]}."
+        line = f"Branch {one_line(b)} in {one_line(path)} ({one_line(label)}): tip {one_line(tip[:100])}."
         unique = (_git_probe(path, ["rev-list", "--count", ref, "--not", f"--exclude={b}",
                                     "--branches", "--remotes", "--"], deadline) or "").strip()
         if unique.isdigit():
